@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Backlink Gap Analyzer</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+    <div class="app">
+        <!-- Header with close button -->
+        <div class="app-header">
+            <span class="app-title">Backlink Analyzer</span>
+            <button id="btn-close" class="btn-close" title="关闭">✕</button>
+        </div>
+
+        <!-- Tab Nav -->
+        <nav class="tab-nav">
+            <button class="tab-btn active" data-tab="collect">收集</button>
+            <button class="tab-btn" data-tab="publish">发布</button>
+            <button class="tab-btn" data-tab="resources">资源库</button>
+            <button class="tab-btn" data-tab="logs">日志</button>
+        </nav>
+
+        <!-- ===== 收集 Tab ===== -->
+        <div class="tab-panel active" id="panel-collect">
+            <label class="field-label">目标域名</label>
+            <div class="input-row">
+                <input type="text" id="domain-input" class="input" placeholder="例如 competitor.com">
+            </div>
+
+            <label class="field-label">我的域名</label>
+            <div class="input-row">
+                <input type="text" id="my-domain-input" class="input" placeholder="例如 mysite.com">
+            </div>
+
+            <div class="source-row">
+                <label class="field-label">数据源</label>
+                <div class="source-checks">
+                    <label class="check-label"><input type="checkbox" id="src-ahrefs" checked> Ahrefs</label>
+                    <label class="check-label"><input type="checkbox" id="src-semrush" checked> SEMrush</label>
+                    <label class="check-label"><input type="checkbox" id="src-similarweb" checked> SimilarWeb</label>
+                </div>
+            </div>
+
+            <button id="btn-collect" class="btn btn-primary btn-full">开始收集</button>
+
+            <div class="stats-card" id="stats-card">
+                <div class="stats-status">
+                    <span class="status-dot" id="status-dot"></span>
+                    <span id="status-text">等待开始...</span>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-number" id="stat-backlinks">0</div>
+                        <div class="stat-label">已发现外链</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" id="stat-analyzed">0</div>
+                        <div class="stat-label">已分析</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" id="stat-blogs">0</div>
+                        <div class="stat-label">外链机会</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" id="stat-queue">0</div>
+                        <div class="stat-label">队列中</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===== 发布 Tab ===== -->
+        <div class="tab-panel" id="panel-publish">
+            <!-- 任务管理 -->
+            <div class="panel-header">
+                <h3>发布任务</h3>
+                <button id="btn-add-task" class="btn btn-small">+ 新建任务</button>
+            </div>
+
+            <div id="task-list" class="task-list"></div>
+
+            <div class="panel-header" style="margin-top:12px">
+                <h3>发布概览</h3>
+            </div>
+
+            <div class="publish-stats">
+                <div class="pub-stat"><span class="pub-num" id="pub-pending">0</span><span class="pub-lbl">待发布</span>
+                </div>
+                <div class="pub-stat"><span class="pub-num green" id="pub-published">0</span><span
+                        class="pub-lbl">已发布</span></div>
+                <div class="pub-stat"><span class="pub-num yellow" id="pub-skipped">0</span><span
+                        class="pub-lbl">已跳过</span></div>
+                <div class="pub-stat"><span class="pub-num red" id="pub-failed">0</span><span class="pub-lbl">失败</span>
+                </div>
+            </div>
+
+            <div class="blog-count-bar" id="blog-count-bar">
+                <span class="blog-count-icon">📝</span>
+                <span class="blog-count-label">可直接发博客：</span>
+                <span class="blog-count-num" id="pub-blog-count">0</span>
+                <span class="blog-count-unit">个</span>
+            </div>
+
+            <div class="publish-current" id="publish-current" style="display:none">
+                <div class="current-label">当前发布：</div>
+                <div class="current-url" id="current-url">-</div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progress-fill"></div>
+                </div>
+                <div class="progress-text" id="progress-text">0 / 0</div>
+            </div>
+
+            <div class="empty-state" id="publish-empty">
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                </svg>
+                <p>暂无可发布资源，请先收集外链</p>
+            </div>
+        </div>
+
+        <!-- ===== 资源库 Tab ===== -->
+        <div class="tab-panel" id="panel-resources">
+            <div class="panel-header">
+                <h3>资源库 <span class="badge" id="res-count">0</span></h3>
+                <button id="btn-export" class="btn btn-small">导出</button>
+            </div>
+
+            <div class="res-filters">
+                <button class="res-filter active" data-filter="all">全部</button>
+                <button class="res-filter" data-filter="comment">可直接发</button>
+                <button class="res-filter" data-filter="other">需手动</button>
+            </div>
+
+            <div class="resources-list" id="resources-list">
+                <div class="empty-state" id="resources-empty">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                        stroke-width="1.5">
+                        <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                        <path d="M2 17l10 5 10-5" />
+                        <path d="M2 12l10 5 10-5" />
+                    </svg>
+                    <p>暂无资源数据</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===== 日志 Tab ===== -->
+        <div class="tab-panel" id="panel-logs">
+            <div class="panel-header">
+                <h3>操作日志</h3>
+                <div>
+                    <select id="log-filter" class="log-filter-select">
+                        <option value="all">全部</option>
+                        <option value="collect">收集</option>
+                        <option value="publish">发布</option>
+                        <option value="ai">AI</option>
+                        <option value="error">错误</option>
+                    </select>
+                    <button id="btn-clear-logs" class="btn btn-small">清空</button>
+                </div>
+            </div>
+            <div class="logs-list" id="logs-list">
+                <div class="empty-state" id="logs-empty">
+                    <p>暂无日志</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="app-footer">
+            <button id="btn-settings" class="footer-btn">设置</button>
+            <span class="footer-sep">|</span>
+            <button id="btn-clear" class="footer-btn">清空数据</button>
+            <span class="footer-sep">|</span>
+            <select id="lang-select" class="lang-select">
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+            </select>
+        </footer>
+    </div>
+
+    <script src="../utils/i18n.js"></script>
+    <script src="../utils/utils.js"></script>
+    <script src="../utils/backlink-merger.js"></script>
+    <script src="popup.js"></script>
+</body>
+
+</html>

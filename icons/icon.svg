@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <circle cx="64" cy="64" r="64" fill="#1c2240"/>
+  <g transform="translate(20, 28)" stroke="#3ecfff" stroke-width="5" fill="none" stroke-linecap="round">
+    <!-- Chain link 1 -->
+    <rect x="8" y="24" width="32" height="20" rx="10" transform="rotate(-30, 24, 34)"/>
+    <!-- Chain link 2 -->
+    <rect x="28" y="24" width="32" height="20" rx="10" transform="rotate(-30, 44, 34)"/>
+    <!-- Magnifying glass -->
+    <circle cx="58" cy="30" r="18" stroke-width="4"/>
+    <line x1="72" y1="42" x2="84" y2="56" stroke-width="5"/>
+  </g>
+</svg>

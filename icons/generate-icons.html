@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Generate & Save Icons</title>
+</head>
+
+<body style="background:#1a1f2e;color:#e8eaf0;font-family:system-ui;padding:40px;text-align:center">
+    <h2>Backlink Analyzer Icons</h2>
+    <p>Click each button to download the icon file, then save to the <code>icons/</code> folder.</p>
+    <div id="previews" style="display:flex;gap:30px;justify-content:center;margin:30px 0"></div>
+    <script>
+        function drawIcon(size) {
+            const c = document.createElement('canvas');
+            c.width = c.height = size;
+            const ctx = c.getContext('2d');
+            const s = size, sc = s / 128;
+
+            // Background
+            ctx.fillStyle = '#1c2240';
+            ctx.beginPath();
+            ctx.arc(s / 2, s / 2, s / 2, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.strokeStyle = '#3ecfff';
+            ctx.lineWidth = Math.max(1.5, 3.5 * sc);
+            ctx.lineCap = 'round';
+
+            // Chain link 1
+            const lw = Math.max(4, 18 * sc), lh = Math.max(3, 12 * sc), lr = lh / 2;
+            const cx1 = s * 0.32, cy = s * 0.55;
+            roundRect(ctx, cx1 - lw / 2, cy - lh / 2, lw, lh, lr);
+            ctx.stroke();
+
+            // Chain link 2
+            const cx2 = s * 0.48;
+            roundRect(ctx, cx2 - lw / 2, cy - lh / 2, lw, lh, lr);
+            ctx.stroke();
+
+            // Magnifying glass
+            const mx = s * 0.62, my = s * 0.4, mr = s * 0.14;
+            ctx.beginPath();
+            ctx.arc(mx, my, mr, 0, Math.PI * 2);
+            ctx.stroke();
+
+            // Handle
+            ctx.lineWidth = Math.max(2, 4.5 * sc);
+            ctx.beginPath();
+            ctx.moveTo(mx + mr * 0.7, my + mr * 0.7);
+            ctx.lineTo(mx + mr * 1.7, my + mr * 1.7);
+            ctx.stroke();
+
+            return c;
+        }
+
+        function roundRect(ctx, x, y, w, h, r) {
+            ctx.beginPath();
+            ctx.moveTo(x + r, y);
+            ctx.lineTo(x + w - r, y);
+            ctx.arcTo(x + w, y, x + w, y + r, r);
+            ctx.lineTo(x + w, y + h - r);
+            ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+            ctx.lineTo(x + r, y + h);
+            ctx.arcTo(x, y + h, x, y + h - r, r);
+            ctx.lineTo(x, y + r);
+            ctx.arcTo(x, y, x + r, y, r);
+            ctx.closePath();
+        }
+
+        [16, 48, 128].forEach(size => {
+            const canvas = drawIcon(size);
+            const div = document.createElement('div');
+            div.style.textAlign = 'center';
+
+            // Preview (scaled up for small icons)
+            const preview = document.createElement('canvas');
+            const ps = Math.max(size, 64);
+            preview.width = preview.height = ps;
+            preview.style.border = '1px solid #3ecfff33';
+            preview.style.borderRadius = '8px';
+            const pctx = preview.getContext('2d');
+            pctx.imageSmoothingEnabled = true;
+            pctx.drawImage(canvas, 0, 0, ps, ps);
+            div.appendChild(preview);
+
+            const label = document.createElement('p');
+            label.textContent = `icon${size}.png`;
+            label.style.margin = '8px 0 4px';
+            div.appendChild(label);
+
+            const btn = document.createElement('button');
+            btn.textContent = 'Download';
+            btn.style.cssText = 'background:#3ecfff;color:#1c2240;border:none;padding:8px 20px;border-radius:6px;font-weight:bold;cursor:pointer';
+            btn.onclick = () => {
+                const a = document.createElement('a');
+                a.download = `icon${size}.png`;
+                a.href = canvas.toDataURL('image/png');
+                a.click();
+            };
+            div.appendChild(btn);
+
+            document.getElementById('previews').appendChild(div);
+        });
+    </script>
+</body>
+
+</html>
