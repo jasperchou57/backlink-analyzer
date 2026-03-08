@@ -20,6 +20,7 @@
 
         // 等待页面加载和可能的自动查询
         await delay(3000);
+        await trySolveVerification();
 
         // 检查是否已经有结果，如果没有则尝试触发查询
         let hasResults = checkForResults();
@@ -33,11 +34,12 @@
                 checkBtn.click();
                 console.log('[Backlink Analyzer] Clicked check button');
                 await delay(8000); // 等待结果加载
+                await trySolveVerification();
             }
         }
 
         // 多次尝试抓取结果（因为页面可能需要时间渲染）
-        let urls = new Set();
+        const urls = new Set();
         for (let attempt = 0; attempt < 3; attempt++) {
             await delay(3000);
             scrapeUrls(urls);
@@ -50,15 +52,67 @@
         // 尝试抓取更多页面结果
         await tryLoadMore(urls);
 
-        const urlArray = Array.from(urls);
-        console.log(`[Backlink Analyzer] Ahrefs: found ${urlArray.length} backlinks`);
+        const items = Array.from(urls).map((url) => ({
+            url,
+            sourceType: 'backlink-page'
+        }));
+        console.log(`[Backlink Analyzer] Ahrefs: found ${items.length} backlinks`);
 
         const source = isMyDomain ? 'my-ahrefs' : 'ahrefs';
         chrome.runtime.sendMessage({
             action: 'backlinkData',
             source: source,
-            urls: urlArray
+            urls: items.map((item) => item.url),
+            items
         });
+    }
+
+    async function trySolveVerification() {
+        for (let attempt = 0; attempt < 6; attempt++) {
+            const solved = clickCloudflareWidget();
+            if (solved) {
+                console.log('[Backlink Analyzer] Attempted Cloudflare verification click');
+                await delay(2500);
+            }
+
+            if (checkForResults() || !hasVerificationPrompt()) {
+                return;
+            }
+
+            await delay(2000);
+        }
+    }
+
+    function hasVerificationPrompt() {
+        const pageText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+        if (/确认您是真人|verify you are human|confirm you are human|cloudflare/i.test(pageText)) {
+            return true;
+        }
+        return !!document.querySelector(
+            'iframe[src*="cloudflare"], iframe[title*="challenge" i], iframe[src*="turnstile"], ' +
+            'input[type="checkbox"][name*="cf"], [class*="turnstile"], [class*="challenge"]'
+        );
+    }
+
+    function clickCloudflareWidget() {
+        const candidates = [
+            ...document.querySelectorAll('label, input[type="checkbox"], iframe, div, span, button')
+        ].filter((el) => {
+            const text = `${el.getAttribute?.('title') || ''} ${el.getAttribute?.('aria-label') || ''} ${el.textContent || ''}`.toLowerCase();
+            const src = (el.getAttribute?.('src') || '').toLowerCase();
+            const cls = (el.className || '').toString().toLowerCase();
+            return /cloudflare|turnstile|verify|human|真人|challenge/.test(text)
+                || /cloudflare|turnstile|challenge/.test(src)
+                || /turnstile|challenge/.test(cls);
+        });
+
+        for (const el of candidates) {
+            if (!isVisible(el)) continue;
+            clickElementLikeUser(el);
+            return true;
+        }
+
+        return false;
     }
 
     function checkForResults() {
@@ -100,15 +154,6 @@
             }
         });
 
-        // === 方法3: 页面中显示的域名文本 ===
-        document.querySelectorAll('span, div, td').forEach(el => {
-            if (el.children.length === 0) { // 只检查叶子节点
-                const text = el.textContent.trim();
-                if (text.match(/^[\w-]+\.[\w.-]+\.\w{2,}$/) && !text.includes('ahrefs')) {
-                    urls.add('https://' + text);
-                }
-            }
-        });
     }
 
     async function tryLoadMore(urls) {
@@ -131,6 +176,35 @@
 
     function delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function isVisible(el) {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden';
+    }
+
+    function clickElementLikeUser(el) {
+        try {
+            const rect = el.getBoundingClientRect();
+            const clientX = rect.left + rect.width / 2;
+            const clientY = rect.top + rect.height / 2;
+            const target = document.elementFromPoint(clientX, clientY) || el;
+            ['mouseover', 'mousedown', 'mouseup', 'click'].forEach((type) => {
+                target.dispatchEvent(new MouseEvent(type, {
+                    view: window,
+                    bubbles: true,
+                    cancelable: true,
+                    clientX,
+                    clientY
+                }));
+            });
+            el.click?.();
+        } catch {}
     }
 
     setTimeout(collectBacklinks, 2000);

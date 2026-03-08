@@ -1,14 +1,32 @@
 /**
- * AI Engine - OpenRouter API 封装
- * 4 个 AI 任务各自可配置不同模型
+ * AI Engine - 多 Provider LLM 封装
+ * 兼容 OpenRouter / SiliconFlow / 自定义 OpenAI 兼容接口
  */
 
 const AIEngine = {
-    // OpenRouter API 端点
-    API_URL: 'https://openrouter.ai/api/v1/chat/completions',
+    PROVIDERS: {
+        openrouter: {
+            label: 'OpenRouter',
+            baseUrl: 'https://openrouter.ai/api/v1',
+            extraHeaders: {
+                'HTTP-Referer': 'chrome-extension://backlink-analyzer',
+                'X-Title': 'Backlink Analyzer'
+            }
+        },
+        siliconflow: {
+            label: 'SiliconFlow',
+            baseUrl: 'https://api.siliconflow.cn/v1',
+            extraHeaders: {}
+        },
+        custom: {
+            label: 'Custom OpenAI Compatible',
+            baseUrl: '',
+            extraHeaders: {}
+        }
+    },
 
     /**
-     * 调用 OpenRouter API
+     * 调用 LLM API
      * @param {string} task - 任务类型: classify | formExtract | commentGen | linkDiscover
      * @param {string} prompt - 用户 prompt
      * @param {object} options - 可选参数
@@ -16,14 +34,20 @@ const AIEngine = {
      */
     async call(task, prompt, options = {}) {
         const settings = await this._getSettings();
-        const apiKey = settings.openrouterApiKey;
+        const provider = this._resolveProvider(settings);
+        const apiKey = this._getApiKey(settings);
         if (!apiKey) {
-            throw new Error('OpenRouter API Key 未配置，请在设置中填入');
+            throw new Error(`${provider.label} API Key 未配置，请在设置中填入`);
         }
 
         const model = this._getModelForTask(task, settings);
         if (!model) {
             throw new Error(`任务 "${task}" 的模型未配置，请在设置中填入模型 ID`);
+        }
+
+        const apiUrl = this._resolveApiUrl(provider, settings);
+        if (!apiUrl) {
+            throw new Error(`Provider "${provider.label}" 的 Base URL 未配置`);
         }
 
         const systemPrompt = options.system || '';
@@ -40,20 +64,19 @@ const AIEngine = {
             temperature: options.temperature !== undefined ? options.temperature : 0.7,
         };
 
-        const response = await fetch(this.API_URL, {
+        const response = await fetch(apiUrl, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${apiKey}`,
                 'Content-Type': 'application/json',
-                'HTTP-Referer': 'chrome-extension://backlink-analyzer',
-                'X-Title': 'Backlink Analyzer'
+                ...(provider.extraHeaders || {})
             },
             body: JSON.stringify(body)
         });
 
         if (!response.ok) {
             const errText = await response.text();
-            throw new Error(`OpenRouter API 错误 (${response.status}): ${errText}`);
+            throw new Error(`${provider.label} API 错误 (${response.status}): ${errText}`);
         }
 
         const data = await response.json();
@@ -135,14 +158,25 @@ Respond in JSON format:
     /**
      * 评论生成 - 根据页面内容生成相关评论
      */
-    async generateComment(pageTitle, pageContent, targetUrl) {
+    async generateComment(pageTitle, pageContent, targetUrl, options = {}) {
+        const anchorText = String(options.anchorText || '').trim();
+        const anchorUrl = String(options.anchorUrl || '').trim();
+        const allowAnchorHtml = !!options.allowAnchorHtml && !!anchorText && !!anchorUrl;
+
         const prompt = `Write a genuine, helpful blog comment for this article. The comment should:
 - Be relevant to the article content
 - Sound natural and human-written
 - Be 2-4 sentences long
-- NOT include any links or promotional content
-- NOT be generic/spammy (avoid "Great post!" only)
+- ${allowAnchorHtml
+                ? `Include exactly one natural HTML anchor tag using this exact target URL: ${anchorUrl} and this exact anchor text: ${anchorText}`
+                : 'NOT include any links or promotional content'}
+- ${allowAnchorHtml
+                ? 'Only include a single <a href="...">...</a> tag once, no other links'
+                : 'NOT be generic/spammy (avoid "Great post!" only)'}
 - Show you actually read the article
+- ${allowAnchorHtml
+                ? 'Keep the anchor subtle and contextually relevant, not salesy'
+                : 'Avoid sounding generic or spammy'}
 
 Article title: ${pageTitle}
 Article content (excerpt): ${(pageContent || '').substring(0, 1500)}
@@ -150,7 +184,9 @@ Article content (excerpt): ${(pageContent || '').substring(0, 1500)}
 Write ONLY the comment text, nothing else.`;
 
         return await this.call('commentGen', prompt, {
-            system: 'You are a thoughtful blog reader who writes genuine, relevant comments. Write only in English unless the article is in another language, in which case match the article language.',
+            system: allowAnchorHtml
+                ? 'You are a thoughtful blog reader. Write a natural comment and, only when requested, include exactly one valid HTML anchor tag with the specified href and anchor text. Do not add markdown fences or explanations.'
+                : 'You are a thoughtful blog reader who writes genuine, relevant comments. Write only in English unless the article is in another language, in which case match the article language.',
             temperature: 0.8,
             maxTokens: 256
         });
@@ -189,11 +225,13 @@ Respond in JSON format:
      */
     async testConnection() {
         try {
+            const settings = await this._getSettings();
+            const provider = this._resolveProvider(settings);
             const result = await this.call('commentGen', 'Say "OK" if you can read this.', {
                 maxTokens: 10,
                 temperature: 0
             });
-            return { success: true, message: result };
+            return { success: true, message: `${provider.label}: ${result}` };
         } catch (e) {
             return { success: false, message: e.message };
         }
@@ -209,6 +247,26 @@ Respond in JSON format:
             linkDiscover: settings.modelLinkDiscover,
         };
         return modelMap[task] || '';
+    },
+
+    _resolveProvider(settings) {
+        const providerId = settings.aiProvider || (settings.aiBaseUrl ? 'custom' : 'openrouter');
+        return this.PROVIDERS[providerId] || this.PROVIDERS.openrouter;
+    },
+
+    _getApiKey(settings) {
+        return settings.aiApiKey || settings.openrouterApiKey || '';
+    },
+
+    _resolveApiUrl(provider, settings) {
+        const configuredBase = (settings.aiBaseUrl || provider.baseUrl || '').trim();
+        if (!configuredBase) return '';
+
+        const normalized = configuredBase.replace(/\/+$/, '');
+        if (normalized.endsWith('/chat/completions')) {
+            return normalized;
+        }
+        return `${normalized}/chat/completions`;
     },
 
     async _getSettings() {

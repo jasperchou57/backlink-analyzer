@@ -8,12 +8,18 @@
         "tabs",
         "storage",
         "scripting",
-        "identity"
+        "identity",
+        "sidePanel"
     ],
     "host_permissions": [
         "<all_urls>"
     ],
-    "action": {},
+    "action": {
+        "default_title": "Open Backlink Analyzer"
+    },
+    "side_panel": {
+        "default_path": "popup/popup.html"
+    },
     "background": {
         "service_worker": "background/background.js"
     },

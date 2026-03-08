@@ -56,7 +56,7 @@ const StorageHelper = {
 
     async getStats() {
         return (await this.get('collectStats')) || {
-            backlinksFound: 0, analyzed: 0, blogResources: 0, inQueue: 0
+            backlinksFound: 0, targetsFound: 0, analyzed: 0, blogResources: 0, inQueue: 0
         };
     },
 
@@ -66,10 +66,15 @@ const StorageHelper = {
 
     async getSettings() {
         return (await this.get('settings')) || {
+            aiProvider: 'openrouter',
+            aiBaseUrl: 'https://openrouter.ai/api/v1',
+            aiApiKey: '',
             name: '',
             email: '',
             website: '',
             apiKey: '',
+            openrouterApiKey: '',
+            publishDebugMode: false,
             commentTemplates: [
                 'Great article about {title}! This provides really valuable insights worth sharing.',
                 'This is a very interesting perspective on {title}. Thanks for the detailed analysis!',

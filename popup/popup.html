@@ -45,7 +45,15 @@
                 </div>
             </div>
 
-            <button id="btn-collect" class="btn btn-primary btn-full">开始收集</button>
+            <div class="collect-action-row">
+                <button id="btn-collect" class="btn btn-primary">开始持续发现</button>
+                <button id="btn-pause-collect" class="btn btn-secondary" disabled>暂停</button>
+            </div>
+
+            <div class="collect-engine-bar">
+                <div class="collect-engine-title" id="collect-engine-title">未启动持续发现</div>
+                <div class="collect-engine-detail" id="collect-engine-detail">输入一个目标网站后开始持续递归分析</div>
+            </div>
 
             <div class="stats-card" id="stats-card">
                 <div class="stats-status">
@@ -55,19 +63,44 @@
                 <div class="stats-grid">
                     <div class="stat-item">
                         <div class="stat-number" id="stat-backlinks">0</div>
-                        <div class="stat-label">已发现外链</div>
+                        <div class="stat-label" id="stat-backlinks-label">待分析目标</div>
                     </div>
                     <div class="stat-item">
                         <div class="stat-number" id="stat-analyzed">0</div>
-                        <div class="stat-label">已分析</div>
+                        <div class="stat-label" id="stat-analyzed-label">已分析页面</div>
                     </div>
                     <div class="stat-item">
                         <div class="stat-number" id="stat-blogs">0</div>
-                        <div class="stat-label">外链机会</div>
+                        <div class="stat-label" id="stat-blogs-label">外链机会</div>
                     </div>
                     <div class="stat-item">
                         <div class="stat-number" id="stat-queue">0</div>
-                        <div class="stat-label">队列中</div>
+                        <div class="stat-label" id="stat-queue-label">剩余队列</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="domain-frontier-card">
+                <div class="panel-header compact-header">
+                    <h3>持续发现域名 <span class="badge" id="domain-frontier-count">0</span></h3>
+                </div>
+                <div class="domain-frontier-stats">
+                    <div class="frontier-stat">
+                        <span class="frontier-stat-label">已建档</span>
+                        <span class="frontier-stat-value" id="domain-profiled-count">0</span>
+                    </div>
+                    <div class="frontier-stat">
+                        <span class="frontier-stat-label">已下钻</span>
+                        <span class="frontier-stat-value" id="domain-expanded-count">0</span>
+                    </div>
+                    <div class="frontier-stat">
+                        <span class="frontier-stat-label">评论发现</span>
+                        <span class="frontier-stat-value" id="domain-comment-count">0</span>
+                    </div>
+                </div>
+                <div class="domain-frontier-list" id="domain-frontier-list">
+                    <div class="empty-state frontier-empty" id="domain-frontier-empty">
+                        <p>暂无域名情报</p>
                     </div>
                 </div>
             </div>
@@ -78,7 +111,10 @@
             <!-- 任务管理 -->
             <div class="panel-header">
                 <h3>发布任务</h3>
-                <button id="btn-add-task" class="btn btn-small">+ 新建任务</button>
+                <div class="panel-actions">
+                    <button id="btn-reset-publish-statuses" class="btn btn-small" title="将已发布/已跳过的资源重置为待发布，并删除失败资源，同时保留各网站历史记录">↺ 全部重置</button>
+                    <button id="btn-add-task" class="btn btn-small">+ 新建任务</button>
+                </div>
             </div>
 
             <div id="task-list" class="task-list"></div>
@@ -105,13 +141,26 @@
                 <span class="blog-count-unit">个</span>
             </div>
 
+            <div class="blog-count-bar anchor-count-bar" id="anchor-count-bar">
+                <span class="blog-count-icon">🔗</span>
+                <span class="blog-count-label">已提交锚文本：</span>
+                <span class="blog-count-num" id="pub-anchor-count">0</span>
+                <span class="blog-count-unit">个</span>
+            </div>
+
             <div class="publish-current" id="publish-current" style="display:none">
                 <div class="current-label">当前发布：</div>
                 <div class="current-url" id="current-url">-</div>
                 <div class="progress-bar">
                     <div class="progress-fill" id="progress-fill"></div>
                 </div>
-                <div class="progress-text" id="progress-text">0 / 0</div>
+                <div class="publish-current-footer">
+                    <div class="progress-text" id="progress-text">0 / 0</div>
+                    <div class="publish-current-actions">
+                        <button id="btn-continue-publish" class="btn btn-small btn-continue-publish" style="display:none">继续</button>
+                        <button id="btn-stop-publish" class="btn btn-small btn-stop-publish">停止</button>
+                    </div>
+                </div>
             </div>
 
             <div class="empty-state" id="publish-empty">
@@ -186,6 +235,7 @@
     <script src="../utils/i18n.js"></script>
     <script src="../utils/utils.js"></script>
     <script src="../utils/backlink-merger.js"></script>
+    <script src="../utils/workflows.js"></script>
     <script src="popup.js"></script>
 </body>
 
