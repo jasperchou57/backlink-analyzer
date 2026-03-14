@@ -1,10 +1,33 @@
 /**
  * Logger - 记录所有关键操作
- * 存储在 chrome.storage.local 中
+ * 优先存储在 IndexedDB，本地数据库不可用时回退到 chrome.storage.local
  */
 
 const Logger = {
     MAX_LOGS: 500,
+    _localStoreReady: null,
+
+    async _ensureLocalStore() {
+        if (typeof LocalDB === 'undefined') {
+            return null;
+        }
+
+        if (!this._localStoreReady) {
+            this._localStoreReady = (async () => {
+                try {
+                    if (typeof LocalDB.migrateFromChromeStorage === 'function') {
+                        await LocalDB.migrateFromChromeStorage({ clearLegacy: true });
+                    }
+                    return LocalDB;
+                } catch (error) {
+                    console.warn('[BLA] LocalDB unavailable for logs, falling back to chrome.storage.local', error);
+                    return null;
+                }
+            })();
+        }
+
+        return await this._localStoreReady;
+    },
 
     /**
      * 添加日志
@@ -29,7 +52,15 @@ const Logger = {
             logs.length = this.MAX_LOGS;
         }
 
-        await chrome.storage.local.set({ logs });
+        const localStore = await this._ensureLocalStore();
+        if (localStore?.setLogs) {
+            await localStore.setLogs(logs);
+            try {
+                await chrome.storage.local.remove('logs');
+            } catch {}
+        } else {
+            await chrome.storage.local.set({ logs });
+        }
 
         // 广播给 popup
         try {
@@ -55,11 +86,24 @@ const Logger = {
      * 清空日志
      */
     async clear() {
+        const localStore = await this._ensureLocalStore();
+        if (localStore?.setLogs) {
+            await localStore.setLogs([]);
+            try {
+                await chrome.storage.local.remove('logs');
+            } catch {}
+            return;
+        }
         await chrome.storage.local.set({ logs: [] });
     },
 
     async _getLogs() {
-        return new Promise((resolve) => {
+        const localStore = await this._ensureLocalStore();
+        if (localStore?.getLogs) {
+            return await localStore.getLogs();
+        }
+
+        return await new Promise((resolve) => {
             chrome.storage.local.get('logs', (data) => {
                 resolve(data.logs || []);
             });

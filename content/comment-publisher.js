@@ -13,7 +13,9 @@
     let currentDebugInfo = null;
     let publishStopped = false;
     let autoSubmitTimer = null;
+    let workflowStallTimer = null;
     let currentPublishMeta = null;
+    const WORKFLOW_STALL_TIMEOUT_MS = 18000;
 
     const NUMBER_WORDS = {
         zero: 0,
@@ -53,6 +55,57 @@
         ]
     };
 
+    const EXECUTION_PROFILES = {
+        fast: {
+            id: 'fast',
+            useAIForForm: false,
+            useAIForComment: false,
+            preferHumanTypingForComment: true,
+            formTimeoutMs: 6000,
+            formPollMs: 400,
+            aiFormTimeoutMs: 0,
+            aiCommentTimeoutMs: 0,
+            submitDelayMs: 700,
+            workflowStallTimeoutMs: 9000
+        },
+        hybrid: {
+            id: 'hybrid',
+            useAIForForm: true,
+            useAIForComment: false,
+            preferHumanTypingForComment: true,
+            formTimeoutMs: 10000,
+            formPollMs: 700,
+            aiFormTimeoutMs: 2200,
+            aiCommentTimeoutMs: 0,
+            submitDelayMs: 900,
+            workflowStallTimeoutMs: 14000
+        },
+        ai: {
+            id: 'ai',
+            useAIForForm: true,
+            useAIForComment: true,
+            preferHumanTypingForComment: true,
+            formTimeoutMs: 16000,
+            formPollMs: 900,
+            aiFormTimeoutMs: 3000,
+            aiCommentTimeoutMs: 4500,
+            submitDelayMs: 1200,
+            workflowStallTimeoutMs: 18000
+        }
+    };
+
+    function isStrictAnchorCommentStyle(value) {
+        return compactText(value || '') === 'anchor-html';
+    }
+
+    function isPreferredAnchorCommentStyle(value) {
+        return compactText(value || '') === 'anchor-prefer';
+    }
+
+    function isAnyAnchorCommentStyle(value) {
+        return isStrictAnchorCommentStyle(value) || isPreferredAnchorCommentStyle(value);
+    }
+
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.action === 'fillComment') {
             fillCommentForm(msg.data);
@@ -69,15 +122,18 @@
         currentDebugInfo = { mode: data.mode || 'semi-auto', actions: [] };
         publishStopped = false;
         clearAutoSubmitTimer();
+        clearWorkflowStallTimer();
         currentPublishMeta = {
             commentStyle: data.commentStyle || 'standard',
-            anchorRequested: data.commentStyle === 'anchor-html',
+            anchorRequested: isAnyAnchorCommentStyle(data.commentStyle),
             anchorInjected: false,
             anchorText: '',
             anchorUrl: '',
+            inlineLinkMode: '',
             commentPreview: '',
             retryWithoutWebsite: !!data.retryWithoutWebsite,
-            websiteOmitted: !data.website
+            websiteOmitted: !data.website,
+            publishStartedAt: new Date().toISOString()
         };
 
         removeDebugArtifacts();
@@ -90,6 +146,7 @@
             useAI: data.useAI !== false,
             pageTitle: data.pageTitle || document.title,
             resource: data.resource || {},
+            siteTemplate: data.siteTemplate || null,
             values: {
                 name: data.name || '',
                 email: data.email || '',
@@ -102,14 +159,24 @@
                 mode: data.commentStyle || 'standard',
                 anchorText: data.anchorKeyword || '',
                 anchorUrl: data.anchorUrl || data.website || '',
-                allowAnchorHtml: false
+                allowAnchorHtml: false,
+                linkMode: '',
+                useInlineLink: false
             }
         };
+        context.execution = resolveExecutionProfile(context);
+
+        await primeCommentSectionSearch(context, { immediate: true, forceProgressiveScroll: true });
+        armWorkflowStallTimer(context);
 
         addDebugEvent('field', `Workflow: ${workflow.name || workflow.id}`);
         addDebugEvent('field', `Publish mode: ${context.mode}${currentDebugMode ? ' (debug pause enabled)' : ''}`);
+        addDebugEvent('field', `Execution profile: ${context.execution.id}`);
 
         try {
+            if (await maybeExecuteStandardCommentFastFlow(context)) {
+                return;
+            }
             await executeWorkflow(context);
         } catch (e) {
             console.log('[BLA] 工作流执行失败:', e);
@@ -123,6 +190,7 @@
         for (const step of steps) {
             if (publishStopped) return;
             await executeWorkflowStep(step, context);
+            if (context.workflowAborted) return;
         }
     }
 
@@ -137,7 +205,7 @@
                 await executeGenerateCommentStep(step, context);
                 break;
             case 'fillFields':
-                executeFillFieldsStep(step, context);
+                await executeFillFieldsStep(step, context);
                 break;
             case 'solveCaptcha':
                 executeSolveCaptchaStep(context);
@@ -156,83 +224,295 @@
         }
     }
 
-    async function executeFindFormStep(step, context) {
-        if (context.useAI && step.useAI !== false) {
-            try {
-                const formAreaHtml = getCommentAreaHtml();
-                if (formAreaHtml) {
-                    context.aiFormInfo = await chrome.runtime.sendMessage({
-                        action: 'aiExtractForm',
-                        html: formAreaHtml
-                    });
-                    if (context.aiFormInfo?.hasForm) {
-                        addDebugEvent('field', `AI detected form selector: ${context.aiFormInfo.formSelector || 'unknown'}`);
-                    }
-                }
-            } catch (e) {
-                console.log('[BLA] AI 表单识别失败，回退到规则匹配:', e);
-            }
+    async function maybeExecuteStandardCommentFastFlow(context) {
+        if (publishStopped || !context) return false;
+
+        const form = findStandardCommentForm();
+        if (!form) {
+            return false;
         }
 
-        if (context.aiFormInfo?.hasForm && context.aiFormInfo.formSelector) {
-            context.form = document.querySelector(context.aiFormInfo.formSelector);
+        context.form = form;
+        prepareFormForInteraction(context.form);
+        context.form.style.outline = '2px dashed #3ecfff';
+        context.form.style.outlineOffset = '8px';
+        markDebugElement(context.form, 'form');
+        currentPublishMeta = {
+            ...(currentPublishMeta || {}),
+            executionPath: 'standard-comment-fast-flow'
+        };
+        addDebugEvent('field', 'Using standard comment fast flow');
+
+        if (handleDuplicateCommentSkip(context)) {
+            return true;
         }
-        if (!context.form) {
-            context.form = findFormByRules();
+
+        await prepareCommentContent(context, { useAI: true });
+        if (context.workflowAborted) {
+            return true;
         }
+
+        await fillStandardCommentFormDirectly(context);
+        if (context.workflowAborted) {
+            return true;
+        }
+        executeSolveCaptchaStep(context);
+        executeAntiSpamStep(context);
+        executeUncheckNotificationsStep(context);
+        executeFinalizeStep(context);
+        return true;
+    }
+
+    async function executeFindFormStep(step, context) {
+        await primeCommentSectionSearch(context, { immediate: true, forceProgressiveScroll: true });
+        context.form = await waitForCommentForm(context, {
+            useAI: context.useAI && step.useAI !== false && context.execution.useAIForForm,
+            timeoutMs: context.execution.formTimeoutMs,
+            pollMs: context.execution.formPollMs,
+            aiTimeoutMs: context.execution.aiFormTimeoutMs
+        });
 
         if (!context.form) {
             addDebugEvent('field', 'Comment form not found');
             throw new Error('Comment form not found');
         }
 
+        prepareFormForInteraction(context.form);
         context.form.style.outline = '2px dashed #3ecfff';
         context.form.style.outlineOffset = '8px';
         context.form.scrollIntoView({ behavior: 'smooth', block: 'center' });
         markDebugElement(context.form, 'form');
+        handleDuplicateCommentSkip(context);
+    }
+
+    async function fillStandardCommentFormDirectly(context) {
+        const form = context?.form;
+        const values = {
+            comment: context?.comment || '',
+            name: context?.values?.name || '',
+            email: context?.values?.email || '',
+            website: context?.values?.website || ''
+        };
+
+        const standardFlow = getStandardCommentFlow();
+        const standardFill = standardFlow?.fillStandardCommentForm
+            ? await standardFlow.fillStandardCommentForm(form, values)
+            : null;
+
+        let commentFilled = !!standardFill?.commentFilled;
+        if (commentFilled) {
+            currentPublishMeta = {
+                ...(currentPublishMeta || {}),
+                commentFieldVerified: true,
+                commentEditorType: 'textarea',
+                commentFieldSelector: standardFill?.commentSelector || currentPublishMeta?.commentFieldSelector || '',
+                commentFillStrategy: 'standard-direct',
+                formSignature: standardFill?.formSignature || buildFormSignature(form) || currentPublishMeta?.formSignature || ''
+            };
+            addDebugEvent('field', 'Standard comment form direct-filled');
+        }
+
+        if (!commentFilled && values.comment) {
+            commentFilled = await fillCommentFieldWithExecutor(form, values.comment, context);
+        }
+
+        if (!commentFilled && values.comment) {
+            addDebugEvent('field', 'Standard comment form comment field could not be verified');
+            reportResult('failed', {
+                reason: 'comment-field-empty',
+                submissionBlocked: true
+            });
+            context.workflowAborted = true;
+            return;
+        }
+
+        if (values.comment) {
+            const ensuredComment = await ensureCommentFieldValue(form, values.comment, context, {
+                allowTypingFallback: true
+            });
+            if (!ensuredComment) {
+                addDebugEvent('field', 'Standard comment form comment verification failed after fallback');
+                reportResult('failed', {
+                    reason: 'comment-field-empty',
+                    submissionBlocked: true
+                });
+                context.workflowAborted = true;
+                return;
+            }
+        }
+
+        const missingRequiredFields = [];
+        if (values.name) {
+            const nameField = findBestField(form, [
+                'input[name="author"]',
+                'input#author',
+                'input[name="name"]',
+                'input[name*="name" i]'
+            ], 'name');
+            if (nameField && !fieldValueMatches(nameField, values.name)) {
+                missingRequiredFields.push('name');
+            }
+        }
+        if (values.email) {
+            const emailField = findBestField(form, [
+                'input[name="email"]',
+                'input#email',
+                'input[type="email"]',
+                'input[name*="mail" i]'
+            ], 'email');
+            if (emailField && !fieldValueMatches(emailField, values.email)) {
+                missingRequiredFields.push('email');
+            }
+        }
+        if (values.website) {
+            const websiteField = findBestField(form, [
+                'input[name="url"]',
+                'input#url',
+                'input[name="website"]',
+                'input[type="url"]',
+                'input[name*="site" i]',
+                'input[name*="web" i]'
+            ], 'website');
+            if (websiteField && !fieldValueMatches(websiteField, values.website)) {
+                missingRequiredFields.push('website');
+            }
+        }
+
+        if (missingRequiredFields.length > 0) {
+            addDebugEvent('field', `Standard form missed fields: ${missingRequiredFields.join(', ')}`);
+            await fillFieldsByRules(form, values, missingRequiredFields, {
+                execution: context.execution
+            });
+        }
     }
 
     async function executeGenerateCommentStep(step, context) {
+        await prepareCommentContent(context, step);
+    }
+
+    function handleDuplicateCommentSkip(context) {
+        const existingComment = findExistingCommentByCommenter(context);
+        if (!existingComment) {
+            return false;
+        }
+
+        addDebugEvent('field', `Existing comment detected for ${context?.values?.name || 'current commenter'}; skipping`);
+        currentPublishMeta = {
+            ...(currentPublishMeta || {}),
+            duplicateCommentDetected: true,
+            duplicateCommentExcerpt: truncateText(compactText(existingComment.text || ''), 180),
+            duplicateCommentSelector: existingComment.selector || ''
+        };
+        context.workflowAborted = true;
+        reportResult('skipped', {
+            reason: 'duplicate-comment-detected',
+            terminalFailureReason: 'duplicate_comment',
+            submissionBlockReason: 'duplicate_comment'
+        });
+        return true;
+    }
+
+    async function prepareCommentContent(context, step = {}) {
         context.anchorOptions = resolveAnchorOptions(context);
-        if (context.useAI && step.useAI !== false) {
+
+        if (shouldSkipUnavailableAnchorPublish(context)) {
+            currentPublishMeta = {
+                ...(currentPublishMeta || {}),
+                commentStyle: context.anchorOptions.mode,
+                anchorRequested: true,
+                anchorInjected: false,
+                inlineLinkMode: '',
+                websiteOmitted: false,
+                linkMode: '',
+                anchorUnavailable: true
+            };
+            addDebugEvent('field', 'Anchor mode requested but verified inline HTML anchor capability was not found; skipping');
+            reportResult('skipped', {
+                reason: 'anchor-mode-unavailable',
+                terminalFailureReason: 'anchor_mode_unavailable',
+                linkMode: '',
+                anchorRequested: true,
+                anchorInjected: false
+            });
+            context.workflowAborted = true;
+            return;
+        }
+
+        if (shouldSkipCommentOnlyDirectPublish(context)) {
+            currentPublishMeta = {
+                ...(currentPublishMeta || {}),
+                commentStyle: context.anchorOptions.mode,
+                anchorRequested: isAnyAnchorCommentStyle(context.anchorOptions.mode),
+                inlineLinkMode: '',
+                websiteOmitted: true,
+                linkMode: 'comment-only'
+            };
+            addDebugEvent('field', 'Comment-only form detected; skipping current direct-link task');
+            reportResult('skipped', {
+                reason: 'comment-only-form',
+                terminalFailureReason: 'comment_only_form',
+                linkMode: 'comment-only',
+                websiteOmitted: true
+            });
+            context.workflowAborted = true;
+            return;
+        }
+
+        context.comment = generateFallbackComment(context.pageTitle, context.anchorOptions);
+        if (context.useAI && step.useAI !== false && context.execution.useAIForComment) {
             try {
                 const pageContent = getPageContent();
-                const result = await chrome.runtime.sendMessage({
+                addDebugEvent('field', 'Generating comment with AI');
+                const result = await sendRuntimeMessageWithTimeout({
                     action: 'aiGenerateComment',
                     pageTitle: context.pageTitle,
                     pageContent,
                     targetUrl: context.anchorOptions.anchorUrl || context.values.website,
                     options: context.anchorOptions
-                });
-                context.comment = result.comment || '';
+                }, context.execution.aiCommentTimeoutMs, 'AI comment generation');
+                if (compactText(result?.comment || '')) {
+                    context.comment = result.comment;
+                }
             } catch (e) {
                 console.log('[BLA] AI 评论生成失败:', e);
+                addDebugEvent('field', `AI comment unavailable, keeping fast fallback: ${e.message}`);
             }
         }
 
-        if (!context.comment) {
-            context.comment = generateFallbackComment(context.pageTitle, context.anchorOptions);
+        context.comment = ensureLinkComment(context.comment, context.anchorOptions);
+        if (!compactText(context.comment)) {
+            context.comment = generateFallbackComment(context.pageTitle, {
+                mode: 'standard',
+                anchorText: '',
+                anchorUrl: '',
+                allowAnchorHtml: false,
+                linkMode: '',
+                useInlineLink: false
+            });
         }
-
-        context.comment = ensureAnchorComment(context.comment, context.anchorOptions);
         currentPublishMeta = {
             ...(currentPublishMeta || {}),
             commentStyle: context.anchorOptions.mode,
-            anchorRequested: context.anchorOptions.mode === 'anchor-html',
-            anchorInjected: /<a\b[^>]*href\s*=/i.test(context.comment),
+            anchorRequested: isAnyAnchorCommentStyle(context.anchorOptions.mode),
+            anchorInjected: commentContainsInlineLink(context.comment),
             anchorText: context.anchorOptions.anchorText || '',
             anchorUrl: context.anchorOptions.anchorUrl || '',
+            inlineLinkMode: context.anchorOptions.linkMode || '',
             commentPreview: truncateText(compactText(context.comment || ''), 180)
         };
 
-        if (context.anchorOptions.allowAnchorHtml) {
-            addDebugEvent('field', `Anchor mode enabled: ${context.anchorOptions.anchorText} -> ${context.anchorOptions.anchorUrl}`);
-        } else if (context.anchorOptions.mode === 'anchor-html') {
-            addDebugEvent('field', 'Anchor mode requested but current page was not judged as HTML-link-safe');
+        if (context.anchorOptions.useInlineLink) {
+            addDebugEvent(
+                'field',
+                `Inline link mode: ${context.anchorOptions.linkMode || 'unknown'} -> ${context.anchorOptions.anchorUrl}`
+            );
+        } else if (isAnyAnchorCommentStyle(context.anchorOptions.mode)) {
+            addDebugEvent('field', 'Anchor mode requested but current page was not judged as inline-link-safe');
         }
     }
 
-    function executeFillFieldsStep(step, context) {
+    async function executeFillFieldsStep(step, context) {
+        prepareFormForInteraction(context.form);
         const values = {
             comment: context.comment,
             name: context.values.name,
@@ -242,11 +522,63 @@
         const allowedFields = Array.isArray(step.fields) && step.fields.length > 0
             ? step.fields
             : ['comment', 'name', 'email', 'website'];
+        const nonCommentFields = allowedFields.filter((fieldType) => fieldType !== 'comment');
 
-        if (context.aiFormInfo?.fields?.length) {
-            fillFieldsFromAI(context.form, context.aiFormInfo, values, allowedFields);
-        } else {
-            fillFieldsByRules(context.form, values, allowedFields);
+        let commentFilled = false;
+        if (shouldUseClassicCommentFastPath(context.form)) {
+            const fastFill = await fillClassicCommentFormFast(context.form, values);
+            if (fastFill.commentFilled) {
+                commentFilled = true;
+                currentPublishMeta = {
+                    ...(currentPublishMeta || {}),
+                    commentFieldVerified: true,
+                    commentEditorType: 'textarea',
+                    commentFieldSelector: fastFill.commentSelector || currentPublishMeta?.commentFieldSelector || '',
+                    commentFillStrategy: 'classic-direct',
+                    formSignature: buildFormSignature(context.form) || currentPublishMeta?.formSignature || ''
+                };
+                addDebugEvent('field', 'Classic comment form fast-filled');
+            }
+        }
+        if (allowedFields.includes('comment') && values.comment) {
+            if (!commentFilled) {
+                commentFilled = await fillCommentFieldWithExecutor(context.form, values.comment, context);
+            }
+        }
+
+        let aiFilledFields = new Set();
+        if (context.aiFormInfo?.fields?.length && nonCommentFields.length > 0) {
+            aiFilledFields = await fillFieldsFromAI(context.form, context.aiFormInfo, values, nonCommentFields, {
+                execution: context.execution
+            });
+        }
+
+        const fallbackFields = nonCommentFields.filter((fieldType) => {
+            if (aiFilledFields.has(fieldType)) return false;
+            return !!values[fieldType];
+        });
+
+        if (fallbackFields.length > 0) {
+            if (context.aiFormInfo?.fields?.length) {
+                addDebugEvent('field', `Fallback rule fill for: ${fallbackFields.join(', ')}`);
+            }
+            await fillFieldsByRules(context.form, values, fallbackFields, {
+                execution: context.execution
+            });
+        }
+
+        if (values.comment) {
+            const ensuredComment = await ensureCommentFieldValue(context.form, values.comment, context, {
+                allowTypingFallback: true
+            });
+            if (ensuredComment) {
+                addDebugEvent('field', 'Verified comment field is populated');
+                if (!commentFilled) {
+                    addDebugEvent('field', 'Comment field recovered by dedicated executor verification');
+                }
+            } else {
+                addDebugEvent('field', 'Comment field still empty after fill attempts');
+            }
         }
     }
 
@@ -278,43 +610,69 @@
             autoSubmitTimer = setTimeout(() => {
                 autoSubmitTimer = null;
                 if (!publishStopped) {
-                    submitForm(context.form);
+                    submitForm(context);
                 }
-            }, 1500);
+            }, context.execution.submitDelayMs);
         } else {
-            showCommentReadyDialog(context.form);
+            showCommentReadyDialog(context);
         }
     }
 
     // === 表单查找（规则） ===
     function findFormByRules() {
+        const candidates = new Map();
+        const addCandidate = (form, bonus = 0) => {
+            if (!form) return;
+            const previous = candidates.get(form) || 0;
+            candidates.set(form, previous + scoreCommentForm(form) + bonus);
+        };
+
         const selectors = [
-            '#commentform', '#respond form', '.comment-form',
-            'form[action*="wp-comments-post"]', 'form.comment-form',
-            '#comments form', '.post-comments form'
+            '#commentform',
+            '#respond form',
+            '.comment-form',
+            'form[action*="wp-comments-post"]',
+            'form.comment-form',
+            '#comments form',
+            '.post-comments form',
+            '.comment-respond form'
         ];
-        for (const sel of selectors) {
-            const form = document.querySelector(sel);
-            if (form) return form;
-        }
+        selectors.forEach((selector) => {
+            document.querySelectorAll(selector).forEach((form) => addCandidate(form, 30));
+        });
+
+        document.querySelectorAll('form').forEach((form) => addCandidate(form, 0));
+
         // 通用：通过 textarea 反推 form
         const textareas = document.querySelectorAll('textarea');
         for (const ta of textareas) {
             const nameAttr = (ta.name || ta.id || '').toLowerCase();
             const placeholder = (ta.placeholder || '').toLowerCase();
             if (nameAttr.includes('comment') || nameAttr.includes('message') ||
+                nameAttr.includes('reply') ||
+                placeholder.includes('coment') ||
                 placeholder.includes('comment') || placeholder.includes('leave') ||
                 placeholder.includes('reply')) {
                 const form = ta.closest('form');
-                if (form) return form;
+                addCandidate(form, 20);
             }
         }
-        return null;
+
+        const rankedForms = Array.from(candidates.entries())
+            .filter(([form]) => formHasInteractiveFields(form))
+            .sort((left, right) => right[1] - left[1]);
+
+        return rankedForms[0]?.[0] || null;
+    }
+
+    function findStandardCommentForm() {
+        return getStandardCommentFlow()?.findStandardCommentForm?.() || null;
     }
 
     // === AI 字段填充 ===
-    function fillFieldsFromAI(form, aiFormInfo, values, allowedFields) {
+    async function fillFieldsFromAI(form, aiFormInfo, values, allowedFields, options = {}) {
         const allowed = new Set(allowedFields || ['comment', 'name', 'email', 'website']);
+        const filledFields = new Set();
         for (const field of aiFormInfo.fields) {
             try {
                 if (!allowed.has(field.type)) continue;
@@ -324,85 +682,259 @@
                     el = form.querySelector(field.selector) || document.querySelector(field.selector);
                 }
 
-                if (!el) continue;
+                if (!isUsableFieldElement(el, form, field.type)) continue;
 
-                switch (field.type) {
-                    case 'comment':
-                        setFieldValue(el, values.comment);
-                        recordFilledField(el, 'comment', values.comment);
-                        break;
-                    case 'name':
-                        if (values.name) {
-                            setFieldValue(el, values.name);
-                            recordFilledField(el, 'name', values.name);
-                        }
-                        break;
-                    case 'email':
-                        if (values.email) {
-                            setFieldValue(el, values.email);
-                            recordFilledField(el, 'email', values.email);
-                        }
-                        break;
-                    case 'website':
-                        if (values.website) {
-                            setFieldValue(el, values.website);
-                            recordFilledField(el, 'website', values.website);
-                        }
-                        break;
+                const value = values[field.type];
+                if (!value) continue;
+
+                const filled = await fillResolvedField(el, field.type, value, {
+                    execution: options.execution
+                });
+                if (filled) {
+                    filledFields.add(field.type);
                 }
             } catch (e) {
                 console.log(`[BLA] 填充字段失败 (${field.type}):`, e);
             }
         }
+        return filledFields;
     }
 
     // === 规则字段填充 ===
-    function fillFieldsByRules(form, values, allowedFields) {
+    async function fillFieldsByRules(form, values, allowedFields, options = {}) {
         const allowed = new Set(allowedFields || ['comment', 'name', 'email', 'website']);
 
         // Comment
         if (allowed.has('comment')) {
-            const commentField = form.querySelector(
-                'textarea[name="comment"], textarea#comment, textarea[name="message"], textarea'
-            );
-            if (commentField) {
-                setFieldValue(commentField, values.comment);
-                recordFilledField(commentField, 'comment', values.comment);
+            const commentField = findBestField(form, [
+                'textarea[name="comment"]',
+                'textarea#comment',
+                'textarea[name="message"]',
+                'textarea[name*="comment" i]',
+                'textarea[name*="message" i]',
+                'textarea'
+            ], 'comment');
+            if (commentField && values.comment) {
+                await fillResolvedField(commentField, 'comment', values.comment, {
+                    execution: options.execution
+                });
             }
         }
 
         // Name
         if (allowed.has('name')) {
-            const nameField = form.querySelector(
-                'input[name="author"], input#author, input[name="name"], input[placeholder*="name" i], input[placeholder*="名" i]'
-            );
+            const nameField = findBestField(form, [
+                'input[name="author"]',
+                'input#author',
+                'input[name="name"]',
+                'input[name*="name" i]',
+                'input[placeholder*="name" i]',
+                'input[placeholder*="nombre" i]',
+                'input[placeholder*="名" i]'
+            ], 'name');
             if (nameField && values.name) {
-                setFieldValue(nameField, values.name);
-                recordFilledField(nameField, 'name', values.name);
+                await fillResolvedField(nameField, 'name', values.name, {
+                    execution: options.execution
+                });
             }
         }
 
         // Email
         if (allowed.has('email')) {
-            const emailField = form.querySelector(
-                'input[name="email"], input#email, input[type="email"]'
-            );
+            const emailField = findBestField(form, [
+                'input[name="email"]',
+                'input#email',
+                'input[type="email"]',
+                'input[name*="mail" i]',
+                'input[placeholder*="correo" i]'
+            ], 'email');
             if (emailField && values.email) {
-                setFieldValue(emailField, values.email);
-                recordFilledField(emailField, 'email', values.email);
+                await fillResolvedField(emailField, 'email', values.email, {
+                    execution: options.execution
+                });
             }
         }
 
         // Website
         if (allowed.has('website')) {
-            const websiteField = form.querySelector(
-                'input[name="url"], input#url, input[name="website"], input[type="url"]'
-            );
+            const websiteField = findBestField(form, [
+                'input[name="url"]',
+                'input#url',
+                'input[name="website"]',
+                'input[type="url"]',
+                'input[name*="site" i]',
+                'input[name*="web" i]',
+                'input[placeholder*="web" i]',
+                'input[placeholder*="site" i]'
+            ], 'website');
             if (websiteField && values.website) {
-                setFieldValue(websiteField, values.website);
-                recordFilledField(websiteField, 'website', values.website);
+                await fillResolvedField(websiteField, 'website', values.website, {
+                    execution: options.execution
+                });
             }
         }
+    }
+
+    async function fillCommentFieldWithExecutor(form, comment, context) {
+        const executor = window.CommentExecutor;
+        if (!executor?.fillCommentField) {
+            return false;
+        }
+
+        const result = await executor.fillCommentField(form, comment, {
+            aiFormInfo: context.aiFormInfo,
+            templateHint: context.siteTemplate || null,
+            execution: context.execution
+        });
+
+        if (!result?.filled) {
+            updateCommentPublishMeta(form, result || {}, { filled: false });
+            return false;
+        }
+
+        context.commentFieldResolution = result;
+        updateCommentPublishMeta(form, result, { filled: true });
+        recordFilledField(result.element, 'comment', comment);
+        addDebugEvent('field', `Comment executor matched ${result.editorType || 'field'} via ${result.strategy || 'unknown'} strategy`);
+        return true;
+    }
+
+    function updateCommentPublishMeta(form, result = {}, options = {}) {
+        currentPublishMeta = {
+            ...(currentPublishMeta || {}),
+            commentFieldVerified: !!options.filled,
+            commentEditorType: result.editorType || currentPublishMeta?.commentEditorType || '',
+            commentFieldSelector: result.selector || currentPublishMeta?.commentFieldSelector || '',
+            commentFieldFingerprint: result.fingerprint || currentPublishMeta?.commentFieldFingerprint || '',
+            commentFillStrategy: result.strategy || currentPublishMeta?.commentFillStrategy || '',
+            commentCandidateCount: Number(result.candidateCount || currentPublishMeta?.commentCandidateCount || 0) || 0,
+            formSignature: result.formSignature || buildFormSignature(form) || currentPublishMeta?.formSignature || '',
+            linkMode: derivePublishLinkMode(result, currentPublishMeta?.commentStyle || 'standard', currentPublishMeta?.anchorRequested)
+        };
+    }
+
+    function buildFormSignature(form) {
+        const standardSignature = getStandardCommentFlow()?.buildFormSignature?.(form);
+        if (standardSignature) return standardSignature;
+        if (!form) return '';
+        return compactText([
+            form.id || '',
+            form.className || '',
+            form.getAttribute('action') || '',
+            form.getAttribute('method') || '',
+            form.querySelector('textarea[name="comment"], textarea#comment, [contenteditable="true"], .ql-editor, .ProseMirror')
+                ? 'comment-editor'
+                : '',
+            form.querySelector('input[name="url"], input#url, input[name="website"], input[type="url"]')
+                ? 'website-field'
+                : ''
+        ].join(' ')).toLowerCase();
+    }
+
+    function derivePublishLinkMode(result = {}, commentStyle, anchorRequested) {
+        const explicitInlineMode = compactText(currentPublishMeta?.inlineLinkMode || '');
+        if (explicitInlineMode) {
+            return explicitInlineMode;
+        }
+        if ((isAnyAnchorCommentStyle(commentStyle) || anchorRequested) && currentPublishMeta?.anchorInjected) {
+            return result?.editorType && result.editorType !== 'textarea'
+                ? 'rich-editor-anchor'
+                : 'raw-html-anchor';
+        }
+        return currentPublishMeta?.websiteOmitted ? 'comment-only' : 'website-field';
+    }
+
+    async function fillResolvedField(el, fieldType, value, options = {}) {
+        if (!el || !value) return false;
+
+        const strategy = resolveFieldExecutionStrategy(fieldType, options.execution);
+        const filled = await applyFieldValue(el, value, {
+            strategy,
+            allowTypingFallback: fieldType === 'comment',
+            verifyValue: true
+        });
+
+        if (filled) {
+            recordFilledField(el, fieldType, value);
+        }
+
+        return filled;
+    }
+
+    function resolveFieldExecutionStrategy(fieldType, execution = {}) {
+        if (fieldType === 'comment') {
+            return execution?.preferHumanTypingForComment === false ? 'direct' : 'typing';
+        }
+        return 'direct';
+    }
+
+    function findBestField(form, selectors = [], fieldType = 'text') {
+        const candidates = [];
+        selectors.forEach((selector) => {
+            form.querySelectorAll(selector).forEach((el) => candidates.push(el));
+        });
+        const usable = candidates.filter((el) => isUsableFieldElement(el, form, fieldType));
+        return usable[0] || null;
+    }
+
+    function isUsableFieldElement(el, form, fieldType = 'text') {
+        if (!el) return false;
+        if (!(el instanceof HTMLElement)) return false;
+        if (!isVisible(el) || el.disabled || el.readOnly) return false;
+        if (!isElementOwnedByForm(el, form)) return false;
+
+        const tagName = (el.tagName || '').toLowerCase();
+        const inputType = (el.getAttribute('type') || '').toLowerCase();
+
+        if (fieldType === 'comment') {
+            return tagName === 'textarea' || el.isContentEditable;
+        }
+
+        if (tagName !== 'input' && tagName !== 'textarea') return false;
+        if (tagName === 'textarea') return fieldType === 'comment';
+
+        if (['hidden', 'submit', 'button', 'checkbox', 'radio', 'file'].includes(inputType)) {
+            return false;
+        }
+
+        if (fieldType === 'email') return inputType === 'email' || inputType === '' || inputType === 'text';
+        if (fieldType === 'website') return inputType === 'url' || inputType === '' || inputType === 'text';
+        return inputType === '' || inputType === 'text' || inputType === 'search';
+    }
+
+    function isElementOwnedByForm(el, form) {
+        if (!el || !form) return false;
+        if (form.contains(el)) return true;
+        if (el.form && el.form === form) return true;
+        const ownerForm = el.closest?.('form');
+        return ownerForm === form;
+    }
+
+    function fieldValueMatches(el, expectedValue) {
+        return compactText(readElementValue(el)) === compactText(expectedValue || '');
+    }
+
+    function scoreCommentForm(form) {
+        if (!form) return -Infinity;
+
+        const signature = compactText(
+            `${form.id || ''} ${form.className || ''} ${form.getAttribute('action') || ''}`
+        ).toLowerCase();
+        const text = compactText(form.textContent || '').toLowerCase();
+        let score = 0;
+
+        if (isVisible(form)) score += 20;
+        if (/comment|respond|reply/.test(signature)) score += 35;
+        if (/wp-comments-post/.test(signature)) score += 30;
+        if (/(deja un comentario|leave a comment|发表评论|发表回复|reply|comentario)/.test(text)) score += 25;
+        if (form.querySelector('textarea')) score += 10;
+        if (form.querySelector('textarea[name="comment"], textarea#comment, textarea[name*="comment" i], textarea[name*="message" i]')) score += 25;
+        if (form.querySelector('input[name="author"], input#author, input[name="name"], input[name*="name" i]')) score += 12;
+        if (form.querySelector('input[name="email"], input#email, input[type="email"], input[name*="mail" i]')) score += 12;
+        if (form.querySelector('input[name="url"], input#url, input[name="website"], input[type="url"], input[name*="web" i]')) score += 8;
+        if (findSubmitButton(form)) score += 10;
+
+        return score;
     }
 
     // === 取消通知勾选 ===
@@ -440,10 +972,122 @@
     }
 
     // === 工具函数 ===
-    function setFieldValue(el, value) {
+    async function applyFieldValue(el, value, options = {}) {
+        const expected = compactText(value || '');
+        if (!el || !expected) return false;
+
+        const strategy = options.strategy || 'direct';
+        if (strategy === 'typing') {
+            await simulateFieldTyping(el, value, options);
+            if (!options.verifyValue) return true;
+            if (fieldValueMatches(el, expected)) return true;
+        } else {
+            setFieldValue(el, value);
+            if (!options.verifyValue) return true;
+            if (fieldValueMatches(el, expected)) return true;
+        }
+
+        if (options.allowTypingFallback && strategy !== 'typing') {
+            await simulateFieldTyping(el, value, options);
+            if (!options.verifyValue) return true;
+            if (fieldValueMatches(el, expected)) return true;
+        }
+
+        return !options.verifyValue ? true : fieldValueMatches(el, expected);
+    }
+
+    function writeElementValue(el, value) {
+        if (el instanceof HTMLInputElement) {
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            if (descriptor?.set) {
+                descriptor.set.call(el, value);
+            } else {
+                el.value = value;
+            }
+            return;
+        }
+
+        if (el instanceof HTMLTextAreaElement) {
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+            if (descriptor?.set) {
+                descriptor.set.call(el, value);
+            } else {
+                el.value = value;
+            }
+            return;
+        }
+
+        if (el?.isContentEditable) {
+            el.innerHTML = value;
+            return;
+        }
+
         el.value = value;
+    }
+
+    function readElementValue(el) {
+        if (!el) return '';
+        if (el?.isContentEditable) return el.textContent || '';
+        return el.value || el.textContent || '';
+    }
+
+    function dispatchFieldInputEvents(el) {
         el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function dispatchFieldChangeEvents(el) {
         el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function setFieldValue(el, value) {
+        writeElementValue(el, value);
+        dispatchFieldInputEvents(el);
+        dispatchFieldChangeEvents(el);
+    }
+
+    async function ensureCommentFieldValue(form, comment, contextOrOptions = {}, extraOptions = {}) {
+        const expected = compactText(comment || '');
+        if (!form || !expected) return false;
+
+        const hasContext = !!contextOrOptions?.values || !!contextOrOptions?.resource || !!contextOrOptions?.execution;
+        const context = hasContext ? contextOrOptions : null;
+        const options = hasContext ? extraOptions : contextOrOptions;
+        const executor = window.CommentExecutor;
+
+        if (executor?.ensureCommentFieldValue) {
+            const result = await executor.ensureCommentFieldValue(form, comment, {
+                aiFormInfo: context?.aiFormInfo || null,
+                templateHint: context?.siteTemplate || null,
+                execution: context?.execution || null,
+                previousResolution: context?.commentFieldResolution || null,
+                ...(options || {})
+            });
+            if (result?.filled) {
+                if (context) {
+                    context.commentFieldResolution = result;
+                }
+                updateCommentPublishMeta(form, result, { filled: true });
+                return true;
+            }
+        }
+
+        const commentField = findBestField(form, [
+            'textarea[name="comment"]',
+            'textarea#comment',
+            'textarea[name="message"]',
+            'textarea[name*="comment" i]',
+            'textarea[name*="message" i]',
+            'textarea'
+        ], 'comment');
+        if (!commentField) return false;
+        if (fieldValueMatches(commentField, expected)) return true;
+
+        return applyFieldValue(commentField, comment, {
+            strategy: 'typing',
+            allowTypingFallback: true,
+            verifyValue: true,
+            ...(options || {})
+        });
     }
 
     function setCheckboxValue(el, checked) {
@@ -481,8 +1125,11 @@
     }
 
     function generateFallbackComment(title, anchorOptions = {}) {
-        if (anchorOptions.allowAnchorHtml && anchorOptions.anchorText && anchorOptions.anchorUrl) {
-            const anchorTag = `<a href="${anchorOptions.anchorUrl}">${anchorOptions.anchorText}</a>`;
+        if (anchorOptions.useInlineLink && anchorOptions.anchorUrl) {
+            const anchorTag = buildInlineLinkMarkup(anchorOptions);
+            if (!anchorTag) {
+                return generateFallbackComment(title, { mode: 'standard', useInlineLink: false });
+            }
             const templates = [
                 `This was a thoughtful article about ${title || 'this topic'}. I also found ${anchorTag} useful for readers exploring the same area.`,
                 `Thanks for sharing such a clear breakdown of ${title || 'the topic'}. For anyone comparing perspectives, ${anchorTag} is another helpful reference.`,
@@ -502,7 +1149,8 @@
     }
 
     // === 弹窗 ===
-    function showCommentReadyDialog(form) {
+    function showCommentReadyDialog(context) {
+        const form = context.form;
         removeDialog();
 
         const overlay = document.createElement('div');
@@ -538,7 +1186,7 @@
             if (publishStopped) return;
             addDebugEvent('field', 'User confirmed submit');
             removeDialog();
-            submitForm(form);
+            submitForm(context);
         });
 
         dialog.querySelector('#bla-skip').addEventListener('click', () => {
@@ -550,14 +1198,34 @@
         });
     }
 
-    function submitForm(form) {
+    async function submitForm(context) {
+        const form = context.form;
         if (publishStopped) return;
 
-        const submitBtn = form.querySelector(
-            'button[type="submit"], input[type="submit"], button#submit, .submit, button[name="submit"]'
-        );
+        const fallbackComment = compactText(context.comment || '')
+            || generateFallbackComment(context.pageTitle, {
+                mode: 'standard',
+                anchorText: '',
+                anchorUrl: '',
+                allowAnchorHtml: false
+            });
+        if (!(await ensureCommentFieldValue(form, fallbackComment, context, { allowTypingFallback: true }))) {
+            addDebugEvent('field', 'Comment field is still empty before submit; aborting submission');
+            reportResult('failed', {
+                reason: 'comment-field-empty',
+                submissionBlocked: true
+            });
+            return;
+        }
+
+        const submitBtn = findSubmitButton(form, context.aiFormInfo);
+        currentPublishMeta = {
+            ...(currentPublishMeta || {}),
+            submitSelector: submitBtn ? describeElementForMeta(submitBtn) : (currentPublishMeta?.submitSelector || '')
+        };
 
         addDebugEvent('field', 'Submitting form');
+        clearWorkflowStallTimer();
         chrome.runtime.sendMessage({
             action: 'commentSubmitting',
             resourceId: currentResourceId,
@@ -565,23 +1233,119 @@
             meta: currentPublishMeta || {}
         }).catch(() => {});
 
-        if (submitBtn) {
-            submitBtn.click();
-        } else {
-            form.submit();
+        const triggered = await triggerSubmitAction(form, submitBtn);
+        if (!triggered) {
+            addDebugEvent('field', 'Submit action could not be triggered');
+            reportResult('failed', {
+                reason: 'submit-trigger-failed',
+                submissionBlocked: true
+            });
+            return;
         }
 
         setTimeout(() => reportResult('submitted', { reportedVia: 'timeout-fallback' }), 8000);
     }
 
     function reportResult(result, extraMeta = {}) {
+        clearWorkflowStallTimer();
+        const startedAt = currentPublishMeta?.publishStartedAt || '';
+        const durationMs = startedAt ? Math.max(0, Date.now() - new Date(startedAt).getTime()) : 0;
         chrome.runtime.sendMessage({
             action: 'commentAction',
             resourceId: currentResourceId,
             taskId: currentTaskId,
             result,
-            meta: { ...(currentPublishMeta || {}), ...(extraMeta || {}) }
+            meta: { ...(currentPublishMeta || {}), durationMs, ...(extraMeta || {}) }
         });
+    }
+
+    async function triggerSubmitAction(form, submitBtn) {
+        const readySubmitBtn = await waitForSubmitButtonReady(submitBtn);
+
+        if (readySubmitBtn) {
+            readySubmitBtn.focus?.();
+            try {
+                readySubmitBtn.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+            } catch {}
+            dispatchSubmitPointerEvents(readySubmitBtn);
+        }
+
+        if (typeof form?.requestSubmit === 'function') {
+            try {
+                form.requestSubmit(readySubmitBtn || undefined);
+                return true;
+            } catch {}
+        }
+
+        if (readySubmitBtn) {
+            try {
+                readySubmitBtn.click();
+                return true;
+            } catch {}
+        }
+
+        try {
+            const accepted = form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            if (!accepted) {
+                return false;
+            }
+        } catch {}
+
+        try {
+            HTMLFormElement.prototype.submit.call(form);
+            return true;
+        } catch {}
+
+        try {
+            form.submit();
+            return true;
+        } catch {}
+
+        return false;
+    }
+
+    async function waitForSubmitButtonReady(submitBtn, timeoutMs = 1800) {
+        if (!submitBtn) return null;
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            if (!isSubmitControlDisabled(submitBtn)) {
+                return submitBtn;
+            }
+            await wait(120);
+        }
+        return submitBtn;
+    }
+
+    function isSubmitControlDisabled(el) {
+        if (!el) return true;
+        if (el.disabled) return true;
+        const ariaDisabled = compactText(el.getAttribute?.('aria-disabled') || '').toLowerCase();
+        if (ariaDisabled === 'true') return true;
+        const className = compactText(el.className || '').toLowerCase();
+        if (/\bdisabled\b/.test(className)) return true;
+        return false;
+    }
+
+    function dispatchSubmitPointerEvents(el) {
+        if (!el) return;
+        const mouseOptions = { bubbles: true, cancelable: true, view: window };
+        const pointerOptions = { bubbles: true, cancelable: true, pointerType: 'mouse', isPrimary: true };
+        const events = [
+            () => typeof PointerEvent === 'function' ? new PointerEvent('pointerdown', pointerOptions) : null,
+            () => new MouseEvent('mousedown', mouseOptions),
+            () => typeof PointerEvent === 'function' ? new PointerEvent('pointerup', pointerOptions) : null,
+            () => new MouseEvent('mouseup', mouseOptions),
+            () => new MouseEvent('click', mouseOptions)
+        ];
+
+        for (const createEvent of events) {
+            try {
+                const event = createEvent();
+                if (event) {
+                    el.dispatchEvent(event);
+                }
+            } catch {}
+        }
     }
 
     function removeDialog() {
@@ -594,6 +1358,7 @@
     function cancelCurrentPublish() {
         publishStopped = true;
         clearAutoSubmitTimer();
+        clearWorkflowStallTimer();
         addDebugEvent('field', 'Publish session stopped by user');
         removeDialog();
     }
@@ -605,11 +1370,74 @@
         }
     }
 
+    function clearWorkflowStallTimer() {
+        if (workflowStallTimer) {
+            clearTimeout(workflowStallTimer);
+            workflowStallTimer = null;
+        }
+    }
+
+    function armWorkflowStallTimer(context) {
+        if (!context || context.mode !== 'full-auto' || currentDebugMode) {
+            return;
+        }
+        clearWorkflowStallTimer();
+        const timeoutMs = Number(context.execution?.workflowStallTimeoutMs || 0) || WORKFLOW_STALL_TIMEOUT_MS;
+        workflowStallTimer = setTimeout(() => {
+            workflowStallTimer = null;
+            if (publishStopped) return;
+            addDebugEvent('field', 'Workflow stalled before submit; aborting current resource');
+            reportResult('failed', {
+                reason: 'workflow-stall-timeout',
+                terminalFailureReason: 'workflow_stall_timeout',
+                submissionBlocked: true
+            });
+        }, timeoutMs);
+    }
+
     function resolveWorkflow(workflow) {
         if (workflow?.steps?.length) {
             return cloneValue(workflow);
         }
         return cloneValue(LOCAL_DEFAULT_WORKFLOW);
+    }
+
+    function resolveExecutionProfile(context) {
+        if (!context?.useAI) {
+            return { ...EXECUTION_PROFILES.fast };
+        }
+
+        const resource = context?.resource || {};
+        const opportunities = new Set(resource?.opportunities || []);
+        const linkModes = new Set(resource?.linkModes || []);
+        const detailsText = compactText((resource?.details || []).join(' ')).toLowerCase();
+        const linkMethod = compactText(resource?.linkMethod || '').toLowerCase();
+        const wantsStrictAnchorHtml = isStrictAnchorCommentStyle(context?.data?.commentStyle);
+        const explicitComplexSignals =
+            resource?.aiClassified
+            || opportunities.has('rich-editor')
+            || opportunities.has('disqus')
+            || /contenteditable|rich-editor|prosemirror|tinymce|ckeditor|captcha|disqus|iframe|shadow-root/i.test(detailsText);
+        const looksLikeStandardCommentResource =
+            opportunities.has('comment')
+            && (
+                linkMethod === 'website-field'
+                || linkMethod === 'html'
+                || linkModes.has('markdown-link')
+                || linkModes.has('bbcode-link')
+                || linkModes.has('plain-url')
+                || /inline-submit-form|textarea\+url\+submit|commentform|wp-comments-post|website-field/.test(detailsText)
+            );
+
+        if (looksLikeStandardCommentResource && !wantsStrictAnchorHtml && !explicitComplexSignals) {
+            return { ...EXECUTION_PROFILES.fast };
+        }
+
+        if (!explicitComplexSignals) {
+            return { ...EXECUTION_PROFILES.hybrid };
+        }
+
+        return { ...EXECUTION_PROFILES.ai };
     }
 
     function removeDebugArtifacts() {
@@ -624,17 +1452,111 @@
         const mode = context.data.commentStyle || 'standard';
         const anchorText = deriveAnchorText(context.data.anchorKeyword || '', context.data.anchorUrl || context.values.website || '');
         const anchorUrl = compactText(context.data.anchorUrl || context.values.website || '');
-        const allowAnchorHtml = mode === 'anchor-html'
-            && !!anchorText
-            && !!anchorUrl
-            && pageAllowsHtmlLinks(context.form, context.resource, context.aiFormInfo);
+        const linkMode = resolveInlineLinkMode(context, anchorText, anchorUrl);
+        const allowAnchorHtml = linkMode === 'raw-html-anchor' || linkMode === 'rich-editor-anchor';
 
         return {
             mode,
             anchorText,
             anchorUrl,
-            allowAnchorHtml
+            allowAnchorHtml,
+            linkMode,
+            useInlineLink: !!linkMode
         };
+    }
+
+    function resolveInlineLinkMode(context, anchorText, anchorUrl) {
+        if (!anchorUrl) return '';
+
+        const resourceModes = Array.from(new Set((context?.resource?.linkModes || []).filter(Boolean)));
+        const templateMode = compactText(context?.siteTemplate?.linkMode || '');
+        const wantsAnchorMode = isAnyAnchorCommentStyle(context?.data?.commentStyle);
+        const runtimeModes = getRuntimeSupportedInlineModes(context.form, context.aiFormInfo, context.siteTemplate);
+        const supportedModes = resourceModes.filter((mode) =>
+            isSupportedInlineLinkMode(mode) && runtimeModes.includes(mode)
+        );
+        const wantedModes = wantsAnchorMode
+            ? ['raw-html-anchor', 'rich-editor-anchor']
+            : ['markdown-link', 'bbcode-link', 'plain-url', 'raw-html-anchor', 'rich-editor-anchor'];
+        const eligibleModes = supportedModes.filter((mode) => wantedModes.includes(mode));
+        const shouldForceInlineLink = wantsAnchorMode || (!!currentPublishMeta?.websiteOmitted && supportedModes.length > 0);
+
+        if (!shouldForceInlineLink) {
+            return '';
+        }
+
+        if (eligibleModes.length === 0) {
+            if (wantsAnchorMode && pageAllowsHtmlLinks(context.form, context.resource, context.aiFormInfo, context.siteTemplate)) {
+                return 'raw-html-anchor';
+            }
+            return '';
+        }
+
+        if (templateMode && eligibleModes.includes(templateMode)) {
+            return templateMode;
+        }
+
+        for (const mode of wantedModes) {
+            if (eligibleModes.includes(mode)) {
+                if ((mode === 'raw-html-anchor' || mode === 'rich-editor-anchor')
+                    && !pageAllowsHtmlLinks(context.form, context.resource, context.aiFormInfo, context.siteTemplate)) {
+                    continue;
+                }
+                if (!anchorText && mode !== 'plain-url') {
+                    continue;
+                }
+                return mode;
+            }
+        }
+
+        return '';
+    }
+
+    function formHasWebsiteField(form) {
+        if (!form) return false;
+        return !!form.querySelector('input[name="url"], input#url, input[name="website"], input#website, input[type="url"], input[name="homepage"]');
+    }
+
+    function formHasIdentityFields(form) {
+        if (!form) return false;
+        return !!form.querySelector(
+            'input[name="author"], input#author, input[name="name"], input#name, input[name="email"], input#email'
+        );
+    }
+
+    function formHasCommentEditor(form) {
+        if (!form) return false;
+        return !!form.querySelector('textarea, [contenteditable="true"], .ql-editor, .ProseMirror, .mce-content-body');
+    }
+
+    function hasVerifiedInlineCapability(form, context) {
+        return getRuntimeSupportedInlineModes(form, context?.aiFormInfo, context?.siteTemplate).length > 0;
+    }
+
+    function shouldSkipCommentOnlyDirectPublish(context) {
+        const form = context?.form;
+        if (!form) return false;
+
+        const wantsDirectLink = !!compactText(context?.values?.website || '')
+            || isAnyAnchorCommentStyle(context?.data?.commentStyle);
+        if (!wantsDirectLink) return false;
+
+        if (!formHasCommentEditor(form)) return false;
+        if (formHasWebsiteField(form)) return false;
+        if (formHasIdentityFields(form)) return false;
+        if (hasVerifiedInlineCapability(form, context)) return false;
+
+        return true;
+    }
+
+    function shouldSkipUnavailableAnchorPublish(context) {
+        if (!isStrictAnchorCommentStyle(context?.data?.commentStyle)) return false;
+        const form = context?.form;
+        if (!form) return false;
+        const runtimeModes = getRuntimeSupportedInlineModes(form, context?.aiFormInfo, context?.siteTemplate);
+        const resolvedMode = compactText(context?.anchorOptions?.linkMode || '');
+        const htmlCapable = runtimeModes.includes('raw-html-anchor') || runtimeModes.includes('rich-editor-anchor');
+        return !htmlCapable || !['raw-html-anchor', 'rich-editor-anchor'].includes(resolvedMode);
     }
 
     function deriveAnchorText(preferredText, anchorUrl) {
@@ -657,34 +1579,48 @@
         }
     }
 
-    function ensureAnchorComment(comment, anchorOptions) {
+    function ensureLinkComment(comment, anchorOptions) {
         const baseComment = compactText(comment || '');
-        if (!anchorOptions.allowAnchorHtml || !anchorOptions.anchorText || !anchorOptions.anchorUrl) {
+        if (!anchorOptions.useInlineLink || !anchorOptions.anchorUrl) {
             return baseComment;
         }
 
-        const anchorTag = `<a href="${escapeHtml(anchorOptions.anchorUrl)}">${escapeHtml(anchorOptions.anchorText)}</a>`;
-        if (/<a\b[^>]*href\s*=/i.test(baseComment)) {
-            return baseComment.replace(
-                /<a\b[^>]*href\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([\s\S]*?)<\/a>/i,
-                anchorTag
-            );
+        const inlineMarkup = buildInlineLinkMarkup(anchorOptions);
+        if (!inlineMarkup) {
+            return baseComment;
+        }
+
+        if (anchorOptions.linkMode === 'raw-html-anchor' || anchorOptions.linkMode === 'rich-editor-anchor') {
+            if (/<a\b[^>]*href\s*=/i.test(baseComment)) {
+                return baseComment.replace(
+                    /<a\b[^>]*href\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([\s\S]*?)<\/a>/i,
+                    inlineMarkup
+                );
+            }
+        }
+        if (anchorOptions.linkMode === 'markdown-link' && /\[[^\]]+\]\(([^)]+)\)/i.test(baseComment)) {
+            return baseComment.replace(/\[[^\]]+\]\(([^)]+)\)/i, inlineMarkup);
+        }
+        if (anchorOptions.linkMode === 'bbcode-link' && /\[url(?:=[^\]]+)?\][\s\S]*?\[\/url\]/i.test(baseComment)) {
+            return baseComment.replace(/\[url(?:=[^\]]+)?\][\s\S]*?\[\/url\]/i, inlineMarkup);
         }
 
         const variants = buildAnchorUrlVariants(anchorOptions.anchorUrl);
         for (const variant of variants) {
-            const replaced = replaceFirstCaseInsensitive(baseComment, variant, anchorTag);
+            const replaced = replaceFirstCaseInsensitive(baseComment, variant, inlineMarkup);
             if (replaced !== baseComment) {
                 return replaced;
             }
         }
 
-        const replacedAnchorText = replaceFirstCaseInsensitive(baseComment, anchorOptions.anchorText, anchorTag);
-        if (replacedAnchorText !== baseComment) {
-            return replacedAnchorText;
+        if (anchorOptions.anchorText && anchorOptions.linkMode !== 'plain-url') {
+            const replacedAnchorText = replaceFirstCaseInsensitive(baseComment, anchorOptions.anchorText, inlineMarkup);
+            if (replacedAnchorText !== baseComment) {
+                return replacedAnchorText;
+            }
         }
 
-        const anchorSentence = `For readers exploring this further, ${anchorTag} is worth a look.`;
+        const anchorSentence = buildInlineLinkSentence(anchorOptions, inlineMarkup);
         if (!baseComment) {
             return anchorSentence;
         }
@@ -692,6 +1628,60 @@
             return `${baseComment} ${anchorSentence}`;
         }
         return `${baseComment}. ${anchorSentence}`;
+    }
+
+    function buildInlineLinkMarkup(anchorOptions = {}) {
+        const anchorText = compactText(anchorOptions.anchorText || '');
+        const anchorUrl = compactText(anchorOptions.anchorUrl || '');
+        if (!anchorUrl) return '';
+
+        switch (anchorOptions.linkMode) {
+            case 'raw-html-anchor':
+            case 'rich-editor-anchor':
+                if (!anchorText) return '';
+                return `<a href="${escapeHtml(anchorUrl)}">${escapeHtml(anchorText)}</a>`;
+            case 'markdown-link':
+                if (!anchorText) return '';
+                return `[${anchorText}](${anchorUrl})`;
+            case 'bbcode-link':
+                if (!anchorText) return '';
+                return `[url=${anchorUrl}]${anchorText}[/url]`;
+            case 'plain-url':
+                return anchorUrl;
+            default:
+                return '';
+        }
+    }
+
+    function buildInlineLinkSentence(anchorOptions = {}, inlineMarkup = '') {
+        if (!inlineMarkup) return '';
+        if (anchorOptions.linkMode === 'plain-url') {
+            if (anchorOptions.anchorText) {
+                return `For readers exploring this further, ${anchorOptions.anchorText}: ${inlineMarkup}`;
+            }
+            return `For readers exploring this further, ${inlineMarkup}`;
+        }
+        return `For readers exploring this further, ${inlineMarkup} is worth a look.`;
+    }
+
+    function isSupportedInlineLinkMode(mode) {
+        return [
+            'raw-html-anchor',
+            'rich-editor-anchor',
+            'markdown-link',
+            'bbcode-link',
+            'plain-url'
+        ].includes(compactText(mode || ''));
+    }
+
+    function commentContainsInlineLink(comment = '') {
+        const normalized = String(comment || '');
+        return (
+            /<a\b[^>]*href\s*=/i.test(normalized)
+            || /\[[^\]]+\]\(([^)]+)\)/i.test(normalized)
+            || /\[url(?:=[^\]]+)?\][\s\S]*?\[\/url\]/i.test(normalized)
+            || /\bhttps?:\/\/[^\s<>"')\]]+/i.test(normalized)
+        );
     }
 
     function buildAnchorUrlVariants(anchorUrl) {
@@ -718,23 +1708,69 @@
         return text.replace(new RegExp(escapeRegExp(target), 'i'), replacement);
     }
 
-    function pageAllowsHtmlLinks(form, resource, aiFormInfo) {
+    function pageShowsExistingCommentBodyAnchors(form) {
+        const roots = [];
+        const scopedRoot = form?.closest?.('#comments, .comments-area, .commentlist, .comment-list, .post-comments, article, main');
+        if (scopedRoot) roots.push(scopedRoot);
+        roots.push(document);
+
+        const excludedSelectors = [
+            '.comment-author',
+            '.fn',
+            '.avatar',
+            '.reply',
+            '.comment-reply-link',
+            '.comment-meta',
+            '.commentmetadata',
+            '.comment-edit-link',
+            '.says',
+            '.navigation',
+            '.nav-links'
+        ].join(', ');
+
+        const selectors = [
+            '.comment-content a[href]',
+            '.comment-body a[href]',
+            '.comments-area p a[href]',
+            '#comments p a[href]',
+            'li.comment p a[href]',
+            'article.comment p a[href]'
+        ].join(', ');
+
+        for (const root of roots) {
+            const anchors = Array.from(root.querySelectorAll(selectors));
+            for (const anchor of anchors) {
+                if (!(anchor instanceof HTMLAnchorElement)) continue;
+                const href = compactText(anchor.getAttribute('href') || '');
+                const text = compactText(anchor.textContent || '');
+                if (!href || /^#|^(javascript|mailto|tel):/i.test(href)) continue;
+                if (anchor.closest(excludedSelectors)) continue;
+                if (text.length < 2) continue;
+                const block = anchor.closest('.comment-content, .comment-body, li.comment, article.comment, .comment, p, div');
+                const blockText = compactText(block?.textContent || '');
+                if (blockText.length < 24) continue;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function pageAllowsHtmlLinks(form, resource, aiFormInfo, siteTemplate) {
         if (!form) return false;
 
-        const formAction = compactText(form.getAttribute('action') || '').toLowerCase();
-        if (formAction.includes('wp-comments-post')) {
+        const templateMode = compactText(siteTemplate?.linkMode || '');
+        if (templateMode === 'raw-html-anchor' || templateMode === 'rich-editor-anchor') {
             return true;
         }
 
-        if (form.id === 'commentform' && form.querySelector('input[name="comment_post_ID"]')) {
+        if (form.querySelector('[contenteditable="true"], .ql-editor, .ProseMirror, .mce-content-body, .tox-edit-area, .note-editable')) {
             return true;
         }
 
-        if (resource?.linkMethod === 'html') return true;
-        if (Array.isArray(resource?.opportunities) && resource.opportunities.includes('rich-editor')) return true;
-        if (Array.isArray(resource?.details) && resource.details.some((item) => /html|链接|可插入/i.test(String(item)))) return true;
-
-        if (form.querySelector('[contenteditable="true"], .ql-editor, .ProseMirror, .mce-content-body')) {
+        if (form.querySelector(
+            '[aria-label*="link" i], [title*="link" i], [data-command="link"], .ql-link, .mce-i-link, .note-btn[data-event="showLinkDialog"]'
+        )) {
             return true;
         }
 
@@ -748,7 +1784,230 @@
             return true;
         }
 
+        if (pageShowsExistingCommentBodyAnchors(form)) {
+            return true;
+        }
+
         return false;
+    }
+
+    function getRuntimeSupportedInlineModes(form, aiFormInfo, siteTemplate) {
+        const modes = [];
+        const formText = compactText(form?.textContent || '').toLowerCase();
+
+        if (pageAllowsHtmlLinks(form, null, aiFormInfo, siteTemplate)) {
+            if (form?.querySelector('[contenteditable="true"], .ql-editor, .ProseMirror, .mce-content-body, .tox-edit-area, .note-editable')) {
+                modes.push('rich-editor-anchor');
+            } else {
+                modes.push('raw-html-anchor');
+            }
+        }
+
+        if (/markdown|commonmark|supports markdown|markdown editor|use markdown|支持markdown|使用markdown/.test(formText)) {
+            modes.push('markdown-link');
+        }
+
+        if (/bbcode|ubb|bulletin board code|支持bbcode|\[url/.test(formText)) {
+            modes.push('bbcode-link');
+        }
+
+        if (/autolink|linkify|plain url|bare url|paste a url|paste url|urls? will be linked|自动识别链接|自动转链接/.test(formText)) {
+            modes.push('plain-url');
+        }
+
+        return Array.from(new Set(modes));
+    }
+
+    async function waitForCommentForm(context, options = {}) {
+        const timeoutMs = Number(options.timeoutMs || 0) || 20000;
+        const pollMs = Number(options.pollMs || 0) || 1200;
+        const aiTimeoutMs = Number(options.aiTimeoutMs || 0) || 3000;
+        const start = Date.now();
+        let aiAttempted = false;
+
+        while (!publishStopped && Date.now() - start < timeoutMs) {
+            const standardForm = findStandardCommentForm();
+            if (standardForm) {
+                return standardForm;
+            }
+            await primeCommentSectionSearch(context, {
+                immediate: Date.now() - start < 2400,
+                forceProgressiveScroll: Date.now() - start < 4000
+            });
+            const dismissed = dismissConsentAndCookieBanners();
+            if (dismissed > 0) {
+                await wait(250);
+            }
+            const ruleForm = findFormByRules();
+            if (ruleForm && formHasInteractiveFields(ruleForm)) {
+                return ruleForm;
+            }
+
+            if (options.useAI) {
+                const shouldRefreshAI = !aiAttempted || !context.aiFormInfo?.hasForm;
+                if (shouldRefreshAI) {
+                    try {
+                        const formAreaHtml = getCommentAreaHtml();
+                        if (formAreaHtml) {
+                            addDebugEvent('field', 'Analyzing form with AI');
+                            context.aiFormInfo = await sendRuntimeMessageWithTimeout({
+                                action: 'aiExtractForm',
+                                html: formAreaHtml
+                            }, aiTimeoutMs, 'AI form extraction');
+                            aiAttempted = true;
+                            if (context.aiFormInfo?.hasForm) {
+                                addDebugEvent('field', `AI detected form selector: ${context.aiFormInfo.formSelector || 'unknown'}`);
+                            }
+                        }
+                    } catch (e) {
+                        aiAttempted = true;
+                        console.log('[BLA] AI 表单识别失败，回退到规则匹配:', e);
+                        addDebugEvent('field', `AI form analysis unavailable, using rules: ${e.message}`);
+                    }
+                }
+            }
+
+            let form = null;
+            if (context.aiFormInfo?.hasForm && context.aiFormInfo.formSelector) {
+                form = document.querySelector(context.aiFormInfo.formSelector);
+            }
+            if (!form) {
+                form = findFormByRules();
+            }
+            if (form && formHasInteractiveFields(form)) {
+                return form;
+            }
+
+            await wait(pollMs);
+        }
+
+        return null;
+    }
+
+    function getCommentPreflight() {
+        return window.CommentPreflight || null;
+    }
+
+    function getStandardCommentFlow() {
+        return window.CommentStandardFlow || null;
+    }
+
+    async function primeCommentSectionSearch(context = {}, options = {}) {
+        const preflight = getCommentPreflight();
+        if (!preflight?.primeCommentSectionSearch) {
+            return false;
+        }
+        return await preflight.primeCommentSectionSearch(context, options);
+    }
+
+    function findExistingCommentByCommenter(context = {}) {
+        return getCommentPreflight()?.findExistingCommentByCommenter?.(context) || null;
+    }
+
+    function prepareFormForInteraction(form) {
+        return getCommentPreflight()?.prepareFormForInteraction?.(form);
+    }
+
+    function dismissConsentAndCookieBanners() {
+        return getCommentPreflight()?.dismissConsentAndCookieBanners?.() || 0;
+    }
+
+    function formHasInteractiveFields(form) {
+        if (!form) return false;
+        const hasTextArea = !!form.querySelector('textarea');
+        const hasTextInput = !!form.querySelector('input[type="text"], input[type="email"], input[type="url"], input:not([type])');
+        const hasSubmit = !!findSubmitButton(form);
+        return (hasTextArea || hasTextInput) && hasSubmit;
+    }
+
+    function shouldUseClassicCommentFastPath(form) {
+        return !!getStandardCommentFlow()?.isStandardCommentForm?.(form);
+    }
+
+    async function fillClassicCommentFormFast(form, values = {}) {
+        return await getStandardCommentFlow()?.fillStandardCommentForm?.(form, values) || {
+            commentFilled: false,
+            commentSelector: ''
+        };
+    }
+
+    function findSubmitButton(form, aiFormInfo) {
+        const candidates = [];
+
+        if (aiFormInfo?.submitSelector) {
+            candidates.push(form.querySelector(aiFormInfo.submitSelector) || document.querySelector(aiFormInfo.submitSelector));
+        }
+
+        const selectorCandidates = [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button#submit',
+            'button[name="submit"]',
+            '.submit button',
+            '.submit input[type="submit"]',
+            '.comment-form button',
+            '.comment-respond button'
+        ];
+        selectorCandidates.forEach((selector) => {
+            candidates.push(form.querySelector(selector));
+        });
+
+        const textButtons = Array.from(form.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'))
+            .filter((el) => {
+                if (!isVisible(el)) return false;
+                const text = compactText(
+                    `${el.textContent || ''} ${el.value || ''} ${el.getAttribute?.('aria-label') || ''}`
+                ).toLowerCase();
+                return /(submit|post comment|post|reply|send|publish|发表评论|提交|发送|评论|antworten|kommentar)/.test(text);
+            });
+        candidates.push(...textButtons);
+
+        return candidates.find(Boolean) || null;
+    }
+
+    function wait(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function simulateFieldTyping(el, value, options = {}) {
+        const nextValue = String(value || '');
+        if (!el || !nextValue) return;
+
+        el.focus?.();
+        if (el.setSelectionRange) {
+            try {
+                const end = Number(el.value?.length || 0);
+                el.setSelectionRange(0, end);
+            } catch {}
+        }
+
+        writeElementValue(el, '');
+        dispatchFieldInputEvents(el);
+
+        const minDelay = Number(options.minDelay || 8);
+        const maxDelay = Math.max(minDelay, Number(options.maxDelay || 18));
+        for (const character of nextValue) {
+            el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: character }));
+            writeElementValue(el, `${readElementValue(el)}${character}`);
+            dispatchFieldInputEvents(el);
+            el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: character }));
+            await wait(Math.floor(minDelay + Math.random() * (maxDelay - minDelay + 1)));
+        }
+
+        dispatchFieldChangeEvents(el);
+        el.blur?.();
+    }
+
+    function sendRuntimeMessageWithTimeout(message, timeoutMs, label = 'runtime message') {
+        const timeout = Number(timeoutMs || 0) || 10000;
+        return Promise.race([
+            chrome.runtime.sendMessage(message),
+            new Promise((_, reject) => {
+                setTimeout(() => {
+                    reject(new Error(`${label} timed out after ${timeout}ms`));
+                }, timeout);
+            })
+        ]);
     }
 
     function addDebugEvent(type, message) {
@@ -1007,6 +2266,17 @@
 
     function truncateText(text, length) {
         return text.length > length ? `${text.slice(0, length - 1)}…` : text;
+    }
+
+    function describeElementForMeta(el) {
+        if (!el) return '';
+        if (el.id) return `#${el.id}`;
+        if (el.name) return `${(el.tagName || '').toLowerCase()}[name="${el.name}"]`;
+        const className = compactText(String(el.className || '').split(/\s+/).slice(0, 3).join('.'));
+        if (className) {
+            return `${(el.tagName || '').toLowerCase()}.${className}`;
+        }
+        return (el.tagName || '').toLowerCase();
     }
 
     function escapeRegExp(text) {

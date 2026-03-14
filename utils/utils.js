@@ -2,18 +2,114 @@
  * 工具模块 - 存储、模板渲染、URL 处理
  */
 
+let localResourceStoreReady = null;
+
+async function ensureLocalResourceStore() {
+    if (typeof LocalDB === 'undefined') {
+        return null;
+    }
+
+    if (!localResourceStoreReady) {
+        localResourceStoreReady = (async () => {
+            try {
+                if (typeof LocalDB.migrateFromChromeStorage === 'function') {
+                    await LocalDB.migrateFromChromeStorage({ clearLegacy: true });
+                }
+                return LocalDB;
+            } catch (error) {
+                console.warn('[BLA] LocalDB unavailable, falling back to chrome.storage.local', error);
+                return null;
+            }
+        })();
+    }
+
+    return await localResourceStoreReady;
+}
+
+async function getStoredResourcesWithFallback(fallbackGetter) {
+    const localStore = await ensureLocalResourceStore();
+    if (localStore?.getResources) {
+        const resources = await localStore.getResources();
+        return Array.isArray(resources) ? resources : [];
+    }
+    return (await fallbackGetter()) || [];
+}
+
+async function saveStoredResourcesWithFallback(resources = [], fallbackSetter) {
+    const localStore = await ensureLocalResourceStore();
+    if (localStore?.setResources) {
+        await localStore.setResources(Array.isArray(resources) ? resources : []);
+        try {
+            await chrome.storage.local.remove('resources');
+        } catch {}
+        return;
+    }
+    await fallbackSetter(resources);
+}
+
+function buildDefaultSettings(overrides = {}) {
+    return {
+        aiProvider: 'openrouter',
+        aiBaseUrl: 'https://openrouter.ai/api/v1',
+        aiApiKey: '',
+        name: '',
+        email: '',
+        website: '',
+        apiKey: '',
+        openrouterApiKey: '',
+        publishDebugMode: false,
+        commentTemplates: [
+            'Great article about {title}! This provides really valuable insights worth sharing.',
+            'This is a very interesting perspective on {title}. Thanks for the detailed analysis!',
+            'Thanks for sharing this comprehensive post about {title}. Very helpful for the community!'
+        ],
+        anchorKeyword: '',
+        anchorUrl: '',
+        publishMode: 'semi-auto',
+        language: 'zh',
+        ...(overrides || {})
+    };
+}
+
 const StorageHelper = {
     async get(key) {
+        const localStore = await ensureLocalResourceStore();
+        if (key === 'settings' && localStore?.getSettings) {
+            return await localStore.getSettings();
+        }
+        if ((key === 'collectState' || key === 'collectStats') && localStore?.getCollectSnapshot) {
+            const snapshot = await localStore.getCollectSnapshot();
+            return snapshot[key] || undefined;
+        }
         const result = await chrome.storage.local.get(key);
         return result[key];
     },
 
     async set(key, value) {
+        const localStore = await ensureLocalResourceStore();
+        if (key === 'settings' && localStore?.setSettings) {
+            await localStore.setSettings(value);
+            try {
+                await chrome.storage.local.remove('settings');
+            } catch {}
+            return;
+        }
+        if ((key === 'collectState' || key === 'collectStats') && localStore?.setCollectSnapshot) {
+            const snapshot = await localStore.getCollectSnapshot();
+            await localStore.setCollectSnapshot(
+                key === 'collectState' ? value : snapshot.collectState,
+                key === 'collectStats' ? value : snapshot.collectStats
+            );
+            try {
+                await chrome.storage.local.remove(['collectState', 'collectStats']);
+            } catch {}
+            return;
+        }
         await chrome.storage.local.set({ [key]: value });
     },
 
     async getResources() {
-        return (await this.get('resources')) || [];
+        return await getStoredResourcesWithFallback(() => this.get('resources'));
     },
 
     async addResource(resource) {
@@ -26,7 +122,7 @@ const StorageHelper = {
                     if (!existing.sources.includes(s)) existing.sources.push(s);
                 });
             }
-            await this.set('resources', resources);
+            await saveStoredResourcesWithFallback(resources, (nextResources) => this.set('resources', nextResources));
             return false; // 非新增
         }
         resources.push({
@@ -36,7 +132,7 @@ const StorageHelper = {
             status: 'pending',
             sources: resource.sources || []
         });
-        await this.set('resources', resources);
+        await saveStoredResourcesWithFallback(resources, (nextResources) => this.set('resources', nextResources));
         return true;
     },
 
@@ -45,13 +141,13 @@ const StorageHelper = {
         const idx = resources.findIndex(r => r.id === id);
         if (idx !== -1) {
             resources[idx] = { ...resources[idx], ...updates };
-            await this.set('resources', resources);
+            await saveStoredResourcesWithFallback(resources, (nextResources) => this.set('resources', nextResources));
         }
     },
 
     async deleteResource(id) {
         const resources = await this.getResources();
-        await this.set('resources', resources.filter(r => r.id !== id));
+        await saveStoredResourcesWithFallback(resources.filter(r => r.id !== id), (nextResources) => this.set('resources', nextResources));
     },
 
     async getStats() {
@@ -65,30 +161,11 @@ const StorageHelper = {
     },
 
     async getSettings() {
-        return (await this.get('settings')) || {
-            aiProvider: 'openrouter',
-            aiBaseUrl: 'https://openrouter.ai/api/v1',
-            aiApiKey: '',
-            name: '',
-            email: '',
-            website: '',
-            apiKey: '',
-            openrouterApiKey: '',
-            publishDebugMode: false,
-            commentTemplates: [
-                'Great article about {title}! This provides really valuable insights worth sharing.',
-                'This is a very interesting perspective on {title}. Thanks for the detailed analysis!',
-                'Thanks for sharing this comprehensive post about {title}. Very helpful for the community!'
-            ],
-            anchorKeyword: '',
-            anchorUrl: '',
-            publishMode: 'semi-auto',
-            language: 'zh'
-        };
+        return buildDefaultSettings((await this.get('settings')) || {});
     },
 
     async saveSettings(settings) {
-        await this.set('settings', settings);
+        await this.set('settings', buildDefaultSettings(settings || {}));
     },
 
     async getCollectState() {
@@ -114,6 +191,10 @@ const StorageHelper = {
 
     async clearAll() {
         await chrome.storage.local.clear();
+        const localStore = await ensureLocalResourceStore();
+        if (localStore?.clearAll) {
+            await localStore.clearAll();
+        }
     }
 };
 

@@ -12,20 +12,44 @@
     <div class="app">
         <!-- Header with close button -->
         <div class="app-header">
-            <span class="app-title">Backlink Analyzer</span>
+            <div class="app-header-left">
+                <button id="btn-home" class="btn-home" title="返回首页">⌂</button>
+                <span class="app-title">Backlink Analyzer</span>
+            </div>
             <button id="btn-close" class="btn-close" title="关闭">✕</button>
         </div>
 
+        <div class="home-panel active" id="panel-home">
+            <div class="home-hero">
+                <div class="home-kicker">工作流首页</div>
+                <h1 class="home-title">选择一个工作区</h1>
+                <p class="home-desc">把“外链发现与发布”和“产品宣传流程”分开运行，避免两套任务混在同一个面板里。</p>
+            </div>
+            <div class="home-grid">
+                <button class="home-card" id="btn-enter-backlink">
+                    <span class="home-card-tag">SEO / 外链</span>
+                    <span class="home-card-title">外链工作流</span>
+                    <span class="home-card-desc">持续发现外链、递归分析评论区、筛选可直接发布资源，再进入外链发布流程。</span>
+                </button>
+                <button class="home-card" id="btn-enter-marketing">
+                    <span class="home-card-tag">营销 / Agent</span>
+                    <span class="home-card-title">产品宣传工作流</span>
+                    <span class="home-card-desc">把产品宣传主任务和长期养号分开管理，后续会继续接自动化执行器。</span>
+                </button>
+            </div>
+        </div>
+
         <!-- Tab Nav -->
-        <nav class="tab-nav">
-            <button class="tab-btn active" data-tab="collect">收集</button>
-            <button class="tab-btn" data-tab="publish">发布</button>
-            <button class="tab-btn" data-tab="resources">资源库</button>
-            <button class="tab-btn" data-tab="logs">日志</button>
+        <nav class="tab-nav hidden" id="tab-nav">
+            <button class="tab-btn" data-tab="collect" data-mode="backlink">收集</button>
+            <button class="tab-btn" data-tab="publish" data-mode="backlink">外链发布</button>
+            <button class="tab-btn" data-tab="marketing" data-mode="marketing">营销任务</button>
+            <button class="tab-btn" data-tab="resources" data-mode="backlink">资源库</button>
+            <button class="tab-btn" data-tab="logs" data-mode="all">日志</button>
         </nav>
 
         <!-- ===== 收集 Tab ===== -->
-        <div class="tab-panel active" id="panel-collect">
+        <div class="tab-panel" id="panel-collect">
             <label class="field-label">目标域名</label>
             <div class="input-row">
                 <input type="text" id="domain-input" class="input" placeholder="例如 competitor.com">
@@ -55,27 +79,57 @@
                 <div class="collect-engine-detail" id="collect-engine-detail">输入一个目标网站后开始持续递归分析</div>
             </div>
 
+            <div class="continuous-session-card" id="continuous-session-card">
+                <div class="continuous-session-head">
+                    <div class="continuous-session-title">持续发现会话</div>
+                    <div class="continuous-session-state" id="continuous-session-state">未启动</div>
+                </div>
+                <div class="continuous-session-grid">
+                    <div class="continuous-session-item">
+                        <span class="continuous-session-label">种子网站</span>
+                        <span class="continuous-session-value" id="continuous-seed-domain">-</span>
+                    </div>
+                    <div class="continuous-session-item">
+                        <span class="continuous-session-label">我的网站</span>
+                        <span class="continuous-session-value" id="continuous-my-domain">-</span>
+                    </div>
+                    <div class="continuous-session-item">
+                        <span class="continuous-session-label">当前递归</span>
+                        <span class="continuous-session-value" id="continuous-current-domain">-</span>
+                    </div>
+                    <div class="continuous-session-item">
+                        <span class="continuous-session-label">最近完成</span>
+                        <span class="continuous-session-value" id="continuous-last-completed">-</span>
+                    </div>
+                </div>
+                <div class="continuous-session-foot">
+                    <div class="continuous-session-meta" id="continuous-session-meta">阶段：空闲 · 待处理 0 · 已处理 0 · 失败 0</div>
+                    <div class="continuous-session-sources" id="continuous-session-sources"></div>
+                </div>
+            </div>
+
             <div class="stats-card" id="stats-card">
                 <div class="stats-status">
                     <span class="status-dot" id="status-dot"></span>
                     <span id="status-text">等待开始...</span>
                 </div>
+                <div class="stats-caption" id="stats-caption">本轮分析波次</div>
                 <div class="stats-grid">
                     <div class="stat-item">
                         <div class="stat-number" id="stat-backlinks">0</div>
-                        <div class="stat-label" id="stat-backlinks-label">待分析目标</div>
+                        <div class="stat-label" id="stat-backlinks-label">本轮待分析</div>
                     </div>
                     <div class="stat-item">
                         <div class="stat-number" id="stat-analyzed">0</div>
-                        <div class="stat-label" id="stat-analyzed-label">已分析页面</div>
+                        <div class="stat-label" id="stat-analyzed-label">本轮已分析</div>
                     </div>
                     <div class="stat-item">
                         <div class="stat-number" id="stat-blogs">0</div>
-                        <div class="stat-label" id="stat-blogs-label">外链机会</div>
+                        <div class="stat-label" id="stat-blogs-label">本轮机会</div>
                     </div>
                     <div class="stat-item">
                         <div class="stat-number" id="stat-queue">0</div>
-                        <div class="stat-label" id="stat-queue-label">剩余队列</div>
+                        <div class="stat-label" id="stat-queue-label">本轮剩余</div>
                     </div>
                 </div>
             </div>
@@ -110,64 +164,150 @@
         <div class="tab-panel" id="panel-publish">
             <!-- 任务管理 -->
             <div class="panel-header">
-                <h3>发布任务</h3>
+                <h3 id="task-panel-title">营销任务</h3>
                 <div class="panel-actions">
-                    <button id="btn-reset-publish-statuses" class="btn btn-small" title="将已发布/已跳过的资源重置为待发布，并删除失败资源，同时保留各网站历史记录">↺ 全部重置</button>
+                    <button id="btn-reset-publish-statuses" class="btn btn-small" title="重置当前发布状态：已发布/已跳过/失败全部回到待发布，并清空发布历史与任务累计统计">↺ 重置资源状态</button>
                     <button id="btn-add-task" class="btn btn-small">+ 新建任务</button>
                 </div>
             </div>
 
+            <div class="workflow-library" id="workflow-library"></div>
+            <div id="task-render-diagnostics" class="task-render-diagnostics" style="display:none"></div>
+
             <div id="task-list" class="task-list"></div>
 
-            <div class="panel-header" style="margin-top:12px">
-                <h3>发布概览</h3>
-            </div>
-
-            <div class="publish-stats">
-                <div class="pub-stat"><span class="pub-num" id="pub-pending">0</span><span class="pub-lbl">待发布</span>
+            <div id="publish-overview-global" style="display:none">
+                <div class="panel-header" style="margin-top:12px">
+                    <h3>发布概览</h3>
                 </div>
-                <div class="pub-stat"><span class="pub-num green" id="pub-published">0</span><span
-                        class="pub-lbl">已发布</span></div>
-                <div class="pub-stat"><span class="pub-num yellow" id="pub-skipped">0</span><span
-                        class="pub-lbl">已跳过</span></div>
-                <div class="pub-stat"><span class="pub-num red" id="pub-failed">0</span><span class="pub-lbl">失败</span>
-                </div>
-            </div>
 
-            <div class="blog-count-bar" id="blog-count-bar">
-                <span class="blog-count-icon">📝</span>
-                <span class="blog-count-label">可直接发博客：</span>
-                <span class="blog-count-num" id="pub-blog-count">0</span>
-                <span class="blog-count-unit">个</span>
-            </div>
-
-            <div class="blog-count-bar anchor-count-bar" id="anchor-count-bar">
-                <span class="blog-count-icon">🔗</span>
-                <span class="blog-count-label">已提交锚文本：</span>
-                <span class="blog-count-num" id="pub-anchor-count">0</span>
-                <span class="blog-count-unit">个</span>
-            </div>
-
-            <div class="publish-current" id="publish-current" style="display:none">
-                <div class="current-label">当前发布：</div>
-                <div class="current-url" id="current-url">-</div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progress-fill"></div>
-                </div>
-                <div class="publish-current-footer">
-                    <div class="progress-text" id="progress-text">0 / 0</div>
-                    <div class="publish-current-actions">
-                        <button id="btn-continue-publish" class="btn btn-small btn-continue-publish" style="display:none">继续</button>
-                        <button id="btn-stop-publish" class="btn btn-small btn-stop-publish">停止</button>
+                <div class="publish-stats">
+                    <div class="pub-stat"><span class="pub-num" id="pub-pending">0</span><span class="pub-lbl">待发布</span>
+                    </div>
+                    <div class="pub-stat"><span class="pub-num green" id="pub-published">0</span><span
+                            class="pub-lbl">已发布</span></div>
+                    <div class="pub-stat"><span class="pub-num yellow" id="pub-skipped">0</span><span
+                            class="pub-lbl">已跳过</span></div>
+                    <div class="pub-stat"><span class="pub-num red" id="pub-failed">0</span><span class="pub-lbl">失败</span>
                     </div>
                 </div>
+
+                <div class="blog-count-bar" id="blog-count-bar">
+                    <span class="blog-count-icon">📝</span>
+                    <span class="blog-count-label">可直接发博客：</span>
+                    <span class="blog-count-num" id="pub-blog-count">0</span>
+                    <span class="blog-count-unit">个</span>
+                </div>
+
+                <div class="blog-count-bar anchor-count-bar" id="anchor-count-bar">
+                    <span class="blog-count-icon">🔗</span>
+                    <span class="blog-count-label">已提交锚文本：</span>
+                    <span class="blog-count-num" id="pub-anchor-count">0</span>
+                    <span class="blog-count-unit">个</span>
+                </div>
+
+                <div class="publish-current" id="publish-current" style="display:none">
+                    <div class="current-label">当前发布：</div>
+                    <div class="current-url" id="current-url">-</div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <div class="publish-current-footer">
+                        <div class="progress-text" id="progress-text">0 / 0</div>
+                        <div class="publish-current-actions">
+                            <button id="btn-continue-publish" class="btn btn-small btn-continue-publish" style="display:none">继续</button>
+                            <button id="btn-stop-publish" class="btn btn-small btn-stop-publish">停止</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="empty-state" id="publish-empty">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                    </svg>
+                    <p>暂无可发布资源，请先收集外链</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===== 营销任务 Tab ===== -->
+        <div class="tab-panel" id="panel-marketing">
+            <div class="panel-header">
+                <h3 id="marketing-panel-title">营销任务</h3>
+                <div class="panel-actions">
+                    <button id="btn-start-marketing-automation" class="btn btn-small">开始持续宣传</button>
+                    <button id="btn-pause-marketing-automation" class="btn btn-small btn-secondary" disabled>暂停</button>
+                    <button id="btn-add-marketing-task" class="btn btn-small">+ 新建任务</button>
+                </div>
             </div>
 
-            <div class="empty-state" id="publish-empty">
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                </svg>
-                <p>暂无可发布资源，请先收集外链</p>
+            <div class="marketing-focus-card">
+                <div class="marketing-focus-head">
+                    <div class="marketing-focus-title">持续宣传会话</div>
+                    <div class="marketing-focus-subtitle" id="marketing-session-state">未启动</div>
+                </div>
+                <div class="marketing-session-grid">
+                    <div class="marketing-session-item">
+                        <span class="marketing-session-label">当前任务</span>
+                        <span class="marketing-session-value" id="marketing-current-task">-</span>
+                    </div>
+                    <div class="marketing-session-item">
+                        <span class="marketing-session-label">当前阶段</span>
+                        <span class="marketing-session-value" id="marketing-current-phase">-</span>
+                    </div>
+                    <div class="marketing-session-item">
+                        <span class="marketing-session-label">待推进任务</span>
+                        <span class="marketing-session-value" id="marketing-pending-count">0</span>
+                    </div>
+                    <div class="marketing-session-item">
+                        <span class="marketing-session-label">待执行养号</span>
+                        <span class="marketing-session-value" id="marketing-due-nurture-count">0</span>
+                    </div>
+                </div>
+                <div class="marketing-focus-subtitle" id="marketing-session-message">等待开始</div>
+            </div>
+
+            <div class="marketing-overview-grid">
+                <div class="marketing-overview-card">
+                    <div class="marketing-overview-num" id="marketing-total-tasks">0</div>
+                    <div class="marketing-overview-label">任务总数</div>
+                </div>
+                <div class="marketing-overview-card">
+                    <div class="marketing-overview-num" id="marketing-promote-count">0</div>
+                    <div class="marketing-overview-label">宣传任务</div>
+                </div>
+                <div class="marketing-overview-card">
+                    <div class="marketing-overview-num" id="marketing-nurture-count">0</div>
+                    <div class="marketing-overview-label">养号任务</div>
+                </div>
+                <div class="marketing-overview-card">
+                    <div class="marketing-overview-num" id="marketing-run-count">0</div>
+                    <div class="marketing-overview-label">累计触发</div>
+                </div>
+            </div>
+
+            <div class="marketing-focus-card">
+                <div class="marketing-focus-head">
+                    <div class="marketing-focus-title">营销任务列表</div>
+                    <div class="marketing-focus-subtitle" id="marketing-last-run">最近运行：-</div>
+                </div>
+                <div id="marketing-task-list" class="task-list"></div>
+                <div class="empty-state" id="marketing-empty">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M8 9h8" />
+                        <path d="M8 13h6" />
+                        <rect x="3" y="4" width="18" height="16" rx="2" />
+                    </svg>
+                    <p>暂无营销任务，点击“新建任务”创建</p>
+                </div>
+            </div>
+
+            <div class="marketing-focus-card">
+                <div class="marketing-focus-head">
+                    <div class="marketing-focus-title">营销工作流库</div>
+                    <div class="marketing-focus-subtitle">把产品宣传主任务和长期养号分开管理</div>
+                </div>
+                <div class="workflow-library" id="marketing-workflow-library"></div>
             </div>
         </div>
 
@@ -180,9 +320,11 @@
 
             <div class="res-filters">
                 <button class="res-filter active" data-filter="all">全部</button>
-                <button class="res-filter" data-filter="comment">可直接发</button>
-                <button class="res-filter" data-filter="other">需手动</button>
+                <button class="res-filter" data-filter="comment">免登录直发</button>
+                <button class="res-filter" data-filter="other">待后续处理</button>
             </div>
+
+            <div class="res-summary" id="resource-filter-summary">当前筛选 0 · 总资源 0</div>
 
             <div class="resources-list" id="resources-list">
                 <div class="empty-state" id="resources-empty">
@@ -233,9 +375,12 @@
     </div>
 
     <script src="../utils/i18n.js"></script>
+    <script src="../utils/local-db.js"></script>
+    <script src="../utils/resource-rules.js"></script>
     <script src="../utils/utils.js"></script>
     <script src="../utils/backlink-merger.js"></script>
     <script src="../utils/workflows.js"></script>
+    <script src="resource-panel.js"></script>
     <script src="popup.js"></script>
 </body>
 

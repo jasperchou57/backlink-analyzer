@@ -4,6 +4,13 @@
  */
 
 const AIEngine = {
+    USAGE_STORAGE_KEY: 'aiUsageStats',
+    PRICE_TABLE: {
+        'qwen-plus': { input: 0.0008, output: 0.002 },
+        'qwen-turbo': { input: 0.0003, output: 0.0006 }
+    },
+    _usageWriteQueue: Promise.resolve(),
+
     PROVIDERS: {
         openrouter: {
             label: 'OpenRouter',
@@ -64,15 +71,30 @@ const AIEngine = {
             temperature: options.temperature !== undefined ? options.temperature : 0.7,
         };
 
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-                ...(provider.extraHeaders || {})
-            },
-            body: JSON.stringify(body)
-        });
+        const timeoutMs = this._getTimeoutForTask(task, options);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+        let response;
+        try {
+            response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json',
+                    ...(provider.extraHeaders || {})
+                },
+                body: JSON.stringify(body),
+                signal: controller.signal
+            });
+        } catch (error) {
+            if (error?.name === 'AbortError') {
+                throw new Error(`${provider.label} API 请求超时 (${timeoutMs}ms)`);
+            }
+            throw error;
+        } finally {
+            clearTimeout(timeoutId);
+        }
 
         if (!response.ok) {
             const errText = await response.text();
@@ -81,7 +103,33 @@ const AIEngine = {
 
         const data = await response.json();
         const content = data.choices?.[0]?.message?.content || '';
+        const usage = this._extractUsage(data);
+        if (usage.totalTokens > 0) {
+            this._recordUsage({
+                task,
+                model,
+                providerId: settings.aiProvider || (settings.aiBaseUrl ? 'custom' : 'openrouter'),
+                usage
+            }).catch(() => {});
+        }
         return content.trim();
+    },
+
+    _getTimeoutForTask(task, options = {}) {
+        const explicitTimeout = Number(options.timeoutMs || 0);
+        if (explicitTimeout > 0) return explicitTimeout;
+
+        switch (task) {
+            case 'formExtract':
+                return 3500;
+            case 'commentGen':
+                return 5000;
+            case 'classify':
+            case 'linkDiscover':
+                return 4000;
+            default:
+                return 5000;
+        }
     },
 
     /**
@@ -221,6 +269,109 @@ Respond in JSON format:
     },
 
     /**
+     * 营销调研计划 - 生成渠道、平台与后续动作建议
+     */
+    async generateResearchPlan(options = {}) {
+        const website = String(options.website || '').trim();
+        const targetAudience = String(options.targetAudience || '').trim();
+        const preferredChannels = String(options.preferredChannels || '').trim();
+        const campaignBrief = String(options.campaignBrief || '').trim();
+        const researchContext = options.researchContext || null;
+        const snapshot = researchContext?.snapshot || null;
+        const searchQueries = Array.isArray(researchContext?.queries) ? researchContext.queries : [];
+        const pageReads = Array.isArray(researchContext?.pageReads) ? researchContext.pageReads : [];
+        const evidenceLines = searchQueries.flatMap((entry) => {
+            const query = String(entry?.query || '').trim();
+            const results = Array.isArray(entry?.results) ? entry.results : [];
+            if (!query || results.length === 0) return [];
+            return [
+                `Query: ${query}`,
+                ...results.slice(0, 5).map((item, index) => `  ${index + 1}. ${item.title || item.url} | ${item.url} | ${item.snippet || ''}`)
+            ];
+        });
+        const pageReadLines = pageReads.flatMap((page, index) => {
+            const title = String(page?.title || page?.url || '').trim();
+            const url = String(page?.url || '').trim();
+            if (!title || !url) return [];
+            return [
+                `${index + 1}. ${title} | ${url}`,
+                `   host: ${page.host || 'N/A'}`,
+                `   description: ${page.description || 'N/A'}`,
+                `   summary: ${page.summary || 'N/A'}`
+            ];
+        });
+        const snapshotBlock = snapshot
+            ? `\nLive product snapshot:
+- title: ${snapshot.title || 'N/A'}
+- description: ${snapshot.description || 'N/A'}
+- headings: ${(snapshot.headings || []).join(' | ') || 'N/A'}
+- summary: ${snapshot.summary || 'N/A'}`
+            : '';
+        const evidenceBlock = evidenceLines.length
+            ? `\nBrowser search evidence:\n${evidenceLines.join('\n')}`
+            : '\nBrowser search evidence:\n- No live search results available';
+        const pageReadBlock = pageReadLines.length
+            ? `\nVisited candidate platform pages:\n${pageReadLines.join('\n')}`
+            : '\nVisited candidate platform pages:\n- No candidate platform pages were opened';
+
+        const prompt = `Build a practical browser-marketing research plan for this product.
+
+Product URL: ${website}
+Target audience: ${targetAudience || 'Not specified'}
+Preferred channels: ${preferredChannels || 'Not specified'}
+Campaign brief: ${campaignBrief || 'Not specified'}
+${snapshotBlock}
+${evidenceBlock}
+${pageReadBlock}
+
+Return a JSON object with:
+- summary: one concise paragraph
+- channels: an array of 5 to 8 specific promotion targets
+- nextSteps: 3 to 5 concrete next actions
+- cautions: 2 to 4 risks or constraints
+
+For each channel include:
+- name
+- url
+- workflowId (must be one of: community-post-promote, directory-submit-promote, account-nurture)
+- angle
+- reason
+
+Rules:
+- Prefer real, well-known communities, directories, or platforms
+- Include a mix of community posting, directory submission, and long-term account building when relevant
+- Prefer channels supported by the live browser search evidence when available
+- Strongly prefer channels whose pages were actually visited in the browser when they look relevant
+- If a URL is uncertain, omit the channel instead of inventing it
+- Keep the plan execution-oriented, not generic
+
+Respond with valid JSON only.`;
+
+        const result = await this.call('researchPlan', prompt, {
+            system: 'You are a product marketing strategist for browser-based workflow agents. Return only valid JSON. Do not use markdown fences.',
+            temperature: 0.5,
+            maxTokens: 1200
+        });
+
+        try {
+            const parsed = JSON.parse(result.replace(/```json\n?|```\n?/g, ''));
+            return {
+                summary: parsed.summary || '',
+                channels: Array.isArray(parsed.channels) ? parsed.channels : [],
+                nextSteps: Array.isArray(parsed.nextSteps) ? parsed.nextSteps : [],
+                cautions: Array.isArray(parsed.cautions) ? parsed.cautions : []
+            };
+        } catch {
+            return {
+                summary: result.trim(),
+                channels: [],
+                nextSteps: [],
+                cautions: []
+            };
+        }
+    },
+
+    /**
      * 测试 API 连接
      */
     async testConnection() {
@@ -237,6 +388,39 @@ Respond in JSON format:
         }
     },
 
+    async getUsageStats() {
+        if (typeof LocalDB !== 'undefined' && typeof LocalDB.getAIUsageStats === 'function') {
+            try {
+                if (typeof LocalDB.migrateFromChromeStorage === 'function') {
+                    await LocalDB.migrateFromChromeStorage({ clearLegacy: true });
+                }
+                const stats = await LocalDB.getAIUsageStats();
+                if (stats && typeof stats === 'object') {
+                    return this._normalizeUsageStats(stats);
+                }
+            } catch {}
+        }
+        if (!chrome?.storage?.local) {
+            return this._normalizeUsageStats(null);
+        }
+        const data = await chrome.storage.local.get(this.USAGE_STORAGE_KEY);
+        return this._normalizeUsageStats(data[this.USAGE_STORAGE_KEY]);
+    },
+
+    async resetUsageStats() {
+        if (typeof LocalDB !== 'undefined' && typeof LocalDB.setAIUsageStats === 'function') {
+            try {
+                await LocalDB.setAIUsageStats(null);
+                if (chrome?.storage?.local) {
+                    await chrome.storage.local.remove(this.USAGE_STORAGE_KEY);
+                }
+                return;
+            } catch {}
+        }
+        if (!chrome?.storage?.local) return;
+        await chrome.storage.local.remove(this.USAGE_STORAGE_KEY);
+    },
+
     // === 内部方法 ===
 
     _getModelForTask(task, settings) {
@@ -245,6 +429,7 @@ Respond in JSON format:
             formExtract: settings.modelFormExtract,
             commentGen: settings.modelCommentGen,
             linkDiscover: settings.modelLinkDiscover,
+            researchPlan: settings.modelCommentGen || settings.modelClassify,
         };
         return modelMap[task] || '';
     },
@@ -270,11 +455,186 @@ Respond in JSON format:
     },
 
     async _getSettings() {
+        if (typeof LocalDB !== 'undefined' && typeof LocalDB.getSettings === 'function') {
+            try {
+                if (typeof LocalDB.migrateFromChromeStorage === 'function') {
+                    await LocalDB.migrateFromChromeStorage({ clearLegacy: true });
+                }
+                const settings = await LocalDB.getSettings();
+                if (settings && typeof settings === 'object' && Object.keys(settings).length > 0) {
+                    return settings;
+                }
+            } catch {}
+        }
         return new Promise((resolve) => {
             chrome.storage.local.get('settings', (data) => {
                 resolve(data.settings || {});
             });
         });
+    },
+
+    _extractUsage(data) {
+        const usage = data?.usage || {};
+        const promptTokens = Number(
+            usage.prompt_tokens
+            ?? usage.input_tokens
+            ?? usage.promptTokens
+            ?? usage.inputTokens
+            ?? 0
+        ) || 0;
+        const completionTokens = Number(
+            usage.completion_tokens
+            ?? usage.output_tokens
+            ?? usage.completionTokens
+            ?? usage.outputTokens
+            ?? 0
+        ) || 0;
+        const totalTokens = Number(usage.total_tokens ?? usage.totalTokens ?? (promptTokens + completionTokens)) || (promptTokens + completionTokens);
+
+        return {
+            promptTokens,
+            completionTokens,
+            totalTokens
+        };
+    },
+
+    _createEmptyUsageBucket() {
+        return {
+            requests: 0,
+            promptTokens: 0,
+            completionTokens: 0,
+            totalTokens: 0,
+            estimatedCost: 0,
+            lastUsedAt: ''
+        };
+    },
+
+    _createEmptyUsageStats() {
+        return {
+            totals: this._createEmptyUsageBucket(),
+            byTask: {},
+            byModel: {},
+            updatedAt: '',
+            currency: 'CNY',
+            pricingBasis: 'per-1k-tokens'
+        };
+    },
+
+    _normalizeUsageStats(stats) {
+        const normalized = {
+            ...this._createEmptyUsageStats(),
+            ...(stats || {})
+        };
+
+        normalized.totals = {
+            ...this._createEmptyUsageBucket(),
+            ...(stats?.totals || {})
+        };
+        normalized.byTask = { ...(stats?.byTask || {}) };
+        normalized.byModel = { ...(stats?.byModel || {}) };
+
+        for (const [key, bucket] of Object.entries(normalized.byTask)) {
+            normalized.byTask[key] = {
+                ...this._createEmptyUsageBucket(),
+                ...(bucket || {})
+            };
+        }
+        for (const [key, bucket] of Object.entries(normalized.byModel)) {
+            normalized.byModel[key] = {
+                ...this._createEmptyUsageBucket(),
+                ...(bucket || {})
+            };
+        }
+
+        return normalized;
+    },
+
+    _resolvePricing(model) {
+        const normalized = String(model || '').trim().toLowerCase();
+        if (!normalized) return null;
+
+        if (normalized.includes('qwen-plus')) {
+            return this.PRICE_TABLE['qwen-plus'];
+        }
+        if (normalized.includes('qwen3.5-plus')) {
+            return this.PRICE_TABLE['qwen-plus'];
+        }
+        if (normalized.includes('qwen-turbo')) {
+            return this.PRICE_TABLE['qwen-turbo'];
+        }
+        if (normalized.includes('qwen3.5-flash')) {
+            return this.PRICE_TABLE['qwen-turbo'];
+        }
+        return null;
+    },
+
+    _estimateCost(model, promptTokens, completionTokens) {
+        const pricing = this._resolvePricing(model);
+        if (!pricing) return 0;
+        return (promptTokens / 1000) * pricing.input + (completionTokens / 1000) * pricing.output;
+    },
+
+    _applyUsageBucket(bucket, usage, estimatedCost) {
+        bucket.requests += 1;
+        bucket.promptTokens += usage.promptTokens;
+        bucket.completionTokens += usage.completionTokens;
+        bucket.totalTokens += usage.totalTokens;
+        bucket.estimatedCost += estimatedCost;
+        bucket.lastUsedAt = new Date().toISOString();
+    },
+
+    async _recordUsage({ task, model, providerId, usage }) {
+        if (!usage?.totalTokens) return;
+
+        this._usageWriteQueue = this._usageWriteQueue.then(async () => {
+            let storedStats = null;
+            if (typeof LocalDB !== 'undefined' && typeof LocalDB.getAIUsageStats === 'function') {
+                try {
+                    storedStats = await LocalDB.getAIUsageStats();
+                } catch {}
+            }
+            if (!storedStats && chrome?.storage?.local) {
+                const data = await chrome.storage.local.get(this.USAGE_STORAGE_KEY);
+                storedStats = data[this.USAGE_STORAGE_KEY];
+            }
+
+            const stats = this._normalizeUsageStats(storedStats);
+            const estimatedCost = this._estimateCost(model, usage.promptTokens, usage.completionTokens);
+
+            this._applyUsageBucket(stats.totals, usage, estimatedCost);
+
+            const taskKey = String(task || 'unknown');
+            if (!stats.byTask[taskKey]) {
+                stats.byTask[taskKey] = this._createEmptyUsageBucket();
+            }
+            this._applyUsageBucket(stats.byTask[taskKey], usage, estimatedCost);
+
+            const modelKey = String(model || 'unknown');
+            if (!stats.byModel[modelKey]) {
+                stats.byModel[modelKey] = {
+                    ...this._createEmptyUsageBucket(),
+                    providerId: providerId || ''
+                };
+            }
+            stats.byModel[modelKey].providerId = providerId || stats.byModel[modelKey].providerId || '';
+            this._applyUsageBucket(stats.byModel[modelKey], usage, estimatedCost);
+
+            stats.updatedAt = new Date().toISOString();
+            if (typeof LocalDB !== 'undefined' && typeof LocalDB.setAIUsageStats === 'function') {
+                try {
+                    await LocalDB.setAIUsageStats(stats);
+                    if (chrome?.storage?.local) {
+                        await chrome.storage.local.remove(this.USAGE_STORAGE_KEY);
+                    }
+                    return;
+                } catch {}
+            }
+            if (chrome?.storage?.local) {
+                await chrome.storage.local.set({ [this.USAGE_STORAGE_KEY]: stats });
+            }
+        }).catch(() => {});
+
+        return this._usageWriteQueue;
     }
 };
 

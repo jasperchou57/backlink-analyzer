@@ -9,6 +9,7 @@
         "storage",
         "scripting",
         "identity",
+        "alarms",
         "sidePanel"
     ],
     "host_permissions": [

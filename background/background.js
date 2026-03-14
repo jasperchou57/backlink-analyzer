@@ -4,7 +4,27 @@
  */
 
 // 导入模块
-importScripts('../utils/ai-engine.js', '../utils/logger.js', '../utils/google-sheets.js', '../utils/workflows.js');
+importScripts(
+    '../utils/local-db.js',
+    '../utils/resource-rules.js',
+    'core/state-store.js',
+    'core/task-store.js',
+    'core/resource-store.js',
+    'core/runtime-message-router.js',
+    'core/publish-memory.js',
+    'core/frontier-scheduler.js',
+    'core/task-manager.js',
+    'core/task-runner.js',
+    'core/continuous-discovery-engine.js',
+    'core/collector-runtime.js',
+    'core/publish-runtime.js',
+    'tasks/discover-workflow.js',
+    'tasks/publish-workflow.js',
+    '../utils/ai-engine.js',
+    '../utils/logger.js',
+    '../utils/google-sheets.js',
+    '../utils/workflows.js'
+);
 
 // === 状态 ===
 let collectState = {
@@ -42,21 +62,66 @@ const DISCOVERY_STRATEGY = {
 };
 
 const PUBLISH_STRATEGY = {
-    DOMAIN_RATE_LIMIT_COOLDOWN_MS: 5 * 60 * 1000
+    DOMAIN_RATE_LIMIT_COOLDOWN_MS: 5 * 60 * 1000,
+    RETRYABLE_FAILURE_COOLDOWN_MS: 12 * 60 * 1000,
+    UNKNOWN_FAILURE_COOLDOWN_MS: 30 * 60 * 1000,
+    RETRYABLE_FAILURE_MAX_ATTEMPTS: 3
 };
 
-let publishState = {
-    isPublishing: false,
-    currentTask: null,
-    currentIndex: 0,
-    queue: [],
-    currentWorkflowId: null,
-    currentTabId: null,
-    currentUrl: '',
-    stopRequested: false,
-    awaitingManualContinue: false,
-    pendingSubmission: null
+const STORAGE_STRATEGY = {
+    RESOURCE_HISTORY_LIMIT: 6,
+    RESOURCE_URL_LIMIT: 260,
+    RESOURCE_TITLE_LIMIT: 140,
+    RESOURCE_DETAIL_LIMIT: 4,
+    RESOURCE_DETAIL_TEXT_LIMIT: 80,
+    RESOURCE_QUOTA_RETRY_LIMITS: [4500, 3500, 2500, 1500]
 };
+
+const SOURCE_TIERS = {
+    HISTORICAL_SUCCESS: 'historical-success',
+    COMMENT_OBSERVED: 'comment-observed',
+    COMPETITOR_BACKLINK: 'competitor-backlink',
+    RULE_GUESS: 'rule-guess',
+    AI_GUESS: 'ai-guess'
+};
+
+const SOURCE_TIER_SCORES = {
+    [SOURCE_TIERS.HISTORICAL_SUCCESS]: 100,
+    [SOURCE_TIERS.COMMENT_OBSERVED]: 82,
+    [SOURCE_TIERS.COMPETITOR_BACKLINK]: 64,
+    [SOURCE_TIERS.RULE_GUESS]: 38,
+    [SOURCE_TIERS.AI_GUESS]: 18
+};
+
+const resourceStore = ResourceStore.create({
+    strategy: STORAGE_STRATEGY,
+    compactText,
+    normalizeHttpUrl: normalizeHttpUrlBg,
+    logger: console
+});
+
+const MARKETING_STRATEGY = {
+    PROMOTION_REFRESH_HOURS: 6
+};
+
+const PUBLISH_WATCHDOG = {
+    DISPATCH_MS: 30000,
+    SUBMISSION_MS: 20000
+};
+
+const RESOURCE_SIGNAL_VERSION = 2;
+const PUBLISH_TASK_SCHEMA_VERSION = 2;
+
+let publishSessions = TaskManager.createDefaultPublishSessions();
+let publishSessionsLoaded = false;
+let publishBatchState = TaskManager.createDefaultPublishBatchState();
+let publishBatchLoaded = false;
+const publishWatchdogs = new Map();
+let autoPublishDispatchTimer = null;
+let autoPublishDispatchRunning = false;
+let publishBatchAdvanceTimer = null;
+let resourceSignalNormalizationTimer = null;
+let resourceSignalNormalizationRunning = false;
 
 let domainIntelCache = {
     frontier: [],
@@ -80,8 +145,13 @@ let continuousDiscoveryState = {
 let continuousDiscoveryLoaded = false;
 let continuousDiscoveryLoopRunning = false;
 
+let marketingAutomationState = TaskManager.createDefaultMarketingAutomationState();
+let marketingAutomationLoaded = false;
+let marketingAutomationLoopRunning = false;
+
 let panelWindowId = null;
 let collectTabId = null;
+let marketingExecutionTabId = null;
 
 async function openPanelWindow() {
     if (panelWindowId !== null) {
@@ -112,89 +182,592 @@ async function configureActionSurface() {
     } catch {}
 }
 
-if (chrome.sidePanel?.setPanelBehavior) {
-    configureActionSurface();
-    chrome.runtime.onInstalled.addListener(() => {
-        configureActionSurface();
-    });
-    chrome.runtime.onStartup.addListener(() => {
-        configureActionSurface();
-    });
-} else {
+async function bootstrapBackgroundRuntime() {
+    if (chrome.sidePanel?.setPanelBehavior) {
+        await configureActionSurface();
+    }
+    await restoreTaskSchedules();
+    await performStorageMaintenance();
+}
+
+function triggerBackgroundBootstrap() {
+    bootstrapBackgroundRuntime().catch(() => {});
+}
+
+triggerBackgroundBootstrap();
+chrome.runtime.onInstalled.addListener(() => {
+    triggerBackgroundBootstrap();
+});
+chrome.runtime.onStartup.addListener(() => {
+    triggerBackgroundBootstrap();
+});
+
+if (!chrome.sidePanel?.setPanelBehavior) {
     // Fallback for browsers without side panel support.
     chrome.action.onClicked.addListener(() => {
         openPanelWindow();
     });
 }
 
-chrome.windows.onRemoved.addListener((windowId) => {
-    if (windowId === panelWindowId) panelWindowId = null;
-});
+function handleAlarmEvent(alarm) {
+    if (!alarm?.name) return;
+    if (alarm.name.startsWith('nurture:')) {
+        handleNurtureAlarm(alarm.name.slice('nurture:'.length)).catch(() => {});
+        return;
+    }
+    if (alarm.name.startsWith('marketing-refresh:')) {
+        handleMarketingRefreshAlarm(alarm.name.slice('marketing-refresh:'.length)).catch(() => {});
+    }
+}
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+function handleWindowRemoved(windowId) {
+    if (windowId === panelWindowId) panelWindowId = null;
+}
+
+function handleTabRemoved(tabId) {
     if (tabId === collectTabId) {
         collectTabId = null;
     }
-    if (tabId === publishState.currentTabId) {
-        publishState.currentTabId = null;
+    if (tabId === marketingExecutionTabId) {
+        marketingExecutionTabId = null;
     }
-    if (tabId === publishState.pendingSubmission?.tabId) {
-        publishState.pendingSubmission = null;
+    let changed = false;
+    for (const [taskId, session] of Object.entries(publishSessions || {})) {
+        if (tabId === session.currentTabId) {
+            publishSessions[taskId] = { ...session, currentTabId: null };
+            changed = true;
+        }
+        if (tabId === session.pendingSubmission?.tabId) {
+            publishSessions[taskId] = { ...publishSessions[taskId], pendingSubmission: null };
+            changed = true;
+        }
     }
-});
+    if (changed) {
+        flushPublishSessions().catch(() => {});
+    }
+}
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+function handleTabUpdated(tabId, changeInfo) {
     if (changeInfo.status !== 'complete') return;
-    if (!publishState.pendingSubmission) return;
-    if (publishState.pendingSubmission.tabId !== tabId) return;
+    const taskId = findPublishSessionTaskIdByPendingTab(tabId);
+    if (!taskId) return;
+    finalizePendingSubmissionFromNavigation(taskId, tabId);
+}
 
-    finalizePendingSubmissionFromNavigation(tabId);
-});
+chrome.alarms.onAlarm.addListener(handleAlarmEvent);
+chrome.windows.onRemoved.addListener(handleWindowRemoved);
+chrome.tabs.onRemoved.addListener(handleTabRemoved);
+chrome.tabs.onUpdated.addListener(handleTabUpdated);
 
 function createDefaultContinuousDiscoveryState() {
+    return TaskManager.createDefaultContinuousDiscoveryState();
+}
+
+function createDefaultPublishState() {
+    return TaskManager.createDefaultPublishState();
+}
+
+function createDefaultPublishSessions() {
+    return TaskManager.createDefaultPublishSessions();
+}
+
+function createDefaultPublishBatchState() {
+    return TaskManager.createDefaultPublishBatchState();
+}
+
+function getPublishStateView() {
+    return TaskManager.buildPublishSessionsView(publishSessions, publishBatchState);
+}
+
+function shouldPersistPublishSession(state = {}) {
+    return !!(
+        state?.currentTask
+        || state?.isPublishing
+        || state?.awaitingManualContinue
+        || state?.pendingSubmission
+        || state?.currentTabId
+        || state?.currentUrl
+        || (Array.isArray(state?.queue) && state.queue.length > 0)
+        || state?.currentIndex
+    );
+}
+
+function normalizeInterruptedPublishSession(state = {}) {
+    if (!state?.isPublishing && !state?.awaitingManualContinue && !state?.pendingSubmission) {
+        return state;
+    }
     return {
+        ...state,
+        isPublishing: false,
+        awaitingManualContinue: false,
+        pendingSubmission: null,
+        currentTabId: null,
+        stopRequested: false
+    };
+}
+
+function getPublishSessionState(taskId) {
+    return {
+        ...TaskManager.createDefaultPublishState(),
+        ...(publishSessions?.[taskId] || {})
+    };
+}
+
+function setPublishSessionState(taskId, nextState) {
+    if (!taskId) return;
+    if (shouldPersistPublishSession(nextState)) {
+        publishSessions[taskId] = nextState;
+    } else {
+        delete publishSessions[taskId];
+    }
+    publishSessionsLoaded = true;
+    flushPublishSessions().catch(() => {});
+}
+
+function updatePublishSessionState(taskId, patch = {}) {
+    if (!taskId) return;
+    const nextState = {
+        ...getPublishSessionState(taskId),
+        ...(patch || {})
+    };
+    setPublishSessionState(taskId, nextState);
+}
+
+function findPublishSessionTaskIdByPendingTab(tabId) {
+    return Object.entries(publishSessions || {}).find(([, session]) => session.pendingSubmission?.tabId === tabId)?.[0] || '';
+}
+
+function findPublishSessionTaskIdByCurrentTab(tabId) {
+    return Object.entries(publishSessions || {}).find(([, session]) => session.currentTabId === tabId)?.[0] || '';
+}
+
+function findPublishSessionTaskIdByResource(resourceId) {
+    return Object.entries(publishSessions || {}).find(([, session]) => {
+        const activeResourceId = session.queue?.[session.currentIndex]?.id || '';
+        return activeResourceId === resourceId || session.pendingSubmission?.resourceId === resourceId;
+    })?.[0] || '';
+}
+
+async function ensurePublishSessionsLoaded() {
+    if (publishSessionsLoaded) return;
+    const loadedSessions = await StateStore.loadPublishSessions(createDefaultPublishSessions());
+    const nextSessions = {};
+    let changed = false;
+
+    for (const [taskId, session] of Object.entries(loadedSessions || {})) {
+        const normalized = normalizeInterruptedPublishSession(session);
+        nextSessions[taskId] = normalized;
+        if (JSON.stringify(normalized) !== JSON.stringify(session || {})) {
+            changed = true;
+        }
+    }
+
+    publishSessions = nextSessions;
+    publishSessionsLoaded = true;
+
+    if (changed) {
+        await StateStore.savePublishSessions(publishSessions);
+    }
+}
+
+async function flushPublishSessions() {
+    await StateStore.savePublishSessions(publishSessions);
+}
+
+function normalizePublishBatchState(state = {}) {
+    return {
+        ...createDefaultPublishBatchState(),
+        ...(state || {}),
+        queueTaskIds: Array.isArray(state.queueTaskIds) ? [...new Set(state.queueTaskIds.filter(Boolean))] : [],
+        completedTaskIds: Array.isArray(state.completedTaskIds) ? [...new Set(state.completedTaskIds.filter(Boolean))] : [],
+        skippedTaskIds: Array.isArray(state.skippedTaskIds) ? [...new Set(state.skippedTaskIds.filter(Boolean))] : [],
+        failedTaskIds: Array.isArray(state.failedTaskIds) ? [...new Set(state.failedTaskIds.filter(Boolean))] : []
+    };
+}
+
+async function ensurePublishBatchStateLoaded() {
+    if (publishBatchLoaded) return;
+    publishBatchState = normalizePublishBatchState(
+        await StateStore.loadPublishBatchState(createDefaultPublishBatchState())
+    );
+    publishBatchLoaded = true;
+}
+
+async function flushPublishBatchState() {
+    await StateStore.savePublishBatchState(publishBatchState);
+}
+
+function setPublishBatchState(nextState = {}) {
+    publishBatchState = normalizePublishBatchState(nextState);
+    publishBatchLoaded = true;
+    flushPublishBatchState().catch(() => {});
+    broadcastPublishBatchState();
+}
+
+function updatePublishBatchState(patch = {}) {
+    setPublishBatchState({
+        ...publishBatchState,
+        ...(patch || {}),
+        updatedAt: new Date().toISOString()
+    });
+}
+
+function broadcastPublishBatchState() {
+    broadcastToPopup({
+        action: 'publishBatchUpdate',
+        state: TaskManager.buildPublishBatchView(publishBatchState)
+    });
+}
+
+function getPublishBatchDoneTaskIds(state = publishBatchState) {
+    return [...new Set([
+        ...(state.completedTaskIds || []),
+        ...(state.skippedTaskIds || []),
+        ...(state.failedTaskIds || [])
+    ])];
+}
+
+function getPublishBatchRemainingTaskIds(state = publishBatchState) {
+    const doneSet = new Set(getPublishBatchDoneTaskIds(state));
+    return (state.queueTaskIds || []).filter((taskId) => !doneSet.has(taskId));
+}
+
+function isPublishBatchRunning() {
+    return !!publishBatchState?.isRunning;
+}
+
+function shouldSkipPublishBatchTask(result = {}) {
+    return ['no_pending_resources', 'site_history_exhausted', 'domain_cooldown_active'].includes(result?.code || '');
+}
+
+function schedulePublishBatchAdvance(reason = 'publish-done', delayMs = 700) {
+    if (publishBatchAdvanceTimer) {
+        clearTimeout(publishBatchAdvanceTimer);
+    }
+    publishBatchAdvanceTimer = setTimeout(() => {
+        publishBatchAdvanceTimer = null;
+        advancePublishBatch(reason).catch(async (error) => {
+            await Logger.error(`批量发布接力失败: ${error.message}`, { reason });
+        });
+    }, Math.max(200, Number(delayMs || 0)));
+}
+
+async function finalizePublishBatch(message = '批量发布已完成') {
+    await ensurePublishBatchStateLoaded();
+    if (!publishBatchState.queueTaskIds?.length) {
+        setPublishBatchState({
+            ...createDefaultPublishBatchState(),
+            isRunning: false,
+            isPaused: true,
+            updatedAt: new Date().toISOString(),
+            lastCompletedAt: new Date().toISOString(),
+            lastMessage: message
+        });
+    } else {
+        setPublishBatchState({
+            ...publishBatchState,
+            isRunning: false,
+            isPaused: true,
+            currentTaskId: '',
+            updatedAt: new Date().toISOString(),
+            lastCompletedAt: new Date().toISOString(),
+            lastMessage: message
+        });
+    }
+    await Logger.publish(message, {
+        totalTasks: publishBatchState.queueTaskIds?.length || 0,
+        completed: publishBatchState.completedTaskIds?.length || 0,
+        skipped: publishBatchState.skippedTaskIds?.length || 0,
+        failed: publishBatchState.failedTaskIds?.length || 0
+    });
+    return { success: true, completed: true, state: TaskManager.buildPublishBatchView(publishBatchState) };
+}
+
+function buildPublishBatchStatusMessage(task = {}, outcome = 'completed', detail = '') {
+    const name = task?.name || task?.website || task?.id || '任务';
+    if (outcome === 'skipped') {
+        return detail ? `已跳过 ${name} · ${detail}` : `已跳过 ${name}`;
+    }
+    if (outcome === 'failed') {
+        return detail ? `任务失败 ${name} · ${detail}` : `任务失败 ${name}`;
+    }
+    return detail ? `已完成 ${name} · ${detail}` : `已完成 ${name}`;
+}
+
+async function markPublishBatchTask(taskId, outcome = 'completed', detail = '', taskMap = new Map()) {
+    await ensurePublishBatchStateLoaded();
+    if (!taskId) return;
+
+    const completedTaskIds = [...(publishBatchState.completedTaskIds || [])];
+    const skippedTaskIds = [...(publishBatchState.skippedTaskIds || [])];
+    const failedTaskIds = [...(publishBatchState.failedTaskIds || [])];
+    const removeTaskId = (list) => list.filter((id) => id !== taskId);
+    const normalizedOutcome = outcome === 'failed' ? 'failed' : outcome === 'skipped' ? 'skipped' : 'completed';
+    const nextCompleted = normalizedOutcome === 'completed' ? [...new Set([...removeTaskId(completedTaskIds), taskId])] : removeTaskId(completedTaskIds);
+    const nextSkipped = normalizedOutcome === 'skipped' ? [...new Set([...removeTaskId(skippedTaskIds), taskId])] : removeTaskId(skippedTaskIds);
+    const nextFailed = normalizedOutcome === 'failed' ? [...new Set([...removeTaskId(failedTaskIds), taskId])] : removeTaskId(failedTaskIds);
+    const task = taskMap.get(taskId) || {};
+
+    updatePublishBatchState({
+        currentTaskId: '',
+        completedTaskIds: nextCompleted,
+        skippedTaskIds: nextSkipped,
+        failedTaskIds: nextFailed,
+        lastCompletedAt: new Date().toISOString(),
+        lastMessage: buildPublishBatchStatusMessage(task, normalizedOutcome, detail)
+    });
+}
+
+async function advancePublishBatch(reason = 'task-finished') {
+    await ensurePublishSessionsLoaded();
+    await ensurePublishBatchStateLoaded();
+    if (!isPublishBatchRunning()) {
+        return { success: false, code: 'publish_batch_idle', message: '当前没有运行中的批量发布。' };
+    }
+
+    const sessionView = getPublishStateView();
+    if (sessionView.isPublishing) {
+        return { success: false, code: 'publish_session_busy', message: '当前仍有发布任务在执行中。' };
+    }
+
+    const tasks = await TaskStore.getTasks();
+    const taskMap = new Map((tasks || []).map((task) => [task.id, task]));
+    const currentTaskId = publishBatchState.currentTaskId || '';
+    if (currentTaskId && !getPublishBatchDoneTaskIds(publishBatchState).includes(currentTaskId)) {
+        await markPublishBatchTask(currentTaskId, 'completed', '', taskMap);
+    }
+
+    const remainingTaskIds = getPublishBatchRemainingTaskIds(publishBatchState);
+    if (remainingTaskIds.length === 0) {
+        return await finalizePublishBatch('批量发布已全部完成');
+    }
+
+    for (const taskId of remainingTaskIds) {
+        const task = taskMap.get(taskId);
+        if (!task || getTaskType(task) !== 'publish') {
+            await markPublishBatchTask(taskId, 'failed', '任务不存在或不是发布任务', taskMap);
+            continue;
+        }
+
+        updatePublishBatchState({
+            currentTaskId: taskId,
+            lastMessage: `准备执行 ${task.name || task.website || task.id || '任务'}`
+        });
+
+        const result = await startPublish(task, { fromBatch: true, batchReason: reason });
+        if (result?.success) {
+            updatePublishBatchState({
+                currentTaskId: taskId,
+                lastMessage: `正在执行 ${task.name || task.website || task.id || '任务'}`
+            });
+            return {
+                success: true,
+                started: true,
+                taskId,
+                message: result.message || '已启动下一条任务'
+            };
+        }
+
+        if (shouldSkipPublishBatchTask(result)) {
+            await markPublishBatchTask(taskId, 'skipped', result?.message || '', taskMap);
+            continue;
+        }
+
+        if (result?.code === 'publish_session_busy' || result?.code === 'publish_batch_busy') {
+            updatePublishBatchState({
+                currentTaskId: taskId,
+                lastMessage: result?.message || '批量发布等待当前会话空闲'
+            });
+            return {
+                success: false,
+                code: result?.code || 'publish_session_busy',
+                message: result?.message || '当前已有发布任务在运行'
+            };
+        }
+
+        await markPublishBatchTask(taskId, 'failed', result?.message || '启动失败', taskMap);
+    }
+
+    return await finalizePublishBatch('批量发布已完成，剩余任务均已跳过或失败');
+}
+
+async function startPublishBatch(taskIds = []) {
+    await ensurePublishSessionsLoaded();
+    await ensurePublishBatchStateLoaded();
+
+    if (isPublishBatchRunning()) {
+        return {
+            success: false,
+            code: 'publish_batch_running',
+            message: '当前已有批量发布在运行，请先停止后再启动新的批量任务。'
+        };
+    }
+
+    const hasActivePublish = Object.values(publishSessions || {}).some((session) =>
+        session.isPublishing || session.awaitingManualContinue || session.pendingSubmission
+    );
+    if (hasActivePublish) {
+        return {
+            success: false,
+            code: 'publish_session_busy',
+            message: '当前已有发布任务在运行，请先停止或完成后再启动批量发布。'
+        };
+    }
+
+    const tasks = await TaskStore.getTasks();
+    const publishTasks = (tasks || []).filter((task) => getTaskType(task) === 'publish');
+    const publishTaskMap = new Map(publishTasks.map((task) => [task.id, task]));
+    const dedupedTaskIds = [...new Set((Array.isArray(taskIds) ? taskIds : []).filter(Boolean))];
+    const queueTaskIds = (dedupedTaskIds.length > 0 ? dedupedTaskIds : publishTasks.map((task) => task.id))
+        .filter((taskId) => publishTaskMap.has(taskId));
+
+    if (queueTaskIds.length === 0) {
+        return {
+            success: false,
+            code: 'no_publish_tasks',
+            message: '当前没有可执行的发布任务。'
+        };
+    }
+
+    if (autoPublishDispatchTimer) {
+        clearTimeout(autoPublishDispatchTimer);
+        autoPublishDispatchTimer = null;
+    }
+    if (publishBatchAdvanceTimer) {
+        clearTimeout(publishBatchAdvanceTimer);
+        publishBatchAdvanceTimer = null;
+    }
+
+    const now = new Date().toISOString();
+    setPublishBatchState({
+        ...createDefaultPublishBatchState(),
+        isRunning: true,
+        isPaused: false,
+        queueTaskIds,
+        currentTaskId: '',
+        startedAt: now,
+        updatedAt: now,
+        lastMessage: `准备顺序执行 ${queueTaskIds.length} 个发布任务`
+    });
+
+    await Logger.publish('启动批量发布', {
+        totalTasks: queueTaskIds.length,
+        taskIds: queueTaskIds
+    });
+
+    return await advancePublishBatch('manual-batch-start');
+}
+
+async function stopPublishBatch(options = {}) {
+    await ensurePublishSessionsLoaded();
+    await ensurePublishBatchStateLoaded();
+
+    const wasRunning = isPublishBatchRunning();
+    const activeTaskId = publishBatchState.currentTaskId || '';
+    const message = options.message || '已停止批量发布';
+    updatePublishBatchState({
         isRunning: false,
         isPaused: true,
-        seedDomain: '',
-        myDomain: '',
-        sources: [],
-        seedInitialized: false,
-        currentDomain: '',
-        lastSeedRunAt: '',
-        lastFrontierRunAt: '',
-        lastCompletedAt: '',
-        lastMessage: ''
+        currentTaskId: '',
+        lastMessage: message
+    });
+
+    if (publishBatchAdvanceTimer) {
+        clearTimeout(publishBatchAdvanceTimer);
+        publishBatchAdvanceTimer = null;
+    }
+
+    if (options.stopActiveTask !== false && activeTaskId) {
+        await stopPublish(activeTaskId, { skipBatchStop: true });
+    }
+
+    if (wasRunning) {
+        await Logger.publish(message, {
+            totalTasks: publishBatchState.queueTaskIds?.length || 0,
+            completed: publishBatchState.completedTaskIds?.length || 0,
+            skipped: publishBatchState.skippedTaskIds?.length || 0,
+            failed: publishBatchState.failedTaskIds?.length || 0
+        });
+    }
+
+    return {
+        success: true,
+        stopped: wasRunning,
+        state: TaskManager.buildPublishBatchView(publishBatchState)
     };
+}
+
+function clearPublishWatchdog(taskId) {
+    const timer = publishWatchdogs.get(taskId);
+    if (timer) {
+        clearTimeout(timer);
+        publishWatchdogs.delete(taskId);
+    }
+}
+
+function schedulePublishWatchdog(taskId, options = {}) {
+    if (!taskId || !options.resourceId) return;
+
+    clearPublishWatchdog(taskId);
+
+    const stage = options.stage || 'dispatch';
+    const timeoutMs = Number(options.timeoutMs || 0) || (stage === 'submission' ? PUBLISH_WATCHDOG.SUBMISSION_MS : PUBLISH_WATCHDOG.DISPATCH_MS);
+    const resourceId = options.resourceId;
+    const currentUrl = options.currentUrl || '';
+
+    const timer = setTimeout(async () => {
+        publishWatchdogs.delete(taskId);
+
+        try {
+            await ensurePublishSessionsLoaded();
+            const session = getPublishSessionState(taskId);
+            const activeResourceId = session.queue?.[session.currentIndex]?.id || '';
+            const pendingResourceId = session.pendingSubmission?.resourceId || '';
+
+            if (!session.isPublishing || session.awaitingManualContinue) return;
+            if (stage === 'dispatch' && activeResourceId !== resourceId) return;
+            if (stage === 'submission' && pendingResourceId !== resourceId) return;
+
+            await Logger.error('发布任务超时，已自动跳过当前资源', {
+                taskId,
+                resourceId,
+                stage,
+                currentUrl
+            });
+
+            await handleCommentAction(resourceId, 'failed', taskId, {
+                reportedVia: 'watchdog',
+                watchdogStage: stage,
+                submissionBlocked: true,
+                submissionBlockReason: stage === 'submission'
+                    ? 'submit-confirm-timeout'
+                    : 'publish-runtime-timeout'
+            });
+        } catch {}
+    }, timeoutMs);
+
+    publishWatchdogs.set(taskId, timer);
 }
 
 async function ensureContinuousDiscoveryLoaded() {
     if (continuousDiscoveryLoaded) return;
-    const data = await chrome.storage.local.get(['continuousDiscoveryState', 'collectState']);
-    continuousDiscoveryState = {
-        ...createDefaultContinuousDiscoveryState(),
-        ...(data.continuousDiscoveryState || {})
-    };
+    const data = await StateStore.get(['continuousDiscoveryState', 'collectState']);
+    continuousDiscoveryState = await StateStore.loadContinuousDiscoveryState(createDefaultContinuousDiscoveryState());
     const persistedCollectState = data.collectState || {};
     if (continuousDiscoveryState.isRunning && !persistedCollectState.isCollecting) {
-        continuousDiscoveryState.isRunning = false;
-        continuousDiscoveryState.isPaused = true;
-        continuousDiscoveryState.currentDomain = '';
-        continuousDiscoveryState.lastMessage = continuousDiscoveryState.lastMessage || '上次持续发现已中断，可继续';
-        await chrome.storage.local.set({ continuousDiscoveryState });
+        continuousDiscoveryState = TaskManager.buildInterruptedContinuousDiscoveryPatch(continuousDiscoveryState);
+        await StateStore.saveContinuousDiscoveryState(continuousDiscoveryState);
     }
     continuousDiscoveryLoaded = true;
 }
 
 async function flushContinuousDiscoveryState() {
-    await chrome.storage.local.set({ continuousDiscoveryState });
+    await StateStore.saveContinuousDiscoveryState(continuousDiscoveryState);
 }
 
 async function updateContinuousDiscoveryState(patch = {}, options = {}) {
     await ensureContinuousDiscoveryLoaded();
-    continuousDiscoveryState = {
-        ...continuousDiscoveryState,
-        ...patch
-    };
+    continuousDiscoveryState = TaskManager.normalizeContinuousDiscoveryPatch(continuousDiscoveryState, patch);
     await flushContinuousDiscoveryState();
     if (options.broadcast !== false) {
         await broadcastContinuousDiscoveryState();
@@ -216,17 +789,167 @@ async function getContinuousDiscoveryStateView() {
     const processedDomains = domainIntelCache.frontier.filter((entry) => (entry.crawlStatus || '') === 'completed').length;
     const failedDomains = domainIntelCache.frontier.filter((entry) => (entry.crawlStatus || '') === 'failed').length;
 
-    return {
-        ...continuousDiscoveryState,
+    return TaskManager.buildContinuousDiscoveryView(continuousDiscoveryState, {
         pendingDomains,
         processedDomains,
         failedDomains
-    };
+    });
 }
 
 async function broadcastContinuousDiscoveryState() {
     const state = await getContinuousDiscoveryStateView();
     broadcastToPopup({ action: 'continuousStateUpdate', state });
+}
+
+async function ensureMarketingAutomationLoaded() {
+    if (marketingAutomationLoaded) return;
+    marketingAutomationState = await StateStore.loadMarketingAutomationState(TaskManager.createDefaultMarketingAutomationState());
+    if (marketingAutomationState.isRunning && !marketingAutomationLoopRunning) {
+        marketingAutomationState = TaskManager.buildInterruptedMarketingAutomationPatch(marketingAutomationState);
+        await StateStore.saveMarketingAutomationState(marketingAutomationState);
+    }
+    marketingAutomationLoaded = true;
+}
+
+async function flushMarketingAutomationState() {
+    await StateStore.saveMarketingAutomationState(marketingAutomationState);
+}
+
+async function updateMarketingAutomationState(patch = {}, options = {}) {
+    await ensureMarketingAutomationLoaded();
+    marketingAutomationState = TaskManager.normalizeMarketingAutomationPatch(marketingAutomationState, patch);
+    await flushMarketingAutomationState();
+    if (options.broadcast !== false) {
+        await broadcastMarketingAutomationState();
+    }
+}
+
+function isVisibleMarketingTaskBg(task = {}) {
+    const workflow = WorkflowRegistry.get(task?.workflowId || WorkflowRegistry.DEFAULT_WORKFLOW_ID) || {};
+    return !workflow.internal && (workflow.taskType || task.taskType || 'publish') !== 'publish';
+}
+
+function getPromotionProgress(task = {}) {
+    const plan = task?.promotionPlan || {};
+    const channels = Array.isArray(plan.channels)
+        ? plan.channels.filter((channel) => channel?.workflowId !== 'account-nurture' && normalizeHttpUrlBg(channel.url || ''))
+        : [];
+    const total = Number(plan.totalOpenableChannels || channels.length || 0);
+    const progressed = Math.min(
+        total,
+        Number.isFinite(Number(plan.progressedChannelCount))
+            ? Number(plan.progressedChannelCount)
+            : Number(plan.nextChannelIndex || 0)
+    );
+    return { total, progressed };
+}
+
+function getPromotionRefreshAlarmName(taskId = '') {
+    return `marketing-refresh:${taskId}`;
+}
+
+function getPromotionRefreshDelayMs(task = {}) {
+    const rawHours = Number(task.refreshHours || MARKETING_STRATEGY.PROMOTION_REFRESH_HOURS);
+    const hours = Number.isFinite(rawHours) && rawHours > 0 ? rawHours : MARKETING_STRATEGY.PROMOTION_REFRESH_HOURS;
+    return hours * 60 * 60 * 1000;
+}
+
+function computeNextPromotionResearchAt(task = {}) {
+    return new Date(Date.now() + getPromotionRefreshDelayMs(task)).toISOString();
+}
+
+function getPromotionNextResearchAtMs(task = {}) {
+    const value = task?.promotionPlan?.nextResearchAt || '';
+    const parsed = new Date(value).getTime();
+    return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isPromotionTaskScheduled(task = {}) {
+    if (task.workflowId !== 'product-promote-campaign') return false;
+    const refreshAtMs = getPromotionNextResearchAtMs(task);
+    return refreshAtMs > Date.now();
+}
+
+function isPromotionTaskPending(task = {}) {
+    if (task.workflowId !== 'product-promote-campaign') return false;
+    const plan = task?.promotionPlan || null;
+    if (!Array.isArray(plan?.channels) || plan.channels.length === 0) return true;
+    const { total, progressed } = getPromotionProgress(task);
+    if (total > 0 && progressed < total) return true;
+    const refreshAtMs = getPromotionNextResearchAtMs(task);
+    return refreshAtMs > 0 && refreshAtMs <= Date.now();
+}
+
+function isNurtureTaskDue(task = {}) {
+    const workflow = WorkflowRegistry.get(task?.workflowId || WorkflowRegistry.DEFAULT_WORKFLOW_ID) || {};
+    const taskType = workflow.taskType || task.taskType || 'publish';
+    if (taskType !== 'nurture') return false;
+    const nextRunAtMs = new Date(task.nextRunAt || '').getTime();
+    return !Number.isFinite(nextRunAtMs) || nextRunAtMs <= Date.now();
+}
+
+function getMarketingAutomationMetrics(tasks = []) {
+    const visibleTasks = (tasks || []).filter(isVisibleMarketingTaskBg);
+    const scheduledRefreshTimes = visibleTasks
+        .filter((task) => isPromotionTaskScheduled(task))
+        .map((task) => getPromotionNextResearchAtMs(task))
+        .filter((time) => time > Date.now())
+        .sort((a, b) => a - b);
+    return {
+        pendingTasks: visibleTasks.filter((task) => isPromotionTaskPending(task)).length,
+        dueNurtureTasks: visibleTasks.filter((task) => isNurtureTaskDue(task)).length,
+        scheduledPromotionTasks: scheduledRefreshTimes.length,
+        nextPromotionRefreshAt: scheduledRefreshTimes[0] ? new Date(scheduledRefreshTimes[0]).toISOString() : ''
+    };
+}
+
+function selectNextMarketingTask(tasks = [], options = {}) {
+    const visibleTasks = (tasks || []).filter(isVisibleMarketingTaskBg);
+    const promotionTasks = visibleTasks
+        .filter((task) => isPromotionTaskPending(task))
+        .sort((a, b) => String(a.lastRunAt || '').localeCompare(String(b.lastRunAt || '')) || String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+
+    if (promotionTasks.length > 0) {
+        return promotionTasks[0];
+    }
+
+    const nurtureTasks = visibleTasks
+        .filter((task) => isNurtureTaskDue(task))
+        .sort((a, b) => {
+            const aTime = new Date(a.nextRunAt || a.createdAt || 0).getTime() || 0;
+            const bTime = new Date(b.nextRunAt || b.createdAt || 0).getTime() || 0;
+            return aTime - bTime;
+        });
+
+    if (nurtureTasks.length > 0) {
+        return nurtureTasks[0];
+    }
+
+    if (options.forcePromotionRefresh) {
+        const refreshableTasks = visibleTasks
+            .filter((task) => task.workflowId === 'product-promote-campaign')
+            .sort((a, b) => String(a.lastRunAt || '').localeCompare(String(b.lastRunAt || '')) || String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+        if (refreshableTasks.length > 0) {
+            return refreshableTasks[0];
+        }
+    }
+
+    return null;
+}
+
+async function getMarketingAutomationStateView() {
+    await ensureMarketingAutomationLoaded();
+    const tasks = await TaskStore.getTasks();
+    const metrics = getMarketingAutomationMetrics(tasks);
+    return TaskManager.buildMarketingAutomationView(marketingAutomationState, {
+        ...metrics,
+        processedTasks: marketingAutomationState.processedTasks || 0
+    });
+}
+
+async function broadcastMarketingAutomationState() {
+    const state = await getMarketingAutomationStateView();
+    broadcastToPopup({ action: 'marketingStateUpdate', state });
 }
 
 async function ensureCollectTab() {
@@ -244,6 +967,32 @@ async function ensureCollectTab() {
     return collectTabId;
 }
 
+async function openOrReuseMarketingTab(url, options = {}) {
+    const { active = false, waitForLoad = true } = options;
+    const targetUrl = normalizeHttpUrlBg(url || '') || 'about:blank';
+
+    if (marketingExecutionTabId) {
+        try {
+            await chrome.tabs.get(marketingExecutionTabId);
+            await chrome.tabs.update(marketingExecutionTabId, { url: targetUrl, active: !!active });
+            if (waitForLoad) {
+                await waitForTabLoad(marketingExecutionTabId);
+            }
+            return await chrome.tabs.get(marketingExecutionTabId);
+        } catch {
+            marketingExecutionTabId = null;
+        }
+    }
+
+    const tab = await chrome.tabs.create({ url: targetUrl, active: !!active });
+    marketingExecutionTabId = tab.id;
+    if (waitForLoad) {
+        await waitForTabLoad(tab.id);
+        return await chrome.tabs.get(tab.id);
+    }
+    return tab;
+}
+
 function getContinuousSeedDomain() {
     return getDomainBg(continuousDiscoveryState.seedDomain || '');
 }
@@ -252,287 +1001,235 @@ function getContinuousMyDomain() {
     return getDomainBg(continuousDiscoveryState.myDomain || '');
 }
 
+async function handleCommentSubmittingMessage(msg = {}, sender = {}) {
+    await ensurePublishSessionsLoaded();
+    const taskId = msg.taskId || findPublishSessionTaskIdByCurrentTab(sender.tab?.id) || '';
+    if (!taskId) return;
+
+    clearPublishWatchdog(taskId);
+    const session = getPublishSessionState(taskId);
+    setPublishSessionState(taskId, {
+        ...session,
+        pendingSubmission: {
+            resourceId: msg.resourceId,
+            taskId,
+            tabId: sender.tab?.id || session.currentTabId || null,
+            meta: msg.meta || {},
+            createdAt: Date.now()
+        }
+    });
+    schedulePublishWatchdog(taskId, {
+        stage: 'submission',
+        resourceId: msg.resourceId,
+        currentUrl: session.currentUrl
+    });
+}
+
 // === 消息处理 ===
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    switch (msg.action) {
-        case 'startCollect':
-            startCollect(msg.domain, msg.myDomain, msg.sources);
-            break;
-        case 'stopCollect':
-            stopCollect();
-            break;
-        case 'startContinuousDiscovery':
-            startContinuousDiscovery(msg.domain, msg.myDomain, msg.sources).then(result => sendResponse(result));
-            return true;
-        case 'pauseContinuousDiscovery':
-            pauseContinuousDiscovery().then(result => sendResponse(result));
-            return true;
-        case 'getContinuousDiscoveryState':
-            getContinuousDiscoveryStateView().then((state) => sendResponse({ state }));
-            return true;
-        case 'startPublish':
-            startPublish(msg.task).then(result => sendResponse(result));
-            return true;
-        case 'stopPublish':
-            stopPublish();
-            break;
-        case 'continuePublish':
-            continuePublish();
-            break;
-        case 'openFloatingPanel':
-            openPanelWindow();
-            break;
-        case 'getPublishState':
-            sendResponse({
-                isPublishing: publishState.isPublishing,
-                currentIndex: publishState.currentIndex,
-                total: publishState.queue?.length || 0,
-                currentUrl: publishState.currentUrl || '',
-                taskId: publishState.currentTask?.id || '',
-                taskName: publishState.currentTask?.name || publishState.currentTask?.website || '',
-                stopRequested: !!publishState.stopRequested,
-                awaitingManualContinue: !!publishState.awaitingManualContinue
-            });
-            return false;
-        case 'backlinkData':
-            handleBacklinkData(msg.source, msg.urls, msg.items || []);
-            break;
-        case 'commentAction':
-            handleCommentAction(msg.resourceId, msg.result, msg.taskId, msg.meta || {});
-            break;
-        case 'commentSubmitting':
-            publishState.pendingSubmission = {
-                resourceId: msg.resourceId,
-                taskId: msg.taskId,
-                tabId: sender.tab?.id || publishState.currentTabId || null,
-                meta: msg.meta || {},
-                createdAt: Date.now()
-            };
-            break;
-        case 'getStats':
-            getPersistedCollectView().then((view) => sendResponse(view));
-            return true;
-        case 'getResources':
-            chrome.storage.local.get('resources', (data) => {
-                sendResponse({ resources: data.resources || [] });
-            });
-            return true;
-        case 'getTasks':
-            chrome.storage.local.get('publishTasks', (data) => {
-                sendResponse({ tasks: data.publishTasks || [] });
-            });
-            return true;
-        case 'getDomainIntel':
-            getDomainIntelView().then((domainIntel) => sendResponse({ domainIntel }));
-            return true;
-        case 'saveTask':
-            savePublishTask(msg.task).then(() => sendResponse({ success: true }));
-            return true;
-        case 'deleteTask':
-            deletePublishTask(msg.taskId).then(() => sendResponse({ success: true }));
-            return true;
-        case 'getLogs':
-            Logger.getAll().then(logs => sendResponse({ logs }));
-            return true;
-        case 'clearLogs':
-            Logger.clear().then(() => sendResponse({ success: true }));
-            return true;
-        case 'clearAllData':
-            resetAllLocalData().then(() => sendResponse({ success: true }));
-            return true;
-        case 'testAiConnection':
-            AIEngine.testConnection().then(result => sendResponse(result));
-            return true;
-        case 'syncToSheets':
-            syncToGoogleSheets().then(result => sendResponse(result));
-            return true;
-        case 'republish':
-            republishResource(msg.resourceId, msg.taskId);
-            break;
-        case 'resetStatus':
-            resetResourcePublishState(msg.resourceId).then(() => sendResponse({ success: true }));
-            return true;
-        case 'resetAllStatuses':
-            resetAllPublishStatuses().then(result => sendResponse(result));
-            return true;
-        // AI 请求从 content script 转发
-        case 'aiExtractForm':
-            AIEngine.extractFormStructure(msg.html).then(result => sendResponse(result));
-            return true;
-        case 'aiGenerateComment':
-            AIEngine.generateComment(msg.pageTitle, msg.pageContent, msg.targetUrl, msg.options || {}).then(comment => {
-                sendResponse({ comment });
-            }).catch(err => {
-                sendResponse({ comment: '', error: err.message });
-            });
-            return true;
+const runtimeMessageRouter = RuntimeMessageRouter.create({
+    fireAndForget: {
+        startCollect: (msg) => startCollect(msg.domain, msg.myDomain, msg.sources),
+        stopCollect: () => stopCollect(),
+        stopPublish: (msg) => stopPublish(msg.taskId),
+        continuePublish: (msg) => continuePublish(msg.taskId),
+        openFloatingPanel: () => openPanelWindow(),
+        backlinkData: (msg) => handleBacklinkData(msg.source, msg.urls, msg.items || []),
+        commentAction: (msg) => handleCommentAction(msg.resourceId, msg.result, msg.taskId, msg.meta || {}),
+        commentSubmitting: (msg, sender) => handleCommentSubmittingMessage(msg, sender),
+        republish: (msg) => republishResource(msg.resourceId, msg.taskId)
+    },
+    asyncActions: {
+        startContinuousDiscovery: (msg) => startContinuousDiscovery(msg.domain, msg.myDomain, msg.sources),
+        pauseContinuousDiscovery: () => pauseContinuousDiscovery(),
+        getContinuousDiscoveryState: async () => ({ state: await getContinuousDiscoveryStateView() }),
+        startMarketingAutomation: (msg) => startMarketingAutomation(msg || {}),
+        pauseMarketingAutomation: () => pauseMarketingAutomation(),
+        getMarketingAutomationState: async () => ({ state: await getMarketingAutomationStateView() }),
+        startPublish: (msg) => startPublish(msg.task),
+        startPublishBatch: (msg) => startPublishBatch(msg.taskIds || []),
+        stopPublishBatch: () => stopPublishBatch(),
+        runMarketingTask: (msg) => runMarketingTask(msg.task, { active: true }),
+        inspectMarketingReview: (msg) => inspectMarketingReview(msg.taskId, msg.url),
+        getPublishState: async () => {
+            await ensurePublishSessionsLoaded();
+            await ensurePublishBatchStateLoaded();
+            return getPublishStateView();
+        },
+        getPublishInsights: async () => ({ insights: await getPublishInsights() }),
+        getStats: () => getPersistedCollectView(),
+        getResources: async () => ({ resources: await getStoredResources() }),
+        getTasks: async () => ({ tasks: await TaskStore.getTasks() }),
+        getDomainIntel: async () => ({ domainIntel: await getDomainIntelView() }),
+        saveTask: async (msg) => {
+            await savePublishTask(msg.task);
+            return { success: true };
+        },
+        deleteTask: async (msg) => {
+            await deletePublishTask(msg.taskId);
+            return { success: true };
+        },
+        getLogs: async () => ({ logs: await Logger.getAll() }),
+        clearLogs: async () => {
+            await Logger.clear();
+            return { success: true };
+        },
+        clearAllData: async () => {
+            await resetAllLocalData();
+            return { success: true };
+        },
+        testAiConnection: () => AIEngine.testConnection(),
+        getAIUsageStats: async () => ({ success: true, stats: await AIEngine.getUsageStats() }),
+        resetAIUsageStats: async () => {
+            await AIEngine.resetUsageStats();
+            return { success: true };
+        },
+        syncToSheets: () => syncToGoogleSheets(),
+        resetStatus: async (msg) => {
+            await resetResourcePublishState(msg.resourceId);
+            return { success: true };
+        },
+        resetAllStatuses: () => resetAllPublishStatuses(),
+        runAutoPublishScheduler: async () => runAutoPublishDispatch({ reason: 'manual-trigger' }),
+        aiExtractForm: (msg) => AIEngine.extractFormStructure(msg.html),
+        aiGenerateComment: async (msg) => {
+            try {
+                const comment = await AIEngine.generateComment(
+                    msg.pageTitle,
+                    msg.pageContent,
+                    msg.targetUrl,
+                    msg.options || {}
+                );
+                return { comment };
+            } catch (error) {
+                return { comment: '', error: error.message };
+            }
+        }
+    },
+    onError: (action, error) => {
+        console.error(`消息处理失败 [${action}]`, error);
+        Logger.error(`消息处理失败 [${action}]: ${error?.message || error}`, { action }).catch(() => {});
     }
 });
+
+chrome.runtime.onMessage.addListener(runtimeMessageRouter);
 
 // ============================================================
 // 收集流程 — 单 Tab 复用 + 递归发现
 // ============================================================
 
 async function startCollect(domain, myDomain, sources) {
-    const seededDomains = [domain, myDomain]
-        .map((value) => getDomainBg(value || ''))
-        .filter(Boolean);
-    collectState = {
-        isCollecting: true,
-        domain,
-        myDomain,
-        sources,
-        backlinks: { ahrefs: [], semrush: [], similarweb: [] },
-        myBacklinks: [],
-        stats: { backlinksFound: 0, targetsFound: 0, analyzed: 0, blogResources: 0, inQueue: 0 },
-        discoveredDomains: new Set(seededDomains),
-        discoveryQueue: [],
-        processedDiscoveryDomains: new Set(seededDomains),
-        discoveryDepth: 0,
-        maxDiscoveryDepth: 3,
-        maxDiscoveryQueue: 500,
-        maxRecursiveDomains: 50,
-        recursiveDomainsProcessed: 0,
-        sourceRequest: null
-    };
-
-    await ensureDomainIntelLoaded();
-    const seedEntry = seededDomains[0] ? ensureDomainFrontierEntry(seededDomains[0]) : null;
-    if (seedEntry) {
-        seedEntry.crawlStatus = 'completed';
-        seedEntry.status = mergeDomainStatus(seedEntry.status, 'expanded');
-    }
-    if (seededDomains[1]) {
-        const myEntry = ensureDomainFrontierEntry(seededDomains[1]);
-        myEntry.crawlStatus = 'completed';
-        myEntry.status = mergeDomainStatus(myEntry.status, 'profiled');
-    }
-    await flushDomainIntel();
-
-    await chrome.storage.local.set({ collectState: { isCollecting: true, domain, myDomain } });
-    broadcastStats();
-    await Logger.collect(`开始收集: ${domain}`, { sources });
-
-    const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
-    collectTabId = tab.id;
-
-    // 1. 依次用每个数据源查竞争对手外链
-    for (const source of sources) {
-        if (!collectState.isCollecting) break;
-        const url = getSourceUrl(source, domain);
-        if (url) {
-            await navigateAndCollect(collectTabId, url, source);
-        }
-    }
-
-    // 2. 查自己域名用于 Gap 对比
-    if (myDomain && collectState.isCollecting) {
-        for (const source of sources) {
-            if (!collectState.isCollecting) break;
-            const url = getSourceUrl(source, myDomain);
-            if (url) {
-                await navigateAndCollect(collectTabId, url, `my-${source}`);
+    await CollectorRuntime.runSeedCollection({
+        logger: Logger,
+        delay,
+        waitForTabLoad,
+        mergeBacklinks,
+        buildAnalysisTargets,
+        fetchAnalyzeAll,
+        recursiveDiscovery,
+        recordDomainIntel,
+        broadcastStats,
+        broadcastContinuousDiscoveryState,
+        broadcastCollectDone: () => broadcastToPopup({ action: 'collectDone' }),
+        getDomain: (value) => getDomainBg(value || ''),
+        getCollectState: () => collectState,
+        setCollectState: (nextState) => { collectState = nextState; },
+        resetCollectWaveStats: (mergedCount) => {
+            collectState.stats.backlinksFound = mergedCount;
+            collectState.stats.targetsFound = mergedCount;
+            collectState.stats.analyzed = 0;
+            collectState.stats.inQueue = 0;
+        },
+        setCollectWaveTargets: (count) => {
+            collectState.stats.targetsFound = count;
+            collectState.stats.inQueue = count;
+        },
+        seedFrontier: async (seededDomains) => {
+            await ensureDomainIntelLoaded();
+            const seedEntry = seededDomains[0] ? ensureDomainFrontierEntry(seededDomains[0]) : null;
+            if (seedEntry) {
+                seedEntry.crawlStatus = 'completed';
+                seedEntry.status = mergeDomainStatus(seedEntry.status, 'expanded');
             }
-        }
-    }
-
-    // 3. 合并三源数据
-    if (collectState.isCollecting) {
-        const merged = mergeBacklinks();
-        await recordDomainIntel(merged, {
-            discoveryMethod: 'collector-merge',
-            seedTarget: collectState.domain,
-            status: 'discovered'
-        });
-        collectState.stats.backlinksFound = merged.length;
-        collectState.stats.targetsFound = merged.length;
-        collectState.stats.analyzed = 0;
-        collectState.stats.inQueue = 0;
-        broadcastStats();
-        await Logger.collect(`合并完成: ${merged.length} 条外链`);
-
-        // 4. 构建分析目标（页面优先，域名再下钻）
-        const analysisTargets = await buildAnalysisTargets(merged);
-        collectState.stats.targetsFound = analysisTargets.length;
-        collectState.stats.inQueue = analysisTargets.length;
-        broadcastStats();
-        await Logger.collect(`分析目标准备完成: ${analysisTargets.length} 个`, {
-            directPages: analysisTargets.filter((item) => item.analysisStage === 'direct-page').length,
-            domainDrilldowns: analysisTargets.filter((item) => item.analysisStage === 'domain-drilldown').length
-        });
-
-        // 5. Fetch 批量分析
-        await fetchAnalyzeAll(analysisTargets);
-
-        // 6. 递归发现
-        await recursiveDiscovery();
-    }
-
-    try { await chrome.tabs.remove(collectTabId); } catch {}
-    collectTabId = null;
-
-    collectState.isCollecting = false;
-    await chrome.storage.local.set({ collectState: { isCollecting: false, domain, myDomain } });
-    await broadcastContinuousDiscoveryState();
-    broadcastToPopup({ action: 'collectDone' });
-    await Logger.collect('收集完成');
-}
-
-async function navigateAndCollect(tabId, url, source) {
-    try {
-        collectState[`${source}_done`] = false;
-        collectState.sourceRequest = {
-            source,
-            result: []
-        };
-        await chrome.tabs.update(tabId, { url });
-        await waitForTabLoad(tabId);
-        await delay(4000);
-
-        const collectorFile = source.replace('my-', '') + '-collector.js';
-        await chrome.scripting.executeScript({
-            target: { tabId },
-            files: [`content/${collectorFile}`]
-        });
-
-        if (source.startsWith('my-')) {
+            if (seededDomains[1]) {
+                const myEntry = ensureDomainFrontierEntry(seededDomains[1]);
+                myEntry.crawlStatus = 'completed';
+                myEntry.status = mergeDomainStatus(myEntry.status, 'profiled');
+            }
+            await flushDomainIntel();
+        },
+        persistCollectSnapshot: async (snapshot) => {
+            await StateStore.saveCollectSnapshot(snapshot);
+        },
+        openCollectTab: async () => {
+            const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+            collectTabId = tab.id;
+            return collectTabId;
+        },
+        closeCollectTab: async () => {
+            if (!collectTabId) return;
+            try { await chrome.tabs.remove(collectTabId); } catch {}
+            collectTabId = null;
+        },
+        finishCollecting: () => {
+            collectState.isCollecting = false;
+        },
+        updateTab: async (tabId, url) => {
+            await chrome.tabs.update(tabId, { url });
+        },
+        executeCollector: async (tabId, collectorFile) => {
+            await chrome.scripting.executeScript({
+                target: { tabId },
+                files: [`content/${collectorFile}`]
+            });
+        },
+        triggerMyDomainCollect: async (tabId) => {
             try {
                 await chrome.tabs.sendMessage(tabId, { action: 'collectAsMyDomain' });
             } catch {}
-        }
+        },
+        setSourceDone: (source, value) => {
+            collectState[`${source}_done`] = value;
+        },
+        isSourceDone: (source) => !!collectState[`${source}_done`],
+        setSourceRequest: (value) => {
+            collectState.sourceRequest = value;
+        },
+        getSourceRequest: () => collectState.sourceRequest
+    }, domain, myDomain, sources);
+}
 
-        const baseSource = source.replace('my-', '');
-        const waitTimeout = baseSource === 'similarweb'
-            ? 150000
-            : baseSource === 'semrush'
-                ? 210000
-                : baseSource === 'ahrefs'
-                    ? 90000
-                    : 45000;
-        await waitForData(source, waitTimeout);
-        const requestResult = collectState.sourceRequest?.source === source
-            ? [...(collectState.sourceRequest.result || [])]
-            : [];
-        collectState.sourceRequest = null;
-        return requestResult;
-    } catch (e) {
-        collectState.sourceRequest = null;
-        await Logger.error(`收集失败 (${source}): ${e.message}`);
-        return [];
-    }
+async function navigateAndCollect(tabId, url, source) {
+    return await CollectorRuntime.navigateAndCollect({
+        logger: Logger,
+        delay,
+        waitForTabLoad,
+        updateTab: async (targetTabId, targetUrl) => {
+            await chrome.tabs.update(targetTabId, { url: targetUrl });
+        },
+        executeCollector: async (targetTabId, collectorFile) => {
+            await chrome.scripting.executeScript({
+                target: { tabId: targetTabId },
+                files: [`content/${collectorFile}`]
+            });
+        },
+        triggerMyDomainCollect: async (targetTabId) => {
+            try {
+                await chrome.tabs.sendMessage(targetTabId, { action: 'collectAsMyDomain' });
+            } catch {}
+        },
+        setSourceDone: (targetSource, value) => {
+            collectState[`${targetSource}_done`] = value;
+        },
+        isSourceDone: (targetSource) => !!collectState[`${targetSource}_done`],
+        setSourceRequest: (value) => {
+            collectState.sourceRequest = value;
+        },
+        getSourceRequest: () => collectState.sourceRequest
+    }, tabId, url, source);
 }
 
 function getSourceUrl(source, domain) {
-    switch (source) {
-        case 'ahrefs':
-            return `https://ahrefs.com/backlink-checker/?input=${domain}&mode=subdomains`;
-        case 'semrush':
-            return `https://sem.3ue.co/analytics/backlinks/backlinks/?q=${domain}&searchType=domain`;
-        case 'similarweb':
-            return `https://sim.3ue.co/#/digitalsuite/acquisition/backlinks/table/999/?duration=28d&key=${domain}&sort=DomainScore`;
-        default:
-            return null;
-    }
+    return CollectorRuntime.getSourceUrl(source, domain);
 }
 
 function handleBacklinkData(source, urls, items = []) {
@@ -561,73 +1258,27 @@ function handleBacklinkData(source, urls, items = []) {
     broadcastStats();
 }
 
-async function waitForData(source, timeout) {
-    const start = Date.now();
-    while (!collectState[`${source}_done`] && Date.now() - start < timeout) {
-        await delay(1000);
-    }
-}
-
 // ============================================================
 // 持续发现：Domain Frontier + Domain Profile
 // ============================================================
 
 async function ensureDomainIntelLoaded() {
     if (domainIntelLoaded) return;
-    const data = await chrome.storage.local.get(['domainFrontier', 'domainProfiles']);
-    domainIntelCache = {
-        frontier: data.domainFrontier || [],
-        profiles: data.domainProfiles || {}
-    };
+    domainIntelCache = await StateStore.loadDomainIntel();
     domainIntelLoaded = true;
 }
 
 async function flushDomainIntel() {
     if (!domainIntelLoaded) return;
-    await chrome.storage.local.set({
-        domainFrontier: domainIntelCache.frontier,
-        domainProfiles: domainIntelCache.profiles
-    });
+    await StateStore.saveDomainIntel(domainIntelCache.frontier, domainIntelCache.profiles);
 }
 
 function createDomainFrontierEntry(domain) {
-    const now = new Date().toISOString();
-    return {
-        domain,
-        status: 'discovered',
-        crawlStatus: 'pending',
-        firstSeenAt: now,
-        lastSeenAt: now,
-        sources: [],
-        sourceTypes: [],
-        discoveryMethods: [],
-        seedTargets: [],
-        discoveredFromUrls: [],
-        sampleUrls: [],
-        seenCount: 0,
-        commentMentions: 0,
-        domainSeedCount: 0,
-        pageSeedCount: 0,
-        drilldownPages: 0,
-        commentOpportunityCount: 0,
-        verifiedAnchorCount: 0,
-        crawlAttempts: 0,
-        crawlDepth: 0,
-        lastCollectedAt: '',
-        lastExpandedAt: '',
-        profileUpdatedAt: '',
-        qualityScore: 0
-    };
+    return FrontierScheduler.createEntry(domain);
 }
 
 function mergeDomainStatus(current = 'discovered', next = 'discovered') {
-    const order = {
-        discovered: 1,
-        queued: 2,
-        profiled: 3,
-        expanded: 4
-    };
-    return (order[next] || 0) > (order[current] || 0) ? next : current;
+    return FrontierScheduler.mergeStatus(current, next);
 }
 
 function ensureDomainFrontierEntry(domain) {
@@ -640,13 +1291,7 @@ function ensureDomainFrontierEntry(domain) {
 }
 
 function shouldQueueDomainForRecursiveCollection(context = {}) {
-    const method = String(context.discoveryMethod || '');
-    return [
-        'collector-merge',
-        'recursive-collector-merge',
-        'commenter-domain',
-        'recursive-discovery'
-    ].includes(method);
+    return FrontierScheduler.shouldQueueForRecursiveCollection(context);
 }
 
 function getContextRecursiveDepth(context = {}) {
@@ -655,20 +1300,13 @@ function getContextRecursiveDepth(context = {}) {
 }
 
 function markEntryCrawlPending(entry, context = {}) {
-    if (!entry) return;
-
-    const seedDomain = getContinuousSeedDomain() || getDomainBg(collectState.domain || '');
-    const myDomain = getContinuousMyDomain() || getDomainBg(collectState.myDomain || '');
-    if (entry.domain === seedDomain || entry.domain === myDomain) {
-        entry.crawlStatus = 'completed';
-        return;
-    }
-
-    if (entry.crawlStatus === 'processing') return;
-    if (!entry.lastCollectedAt || entry.crawlStatus !== 'completed') {
-        entry.crawlStatus = 'pending';
-    }
-    entry.crawlDepth = Math.max(entry.crawlDepth || 0, getContextRecursiveDepth(context));
+    FrontierScheduler.markEntryCrawlPending(entry, {
+        ...context,
+        recursiveDepth: getContextRecursiveDepth(context)
+    }, {
+        seedDomain: getContinuousSeedDomain() || getDomainBg(collectState.domain || ''),
+        myDomain: getContinuousMyDomain() || getDomainBg(collectState.myDomain || '')
+    });
 }
 
 async function markDomainCrawlState(domain, patch = {}) {
@@ -681,22 +1319,10 @@ async function markDomainCrawlState(domain, patch = {}) {
 }
 
 function getNextPendingFrontierDomain() {
-    const seedDomain = getContinuousSeedDomain() || getDomainBg(collectState.domain || '');
-    const myDomain = getContinuousMyDomain() || getDomainBg(collectState.myDomain || '');
-
-    return [...domainIntelCache.frontier]
-        .filter((entry) => {
-            if (!entry?.domain) return false;
-            if (entry.domain === seedDomain || entry.domain === myDomain) return false;
-            return (entry.crawlStatus || 'pending') === 'pending';
-        })
-        .sort((a, b) => {
-            const depthDiff = (a.crawlDepth || 0) - (b.crawlDepth || 0);
-            if (depthDiff !== 0) return depthDiff;
-            const scoreDiff = (b.qualityScore || 0) - (a.qualityScore || 0);
-            if (scoreDiff !== 0) return scoreDiff;
-            return String(a.lastSeenAt || '').localeCompare(String(b.lastSeenAt || ''));
-        })[0] || null;
+    return FrontierScheduler.getNextPendingEntry(domainIntelCache.frontier, {
+        seedDomain: getContinuousSeedDomain() || getDomainBg(collectState.domain || ''),
+        myDomain: getContinuousMyDomain() || getDomainBg(collectState.myDomain || '')
+    });
 }
 
 function pushUniqueValue(target, value, limit = 6) {
@@ -756,8 +1382,12 @@ function inferCountryFromDomain(domain = '', language = '') {
     return '';
 }
 
-function detectCmsFromHtml(html = '') {
+function detectCmsFromHtml(html = '', url = '') {
     const lower = html.toLowerCase();
+    const urlLower = String(url || '').toLowerCase();
+    if (lower.includes('powered by ownd') || lower.includes('ameba ownd') || /(?:^|\/\/|\.)(shopinfo\.jp|themedia\.jp)\b/.test(urlLower)) {
+        return 'ameba-ownd';
+    }
     if (lower.includes('wp-content') || lower.includes('wp-includes') || lower.includes('wordpress')) return 'wordpress';
     if (lower.includes('woocommerce')) return 'woocommerce';
     if (lower.includes('shopify') || lower.includes('cdn.shopify.com')) return 'shopify';
@@ -830,14 +1460,114 @@ function detectTopicFromText(text = '') {
     return bestTopic;
 }
 
+function normalizeSourceTier(value = '') {
+    const normalized = compactText(value).toLowerCase();
+    return Object.values(SOURCE_TIERS).includes(normalized) ? normalized : '';
+}
+
+function getSourceTierScore(value = '') {
+    return SOURCE_TIER_SCORES[normalizeSourceTier(value)] || 0;
+}
+
+function preferHigherSourceTier(current = '', next = '') {
+    return getSourceTierScore(next) > getSourceTierScore(current) ? normalizeSourceTier(next) : normalizeSourceTier(current);
+}
+
+function mergeSourceTierArrays(values = [], nextValues = [], limit = 5) {
+    const merged = [];
+    for (const value of [...(values || []), ...(nextValues || [])]) {
+        const normalized = normalizeSourceTier(value);
+        if (!normalized || merged.includes(normalized)) continue;
+        merged.push(normalized);
+    }
+    return merged
+        .sort((left, right) => getSourceTierScore(right) - getSourceTierScore(left))
+        .slice(0, limit);
+}
+
+function buildDiscoveryEdge(tier = '', method = '', detail = '') {
+    return compactText([
+        normalizeSourceTier(tier),
+        compactText(method),
+        compactText(detail)
+    ].filter(Boolean).join('|')).slice(0, 180);
+}
+
+function mergeDiscoveryEdges(values = [], nextValues = [], limit = 8) {
+    const merged = [];
+    for (const value of [...(values || []), ...(nextValues || [])]) {
+        const normalized = compactText(value).slice(0, 180);
+        if (!normalized || merged.includes(normalized)) continue;
+        merged.push(normalized);
+    }
+    return merged.slice(0, limit);
+}
+
+function getResourcePublishedSuccessCount(resource = {}) {
+    return Object.values(resource.publishHistory || {}).reduce((total, entry) => {
+        return total + Number(entry?.attempts?.published || 0);
+    }, 0) + (resource.status === 'published' ? 1 : 0);
+}
+
+function getResourceAnchorVerifiedCount(resource = {}) {
+    let count = 0;
+    if (resource.publishMeta?.anchorVisible) count += 1;
+    for (const entry of Object.values(resource.publishHistory || {})) {
+        if (entry?.publishMeta?.anchorVisible) count += 1;
+    }
+    return count;
+}
+
+function getEffectiveResourceSourceTier(resource = {}) {
+    if (
+        getResourcePublishedSuccessCount(resource) > 0
+        || getResourceAnchorVerifiedCount(resource) > 0
+        || resource.publishMeta?.commentFieldVerified
+    ) {
+        return SOURCE_TIERS.HISTORICAL_SUCCESS;
+    }
+
+    const candidates = [
+        resource.sourceTier,
+        resource.discoverySourceTier,
+        ...(resource.sourceTiers || [])
+    ];
+    return mergeSourceTierArrays([], candidates, 1)[0] || '';
+}
+
+function summarizeSourceEvidenceFromEdges(edges = []) {
+    const evidence = {
+        historicalSuccess: 0,
+        commentObserved: 0,
+        competitorBacklink: 0,
+        ruleGuess: 0,
+        aiGuess: 0
+    };
+
+    for (const edge of edges || []) {
+        const tier = normalizeSourceTier(String(edge || '').split('|')[0] || '');
+        if (tier === SOURCE_TIERS.HISTORICAL_SUCCESS) evidence.historicalSuccess++;
+        if (tier === SOURCE_TIERS.COMMENT_OBSERVED) evidence.commentObserved++;
+        if (tier === SOURCE_TIERS.COMPETITOR_BACKLINK) evidence.competitorBacklink++;
+        if (tier === SOURCE_TIERS.RULE_GUESS) evidence.ruleGuess++;
+        if (tier === SOURCE_TIERS.AI_GUESS) evidence.aiGuess++;
+    }
+
+    return evidence;
+}
+
 function calculateDomainQualityScore(entry = {}, profile = {}) {
     let score = 10;
     const sources = new Set(entry.sources || []);
 
     score += Math.min((sources.size || 0) * 8, 24);
+    score += Math.round(getSourceTierScore(entry.sourceTier || '') * 0.35);
     score += Math.min((entry.commentMentions || 0) * 4, 16);
     score += Math.min((entry.drilldownPages || 0) * 3, 15);
     score += Math.min((entry.commentOpportunityCount || 0) * 6, 18);
+    score += Math.min((entry.publishSuccessCount || 0) * 10, 24);
+    score += Math.min((entry.verifiedAnchorCount || 0) * 12, 24);
+    score -= Math.min((entry.blockedPublishCount || 0) * 6, 18);
 
     if (profile.siteType === 'blog') score += 22;
     if (profile.siteType === 'forum') score += 16;
@@ -845,6 +1575,7 @@ function calculateDomainQualityScore(entry = {}, profile = {}) {
     if (profile.siteType === 'directory') score += 8;
     if (profile.siteType === 'store') score -= 8;
     if (profile.cms === 'wordpress') score += 6;
+    if (profile.cms === 'ameba-ownd') score -= 16;
     if (profile.commentCapable) score += 12;
     if (profile.topic === 'gambling' || profile.topic === 'adult') score -= 18;
     if (sources.has('A')) score += 6;
@@ -858,7 +1589,7 @@ function buildDomainProfileFromHtml(url, html, hints = {}) {
     const title = html.match(/<title[^>]*>(.*?)<\/title>/i)?.[1]?.trim()?.slice(0, 140) || '';
     const description = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i)?.[1]?.trim()?.slice(0, 220) || '';
     const language = inferLanguageFromHtml(html);
-    const cms = detectCmsFromHtml(html);
+    const cms = detectCmsFromHtml(html, url);
     const siteType = detectSiteTypeFromHtml(html, url, hints.sampleUrls || []);
     const pageText = html
         .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -899,7 +1630,17 @@ async function recordDomainIntel(items = [], context = {}) {
         entry.status = mergeDomainStatus(entry.status, context.status || 'discovered');
         entry.sources = mergeStringArrays(entry.sources, item.sources || context.sources || [], 8);
         entry.sourceTypes = mergeStringArrays(entry.sourceTypes, item.sourceTypes || (item.sourceType ? [item.sourceType] : []) || [], 4);
+        entry.sourceTiers = mergeSourceTierArrays(entry.sourceTiers || [], [
+            item.sourceTier || '',
+            ...(item.sourceTiers || []),
+            context.sourceTier || ''
+        ]);
+        entry.sourceTier = preferHigherSourceTier(
+            entry.sourceTier || '',
+            item.sourceTier || context.sourceTier || ''
+        );
         entry.discoveryMethods = mergeStringArrays(entry.discoveryMethods, [context.discoveryMethod || 'collector'], 6);
+        entry.discoveryEdges = mergeDiscoveryEdges(entry.discoveryEdges || [], item.discoveryEdges || []);
         entry.seedTargets = mergeStringArrays(entry.seedTargets, [context.seedTarget || collectState.domain || ''], 6);
         entry.discoveredFromUrls = mergeStringArrays(entry.discoveredFromUrls, [context.discoveredFromUrl || ''], 6);
         entry.sampleUrls = mergeStringArrays(entry.sampleUrls, [item.url || ''], 6);
@@ -915,6 +1656,36 @@ async function recordDomainIntel(items = [], context = {}) {
         if (shouldQueueDomainForRecursiveCollection(context)) {
             markEntryCrawlPending(entry, context);
         }
+    }
+
+    recalculateDomainIntelScores();
+    await flushDomainIntel();
+}
+
+async function recordDomainPublishEvidence(url, status, publishMeta = {}) {
+    const domain = getDomainBg(url);
+    if (!domain) return;
+
+    await ensureDomainIntelLoaded();
+    const entry = ensureDomainFrontierEntry(domain);
+    entry.sourceTiers = mergeSourceTierArrays(entry.sourceTiers || [], [
+        status === 'published' ? SOURCE_TIERS.HISTORICAL_SUCCESS : ''
+    ]);
+    entry.sourceTier = preferHigherSourceTier(entry.sourceTier || '', status === 'published' ? SOURCE_TIERS.HISTORICAL_SUCCESS : '');
+
+    if (status === 'published') {
+        entry.lastPublishedAt = publishMeta.updatedAt || new Date().toISOString();
+        entry.publishSuccessCount = Number(entry.publishSuccessCount || 0) + 1;
+        if (publishMeta.anchorVisible) {
+            entry.verifiedAnchorCount = Number(entry.verifiedAnchorCount || 0) + 1;
+        }
+        entry.discoveryEdges = mergeDiscoveryEdges(entry.discoveryEdges || [], [
+            buildDiscoveryEdge(SOURCE_TIERS.HISTORICAL_SUCCESS, 'publish-success', url)
+        ]);
+    }
+
+    if (publishMeta.submissionBlocked) {
+        entry.blockedPublishCount = Number(entry.blockedPublishCount || 0) + 1;
     }
 
     recalculateDomainIntelScores();
@@ -1025,7 +1796,6 @@ async function startContinuousDiscovery(domain, myDomain, sources = []) {
         return { success: false, message: '请至少选择一个数据源。' };
     }
 
-    const nextSeedUrl = `https://${normalizedDomain}/`;
     const seedChanged =
         getDomainBg(continuousDiscoveryState.seedDomain || '') !== normalizedDomain ||
         getDomainBg(continuousDiscoveryState.myDomain || '') !== normalizedMyDomain ||
@@ -1046,18 +1816,13 @@ async function startContinuousDiscovery(domain, myDomain, sources = []) {
         await flushDomainIntel();
     }
 
-    await updateContinuousDiscoveryState({
-        isRunning: true,
-        isPaused: false,
-        seedDomain: nextSeedUrl,
-        myDomain: normalizedMyDomain ? `https://${normalizedMyDomain}/` : '',
-        sources: normalizedSources,
-        seedInitialized: (seedChanged || pendingFrontierDomains === 0) ? false : !!continuousDiscoveryState.seedInitialized,
-        currentDomain: '',
-        lastMessage: (seedChanged || pendingFrontierDomains === 0)
-            ? '准备启动新的持续发现流程'
-            : '继续持续发现流程'
-    });
+    await updateContinuousDiscoveryState(TaskManager.buildStartContinuousDiscoveryPatch(continuousDiscoveryState, {
+        normalizedDomain,
+        normalizedMyDomain,
+        normalizedSources,
+        seedChanged,
+        pendingFrontierDomains
+    }));
 
     ensureContinuousDiscoveryLoop();
     return { success: true };
@@ -1065,19 +1830,16 @@ async function startContinuousDiscovery(domain, myDomain, sources = []) {
 
 async function pauseContinuousDiscovery() {
     await ensureContinuousDiscoveryLoaded();
-    await updateContinuousDiscoveryState({
-        isRunning: false,
-        isPaused: true,
-        currentDomain: '',
-        lastMessage: '已暂停持续发现'
-    });
+    await updateContinuousDiscoveryState(TaskManager.buildPauseContinuousDiscoveryPatch(continuousDiscoveryState));
     collectState.isCollecting = false;
-    await chrome.storage.local.set({
+    await StateStore.saveCollectSnapshot({
         collectState: {
             isCollecting: false,
             domain: getContinuousSeedDomain(),
-            myDomain: getContinuousMyDomain()
-        }
+            myDomain: getContinuousMyDomain(),
+            sources: collectState.sources || []
+        },
+        collectStats: collectState.stats
     });
     return { success: true };
 }
@@ -1107,163 +1869,292 @@ function prepareContinuousCollectContext() {
     collectState.sourceRequest = null;
 }
 
-async function processFrontierDomain(domain) {
-    prepareContinuousCollectContext();
-    const now = new Date().toISOString();
-
-    await markDomainCrawlState(domain, {
-        crawlStatus: 'processing',
-        status: mergeDomainStatus(
-            domainIntelCache.frontier.find((item) => item.domain === domain)?.status || 'discovered',
-            'queued'
-        ),
-        lastSeenAt: now,
-        crawlAttempts: (domainIntelCache.frontier.find((item) => item.domain === domain)?.crawlAttempts || 0) + 1
-    });
-
-    await updateContinuousDiscoveryState({
-        currentDomain: domain,
-        lastFrontierRunAt: now,
-        lastMessage: `正在递归分析 ${domain}`
-    });
-
-    const merged = await collectRecursiveDomainBacklinks(domain);
-    if (!collectState.isCollecting || continuousDiscoveryState.isPaused || !continuousDiscoveryState.isRunning) {
-        await markDomainCrawlState(domain, { crawlStatus: 'pending' });
-        return false;
-    }
-
-    if (merged.length === 0) {
-        await markDomainCrawlState(domain, {
-            crawlStatus: 'completed',
-            lastCollectedAt: new Date().toISOString(),
-            status: mergeDomainStatus(
-                domainIntelCache.frontier.find((item) => item.domain === domain)?.status || 'discovered',
-                'profiled'
-            )
-        });
-        await Logger.collect(`持续发现: ${domain} 未发现可继续分析的外链`);
-        return true;
-    }
-
-    const analysisTargets = await buildAnalysisTargets(merged);
-    collectState.stats.targetsFound += analysisTargets.length;
-    collectState.stats.inQueue += analysisTargets.length;
-    broadcastStats();
-    await Logger.collect(`持续发现: ${domain} 准备分析 ${analysisTargets.length} 个目标`);
-
-    await fetchAnalyzeAll(analysisTargets);
-
-    await markDomainCrawlState(domain, {
-        crawlStatus: 'completed',
-        lastCollectedAt: new Date().toISOString(),
-        status: mergeDomainStatus(
-            domainIntelCache.frontier.find((item) => item.domain === domain)?.status || 'discovered',
-            'expanded'
-        )
-    });
-    return true;
-}
-
 async function runContinuousDiscoveryLoop() {
+    const runtimeContext = {
+        ensureContinuousDiscoveryLoaded,
+        ensureDomainIntelLoaded,
+        ensureCollectTab,
+        startCollect,
+        buildAnalysisTargets,
+        fetchAnalyzeAll,
+        collectRecursiveDomainBacklinks,
+        markDomainCrawlState,
+        mergeDomainStatus,
+        getNextPendingFrontierDomain,
+        getContinuousDiscoveryStateView,
+        updateContinuousDiscoveryState,
+        getContinuousState: () => continuousDiscoveryState,
+        getContinuousSeedDomain,
+        getContinuousMyDomain,
+        getContinuousSources: () => continuousDiscoveryState.sources || [],
+        getDomainEntry: (domain) => domainIntelCache.frontier.find((item) => item.domain === domain) || null,
+        isContinuousRunning: () => continuousDiscoveryState.isRunning && !continuousDiscoveryState.isPaused,
+        prepareCollectContext: prepareContinuousCollectContext,
+        incrementQueuedTargets: (count) => {
+            collectState.stats.targetsFound += count;
+            collectState.stats.inQueue += count;
+        },
+        broadcastStats,
+        persistCollectRunning: async (isCollecting) => {
+            collectState.isCollecting = isCollecting;
+            await StateStore.saveCollectSnapshot({
+                collectState: {
+                    isCollecting,
+                    domain: getContinuousSeedDomain(),
+                    myDomain: getContinuousMyDomain(),
+                    sources: collectState.sources || []
+                },
+                collectStats: collectState.stats
+            });
+        },
+        closeCollectTab: async () => {
+            if (!collectTabId) return;
+            try { await chrome.tabs.remove(collectTabId); } catch {}
+            collectTabId = null;
+        },
+        broadcastCollectDone: () => broadcastToPopup({ action: 'collectDone' }),
+        logger: Logger,
+        taskManager: TaskManager
+    };
+
     await ensureContinuousDiscoveryLoaded();
     if (continuousDiscoveryState.isPaused || !continuousDiscoveryState.isRunning) return;
 
-    if (!continuousDiscoveryState.seedInitialized) {
-        await updateContinuousDiscoveryState({
-            currentDomain: getContinuousSeedDomain(),
-            lastMessage: `正在初始化种子网站 ${getContinuousSeedDomain()}`
-        });
-        await startCollect(
-            getContinuousSeedDomain(),
-            getContinuousMyDomain(),
-            continuousDiscoveryState.sources || []
-        );
-        await updateContinuousDiscoveryState({
-            seedInitialized: true,
-            currentDomain: '',
-            lastSeedRunAt: new Date().toISOString(),
-            lastMessage: '种子网站初始化完成，开始持续处理发现池'
-        });
-    }
-
-    prepareContinuousCollectContext();
-    await chrome.storage.local.set({
-        collectState: {
-            isCollecting: true,
-            domain: getContinuousSeedDomain(),
-            myDomain: getContinuousMyDomain()
+    const task = DiscoverWorkflow.buildTask(continuousDiscoveryState);
+    await TaskRunner.run(task, {
+        shouldStop: () => continuousDiscoveryState.isPaused || !continuousDiscoveryState.isRunning,
+        handlers: {
+            seed_collect: async () => await ContinuousDiscoveryEngine.runSeedInitialization(runtimeContext),
+            frontier_collect: async () => await ContinuousDiscoveryEngine.runFrontierCollection(runtimeContext)
+        },
+        onStepStart: async (step, index, total, currentTask) => {
+            await updateContinuousDiscoveryState(
+                TaskManager.buildContinuousStepPatch(continuousDiscoveryState, currentTask, step, index, total)
+            );
         }
     });
-    await ensureDomainIntelLoaded();
-    await ensureCollectTab();
+}
 
-    while (continuousDiscoveryState.isRunning && !continuousDiscoveryState.isPaused) {
-        const nextEntry = getNextPendingFrontierDomain();
-        if (!nextEntry) {
+function formatMarketingRefreshAt(refreshAt = '') {
+    const time = new Date(refreshAt).getTime();
+    if (!Number.isFinite(time) || time <= 0) return '';
+    return new Date(time).toLocaleString('zh-CN', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit'
+    });
+}
+
+async function startMarketingAutomation(options = {}) {
+    await ensureMarketingAutomationLoaded();
+    const forcePromotionRefresh = options.forcePromotionRefresh !== false;
+
+    if (marketingAutomationState.isRunning && !marketingAutomationState.isPaused) {
+        return { success: false, message: '持续宣传已在运行中。' };
+    }
+
+    const tasks = await TaskStore.getTasks();
+    const metrics = getMarketingAutomationMetrics(tasks);
+    const nextTask = selectNextMarketingTask(tasks, { forcePromotionRefresh });
+
+    if (!nextTask) {
+        if (metrics.scheduledPromotionTasks > 0) {
+            const nextRefreshLabel = formatMarketingRefreshAt(metrics.nextPromotionRefreshAt);
+            await updateMarketingAutomationState({
+                isRunning: false,
+                isPaused: true,
+                pauseReason: 'scheduled',
+                phase: 'scheduled',
+                phaseLabel: '等待下一次调研',
+                currentTaskId: '',
+                currentTaskName: '',
+                currentTaskType: '',
+                pendingTasks: 0,
+                dueNurtureTasks: 0,
+                scheduledPromotionTasks: metrics.scheduledPromotionTasks,
+                nextPromotionRefreshAt: metrics.nextPromotionRefreshAt || '',
+                lastCompletedAt: new Date().toISOString(),
+                lastMessage: nextRefreshLabel
+                    ? `当前渠道都已推进完，将在 ${nextRefreshLabel} 自动继续调研。`
+                    : '当前渠道都已推进完，等待下一次自动调研。'
+            });
+            return {
+                success: false,
+                message: nextRefreshLabel
+                    ? `当前没有待推进的营销任务，下一次会在 ${nextRefreshLabel} 自动继续。`
+                    : '当前没有待推进的营销任务，等待下一次自动调研。'
+            };
+        }
+
+        await updateMarketingAutomationState({
+            isRunning: false,
+            isPaused: true,
+            pauseReason: 'completed',
+            phase: 'completed',
+            phaseLabel: '无待执行任务',
+            currentTaskId: '',
+            currentTaskName: '',
+            currentTaskType: '',
+            pendingTasks: 0,
+            dueNurtureTasks: 0,
+            scheduledPromotionTasks: 0,
+            nextPromotionRefreshAt: '',
+            lastCompletedAt: new Date().toISOString(),
+            lastMessage: '当前没有待推进的营销任务'
+        });
+        return { success: false, message: '当前没有待推进的营销任务。' };
+    }
+
+    await updateMarketingAutomationState(
+        TaskManager.buildStartMarketingAutomationPatch(marketingAutomationState, {
+            ...metrics,
+            pendingTasks: metrics.pendingTasks || 1
+        })
+    );
+    marketingAutomationState = {
+        ...marketingAutomationState,
+        forcePromotionRefresh: forcePromotionRefresh && !isPromotionTaskPending(nextTask)
+    };
+    ensureMarketingAutomationLoop();
+    return { success: true };
+}
+
+async function pauseMarketingAutomation() {
+    await ensureMarketingAutomationLoaded();
+    await updateMarketingAutomationState(TaskManager.buildPauseMarketingAutomationPatch(marketingAutomationState));
+    return { success: true };
+}
+
+function ensureMarketingAutomationLoop() {
+    if (marketingAutomationLoopRunning) return;
+    marketingAutomationLoopRunning = true;
+    runMarketingAutomationLoop()
+        .catch(async (error) => {
+            await Logger.error(`持续宣传流程异常: ${error.message}`);
+            await updateMarketingAutomationState({
+                isRunning: false,
+                isPaused: true,
+                phase: 'failed',
+                phaseLabel: '异常中止',
+                currentTaskId: '',
+                currentTaskName: '',
+                currentTaskType: '',
+                lastCompletedAt: new Date().toISOString(),
+                lastMessage: `持续宣传异常中止: ${error.message}`
+            });
+        })
+        .finally(() => {
+            marketingAutomationLoopRunning = false;
+        });
+}
+
+async function runMarketingAutomationLoop() {
+    await ensureMarketingAutomationLoaded();
+    if (marketingAutomationState.isPaused || !marketingAutomationState.isRunning) return;
+
+    while (marketingAutomationState.isRunning && !marketingAutomationState.isPaused) {
+        const tasks = await TaskStore.getTasks();
+        const metrics = getMarketingAutomationMetrics(tasks);
+        const forcePromotionRefresh = !!marketingAutomationState.forcePromotionRefresh;
+        const nextTask = selectNextMarketingTask(tasks, { forcePromotionRefresh });
+
+        if (!nextTask) {
+            const nextRefreshLabel = formatMarketingRefreshAt(metrics.nextPromotionRefreshAt);
+            await updateMarketingAutomationState(metrics.scheduledPromotionTasks > 0 ? {
+                isRunning: false,
+                isPaused: true,
+                pauseReason: 'scheduled',
+                phase: 'scheduled',
+                phaseLabel: '等待下一次调研',
+                currentTaskId: '',
+                currentTaskName: '',
+                currentTaskType: '',
+                pendingTasks: metrics.pendingTasks,
+                dueNurtureTasks: metrics.dueNurtureTasks,
+                scheduledPromotionTasks: metrics.scheduledPromotionTasks,
+                nextPromotionRefreshAt: metrics.nextPromotionRefreshAt || '',
+                lastCompletedAt: new Date().toISOString(),
+                lastMessage: nextRefreshLabel
+                    ? `当前渠道都已推进完，将在 ${nextRefreshLabel} 自动继续调研。`
+                    : '当前渠道都已推进完，等待下一次自动调研。'
+            } : {
+                isRunning: false,
+                isPaused: true,
+                pauseReason: 'completed',
+                phase: 'completed',
+                phaseLabel: '已完成',
+                currentTaskId: '',
+                currentTaskName: '',
+                currentTaskType: '',
+                pendingTasks: metrics.pendingTasks,
+                dueNurtureTasks: metrics.dueNurtureTasks,
+                scheduledPromotionTasks: 0,
+                nextPromotionRefreshAt: '',
+                lastCompletedAt: new Date().toISOString(),
+                lastMessage: '当前没有待推进的营销任务'
+            });
             break;
         }
 
-        const processed = await processFrontierDomain(nextEntry.domain);
-        await ensureContinuousDiscoveryLoaded();
-        if (!processed) break;
-    }
-
-    const finalState = await getContinuousDiscoveryStateView();
-    if (!finalState.pendingDomains) {
-        await updateContinuousDiscoveryState({
-            isRunning: false,
-            currentDomain: '',
-            lastCompletedAt: new Date().toISOString(),
-            lastMessage: '持续发现已完成，发现池暂时没有新的待递归网站'
-        });
-        await chrome.storage.local.set({
-            collectState: {
-                isCollecting: false,
-                domain: getContinuousSeedDomain(),
-                myDomain: getContinuousMyDomain()
-            }
-        });
-        if (collectTabId) {
-            try { await chrome.tabs.remove(collectTabId); } catch {}
-            collectTabId = null;
+        if (forcePromotionRefresh) {
+            marketingAutomationState = {
+                ...marketingAutomationState,
+                forcePromotionRefresh: false
+            };
         }
-        broadcastToPopup({ action: 'collectDone' });
-        return;
-    }
 
-    if (continuousDiscoveryState.isPaused) {
-        await updateContinuousDiscoveryState({
-            currentDomain: '',
-            lastMessage: '持续发现已暂停'
+        const nextTaskType = getTaskType(nextTask);
+        const phaseLabel = nextTaskType === 'nurture' ? '执行养号会话' : '推进宣传渠道';
+        await updateMarketingAutomationState({
+            pauseReason: '',
+            currentTaskId: nextTask.id || '',
+            currentTaskName: nextTask.name || nextTask.website || nextTask.platformUrl || '',
+            currentTaskType: nextTaskType,
+            phase: nextTaskType === 'nurture' ? 'nurture' : 'promote',
+            phaseLabel,
+            pendingTasks: metrics.pendingTasks,
+            dueNurtureTasks: metrics.dueNurtureTasks,
+            scheduledPromotionTasks: metrics.scheduledPromotionTasks,
+            nextPromotionRefreshAt: metrics.nextPromotionRefreshAt || '',
+            lastMessage: `正在处理 ${nextTask.name || nextTask.website || nextTask.platformUrl || '营销任务'}`
         });
-        await chrome.storage.local.set({
-            collectState: {
-                isCollecting: false,
-                domain: getContinuousSeedDomain(),
-                myDomain: getContinuousMyDomain()
-            }
-        });
-        return;
-    }
 
-    await updateContinuousDiscoveryState({
-        isRunning: false,
-        currentDomain: '',
-        lastCompletedAt: new Date().toISOString(),
-        lastMessage: '持续发现已结束'
-    });
-    await chrome.storage.local.set({
-        collectState: {
-            isCollecting: false,
-            domain: getContinuousSeedDomain(),
-            myDomain: getContinuousMyDomain()
+        const result = await runMarketingTask(nextTask, { active: false, automation: true });
+        const nextMetrics = getMarketingAutomationMetrics(await TaskStore.getTasks());
+        await updateMarketingAutomationState({
+            processedTasks: Number(marketingAutomationState.processedTasks || 0) + 1,
+            pendingTasks: nextMetrics.pendingTasks,
+            dueNurtureTasks: nextMetrics.dueNurtureTasks,
+            scheduledPromotionTasks: nextMetrics.scheduledPromotionTasks,
+            nextPromotionRefreshAt: nextMetrics.nextPromotionRefreshAt || '',
+            currentTaskId: '',
+            currentTaskName: '',
+            currentTaskType: '',
+            phase: 'running',
+            phaseLabel: '等待下一轮',
+            lastMessage: result?.message || `${phaseLabel}已完成`
+        });
+
+        if (!marketingAutomationState.isRunning || marketingAutomationState.isPaused) {
+            break;
         }
-    });
+
+        await delay(1200);
+    }
 }
 
 async function resetAllLocalData() {
     await chrome.storage.local.clear();
+    await resourceStore.clearAll();
+    if (autoPublishDispatchTimer) {
+        clearTimeout(autoPublishDispatchTimer);
+        autoPublishDispatchTimer = null;
+    }
+    if (publishBatchAdvanceTimer) {
+        clearTimeout(publishBatchAdvanceTimer);
+        publishBatchAdvanceTimer = null;
+    }
     collectState = {
         isCollecting: false,
         domain: '',
@@ -1282,23 +2173,18 @@ async function resetAllLocalData() {
         recursiveDomainsProcessed: 0,
         sourceRequest: null
     };
-    publishState = {
-        isPublishing: false,
-        currentTask: null,
-        currentIndex: 0,
-        queue: [],
-        currentWorkflowId: null,
-        currentTabId: null,
-        currentUrl: '',
-        stopRequested: false,
-        awaitingManualContinue: false,
-        pendingSubmission: null
-    };
+    publishSessions = createDefaultPublishSessions();
+    publishSessionsLoaded = false;
+    publishBatchState = createDefaultPublishBatchState();
+    publishBatchLoaded = false;
     domainIntelCache = { frontier: [], profiles: {} };
     domainIntelLoaded = false;
     continuousDiscoveryState = createDefaultContinuousDiscoveryState();
     continuousDiscoveryLoaded = false;
     continuousDiscoveryLoopRunning = false;
+    marketingAutomationState = TaskManager.createDefaultMarketingAutomationState();
+    marketingAutomationLoaded = false;
+    marketingAutomationLoopRunning = false;
 }
 
 // ============================================================
@@ -1328,6 +2214,9 @@ function mergeBacklinks(backlinksBySource = collectState.backlinks, options = {}
                 const entry = urlMap.get(norm);
                 if (!entry.sources.includes(key)) entry.sources.push(key);
                 if (!entry.sourceTypes.includes(item.sourceType)) entry.sourceTypes.push(item.sourceType);
+                entry.sourceTiers = mergeSourceTierArrays(entry.sourceTiers, [item.sourceTier]);
+                entry.sourceTier = preferHigherSourceTier(entry.sourceTier, item.sourceTier);
+                entry.discoveryEdges = mergeDiscoveryEdges(entry.discoveryEdges, item.discoveryEdges || []);
                 entry.candidateType = resolveCandidateType(entry.sourceTypes);
             } else {
                 urlMap.set(norm, {
@@ -1335,6 +2224,9 @@ function mergeBacklinks(backlinksBySource = collectState.backlinks, options = {}
                     normalizedUrl: norm,
                     sources: [key],
                     sourceTypes: [item.sourceType],
+                    sourceTier: normalizeSourceTier(item.sourceTier) || SOURCE_TIERS.COMPETITOR_BACKLINK,
+                    sourceTiers: mergeSourceTierArrays([], [item.sourceTier || SOURCE_TIERS.COMPETITOR_BACKLINK]),
+                    discoveryEdges: mergeDiscoveryEdges([], item.discoveryEdges || []),
                     candidateType: resolveCandidateType([item.sourceType]),
                     domain: getDomainBg(url)
                 });
@@ -1528,11 +2420,17 @@ function scoreDomainCandidateUrl(url, anchorText = '') {
 
 function createDrilldownTarget(url, seed, drilled = true) {
     const sourceTypes = Array.from(new Set([...(seed.sourceTypes || []), 'backlink-page']));
+    const sourceTier = drilled ? SOURCE_TIERS.RULE_GUESS : (seed.sourceTier || SOURCE_TIERS.COMPETITOR_BACKLINK);
     return {
         url,
         normalizedUrl: normalizeUrlBg(url),
         sources: [...(seed.sources || [])],
         sourceTypes,
+        sourceTier,
+        sourceTiers: mergeSourceTierArrays(seed.sourceTiers || [], [sourceTier]),
+        discoveryEdges: mergeDiscoveryEdges(seed.discoveryEdges || [], [
+            buildDiscoveryEdge(sourceTier, drilled ? 'domain-drilldown' : 'domain-homepage', seed.domain || getDomainBg(seed.url))
+        ]),
         candidateType: resolveCandidateType(sourceTypes),
         domain: getDomainBg(url),
         analysisStage: drilled ? 'domain-drilldown' : 'domain-homepage',
@@ -1605,20 +2503,42 @@ async function fetchAnalyzePage(link) {
         if (ruleResult) {
             ruleResult.candidateType = link.candidateType || resolveCandidateType(link.sourceTypes || []);
             ruleResult.sourceTypes = [...(link.sourceTypes || [])];
+            ruleResult.discoverySourceTier = normalizeSourceTier(link.sourceTier || '');
+            ruleResult.sourceTier = normalizeSourceTier(link.sourceTier || '');
+            ruleResult.sourceTiers = mergeSourceTierArrays(link.sourceTiers || [], [ruleResult.sourceTier]);
+            ruleResult.discoveryEdges = mergeDiscoveryEdges(link.discoveryEdges || [], [
+                buildDiscoveryEdge(ruleResult.sourceTier || SOURCE_TIERS.RULE_GUESS, 'rule-match', link.analysisStage || link.candidateType || 'page')
+            ]);
         }
         await enrichDomainProfileFromPage(url, html, ruleResult);
 
         // AI 结果增强
         if (aiResult && aiResult.canLeaveLink && !ruleResult) {
+            const aiOpportunities = [];
+            if (aiResult.hasComments || aiResult.isBlog) {
+                aiOpportunities.push('comment');
+            }
+            if (aiResult.siteType && !aiOpportunities.includes(aiResult.siteType)) {
+                aiOpportunities.push(aiResult.siteType);
+            }
+            if (aiOpportunities.length === 0) {
+                aiOpportunities.push('comment');
+            }
             return {
                 url,
                 pageTitle: html.match(/<title[^>]*>(.*?)<\/title>/i)?.[1]?.trim()?.substring(0, 100) || '',
-                opportunities: [aiResult.siteType || 'comment'],
-                details: [aiResult.reason || ''],
+                opportunities: aiOpportunities,
+                details: ['ai-candidate', aiResult.reason || ''],
                 sources: link.sources || [],
                 sourceTypes: [...(link.sourceTypes || [])],
+                discoverySourceTier: normalizeSourceTier(link.sourceTier || SOURCE_TIERS.AI_GUESS) || SOURCE_TIERS.AI_GUESS,
+                sourceTier: preferHigherSourceTier(link.sourceTier || '', SOURCE_TIERS.AI_GUESS) || SOURCE_TIERS.AI_GUESS,
+                sourceTiers: mergeSourceTierArrays(link.sourceTiers || [], [SOURCE_TIERS.AI_GUESS, link.sourceTier || '']),
+                discoveryEdges: mergeDiscoveryEdges(link.discoveryEdges || [], [
+                    buildDiscoveryEdge(SOURCE_TIERS.AI_GUESS, 'ai-classify', link.analysisStage || link.candidateType || 'page')
+                ]),
                 candidateType: link.candidateType || resolveCandidateType(link.sourceTypes || []),
-                linkMethod: 'website-field',
+                linkMethod: 'text',
                 aiClassified: true
             };
         }
@@ -1640,25 +2560,134 @@ async function fetchAnalyzePage(link) {
 
 function analyzeHtml(html, url, link) {
     const htmlLower = html.toLowerCase();
+    const normalizedUrl = String(url || '').toLowerCase();
     const opportunities = [];
     const details = [];
+    const linkModes = [];
+    const hasTextarea = htmlLower.includes('<textarea');
+    const hasSubmitControl = htmlLower.includes('type="submit"') || htmlLower.includes('<button');
+    const hasUrlField =
+        htmlLower.includes('type="url"') ||
+        htmlLower.includes('name="url"') ||
+        htmlLower.includes('id="url"') ||
+        htmlLower.includes('name="website"') ||
+        htmlLower.includes('id="website"') ||
+        htmlLower.includes('homepage');
+    const hasCommentKeywords =
+        htmlLower.includes('comment') ||
+        htmlLower.includes('reply') ||
+        htmlLower.includes('leave a reply') ||
+        htmlLower.includes('leave a comment') ||
+        htmlLower.includes('post comment') ||
+        htmlLower.includes('发表评论') ||
+        htmlLower.includes('留言');
+    const hasIdentityFields =
+        htmlLower.includes('name="author"') ||
+        htmlLower.includes('id="author"') ||
+        htmlLower.includes('comment-form-author') ||
+        htmlLower.includes('name="email"') ||
+        htmlLower.includes('id="email"') ||
+        htmlLower.includes('comment-form-email') ||
+        htmlLower.includes('name="comment"') ||
+        htmlLower.includes('id="comment"') ||
+        htmlLower.includes('comment-form-comment');
+    const requiresLoginToPost =
+        htmlLower.includes('must be logged in to post a comment') ||
+        htmlLower.includes('you must be logged in to post a comment') ||
+        htmlLower.includes('log in to leave a comment') ||
+        htmlLower.includes('login to leave a comment') ||
+        htmlLower.includes('sign in to leave a comment') ||
+        htmlLower.includes('sign in to comment') ||
+        htmlLower.includes('log in to comment') ||
+        htmlLower.includes('please log in to comment') ||
+        htmlLower.includes('register to reply');
+    const commentsClosed =
+        htmlLower.includes('comments are closed') ||
+        htmlLower.includes('commenting is closed') ||
+        htmlLower.includes('discussion closed');
+    const hasCaptcha =
+        htmlLower.includes('g-recaptcha') ||
+        htmlLower.includes('grecaptcha') ||
+        htmlLower.includes('hcaptcha') ||
+        htmlLower.includes('turnstile') ||
+        htmlLower.includes('cloudflare-turnstile') ||
+        htmlLower.includes('captcha');
+    const supportsMarkdownLinks =
+        hasTextarea &&
+        (
+            /markdown|commonmark|marked|supports markdown|markdown editor|use markdown|支持markdown|使用markdown/i.test(html)
+            || /\[[^\]]+\]\((https?:\/\/|\/)/i.test(html)
+        );
+    const supportsBbcodeLinks =
+        hasTextarea &&
+        (
+            /bbcode|ubb|bulletin board code|支持bbcode/i.test(html)
+            || /\[url(?:=|\])/i.test(html)
+        );
+    const supportsPlainUrlLinks =
+        hasTextarea &&
+        /autolink|linkify|plain url|bare url|paste a url|paste url|urls? will be linked|自动识别链接|自动转链接/i.test(html);
+    const hasExplicitHtmlAnchorHint =
+        /(allowed html tags|html tags allowed|you may use these html tags|allowed tags|comment html|html标签|允许使用html|可用标签)/i.test(html);
+    const hasInlineSubmitForm = hasSubmitControl && (hasTextarea || hasIdentityFields || hasUrlField);
+    const isAmebaOwnd =
+        /powered by ownd|ameba ownd/i.test(html)
+        || /(?:^|\/\/|\.)(shopinfo\.jp|themedia\.jp)\b/.test(normalizedUrl);
 
     // 1. 博客评论表单
     if (htmlLower.includes('commentform') ||
         htmlLower.includes('comment-form') ||
+        htmlLower.includes('comment-respond') ||
         htmlLower.includes('id="respond"') ||
         htmlLower.includes('wp-comments-post') ||
         htmlLower.includes('leave a reply') ||
         htmlLower.includes('leave a comment') ||
         htmlLower.includes('发表评论') ||
-        htmlLower.includes('留下评论')) {
+        htmlLower.includes('留下评论') ||
+        (hasTextarea && hasSubmitControl && (hasCommentKeywords || hasIdentityFields))) {
         opportunities.push('comment');
-        if (htmlLower.includes('name="url"') || htmlLower.includes('id="url"') ||
-            htmlLower.includes('type="url"') || htmlLower.includes('name="website"')) {
+        if (hasUrlField) {
             details.push('website-field');
+            linkModes.push('website-field');
+        }
+        if (hasInlineSubmitForm) {
+            details.push('inline-submit-form');
+        }
+        if (isAmebaOwnd) {
+            details.push('ameba-ownd');
         }
         if (htmlLower.includes('wordpress') || htmlLower.includes('wp-content')) {
             details.push('wordpress');
+        }
+        if (hasExplicitHtmlAnchorHint) {
+            details.push('allowed-html-anchor');
+            linkModes.push('raw-html-anchor');
+        }
+        if (supportsMarkdownLinks) {
+            details.push('markdown-link');
+            linkModes.push('markdown-link');
+        }
+        if (supportsBbcodeLinks) {
+            details.push('bbcode-link');
+            linkModes.push('bbcode-link');
+        }
+        if (supportsPlainUrlLinks) {
+            details.push('plain-url');
+            linkModes.push('plain-url');
+        }
+        if (
+            !hasUrlField
+            && !hasIdentityFields
+            && !hasExplicitHtmlAnchorHint
+            && !supportsMarkdownLinks
+            && !supportsBbcodeLinks
+            && !supportsPlainUrlLinks
+            && !htmlLower.includes('tinymce')
+            && !htmlLower.includes('ckeditor')
+            && !htmlLower.includes('quill')
+            && !htmlLower.includes('contenteditable="true"')
+        ) {
+            details.push('comment-only');
         }
     }
 
@@ -1683,6 +2712,7 @@ function analyzeHtml(html, url, link) {
             htmlLower.includes('homepage') || htmlLower.includes('profile'))) {
         opportunities.push('register');
         details.push('profile-link');
+        linkModes.push('profile-link');
     }
 
     // 5. 提交网站
@@ -1711,6 +2741,10 @@ function analyzeHtml(html, url, link) {
         htmlLower.includes('quill') || htmlLower.includes('contenteditable="true"')) {
         opportunities.push('rich-editor');
         details.push('可插入链接');
+        linkModes.push('rich-editor-anchor');
+        if (hasInlineSubmitForm) {
+            details.push('inline-submit-form');
+        }
     }
 
     // 9. Wiki
@@ -1720,21 +2754,42 @@ function analyzeHtml(html, url, link) {
 
     // 10. 通用表单
     if (opportunities.length === 0) {
-        const hasTextarea = htmlLower.includes('<textarea');
-        const hasUrlInput = htmlLower.includes('type="url"') || htmlLower.includes('name="url"') ||
-            htmlLower.includes('name="website"') || htmlLower.includes('name="link"');
-        const hasSubmit = htmlLower.includes('type="submit"') || htmlLower.includes('button');
+        const hasUrlInput = hasUrlField || htmlLower.includes('name="link"');
+        const hasSubmit = hasSubmitControl;
 
         if (hasTextarea && hasUrlInput && hasSubmit) {
             opportunities.push('form');
             details.push('textarea+url+submit');
+            details.push('inline-submit-form');
+            details.push('website-field');
+            linkModes.push('website-field');
         }
     }
 
     if (opportunities.length === 0) return null;
 
+    if (requiresLoginToPost) {
+        details.push('login-required');
+    }
+    if (commentsClosed) {
+        details.push('comment-closed');
+    }
+    if (hasCaptcha) {
+        details.push('captcha');
+    }
+
     const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
     const pageTitle = titleMatch ? titleMatch[1].trim().substring(0, 100) : '';
+    const resourceShape = {
+        url,
+        pageTitle,
+        opportunities,
+        details,
+        linkModes: Array.from(new Set(linkModes))
+    };
+    const resourceClass = self.ResourceRules?.getResourceClass?.(resourceShape) || '';
+    const frictionLevel = self.ResourceRules?.getResourceFrictionLevel?.(resourceShape) || '';
+    const directPublishReady = !!self.ResourceRules?.isDirectPublishReady?.(resourceShape);
 
     return {
         url,
@@ -1742,8 +2797,15 @@ function analyzeHtml(html, url, link) {
         opportunities,
         details,
         sources: link.sources || [],
-        linkMethod: details.includes('website-field') ? 'website-field' :
-            details.includes('可插入链接') ? 'html' : 'text'
+        linkModes: resourceShape.linkModes,
+        linkMethod: linkModes.includes('raw-html-anchor') || linkModes.includes('rich-editor-anchor')
+            ? 'html'
+            : (linkModes.includes('website-field') ? 'website-field' : 'text'),
+        hasCaptcha,
+        hasUrlField,
+        resourceClass,
+        frictionLevel,
+        directPublishReady
     };
 }
 
@@ -1784,7 +2846,21 @@ async function extractCommenterDomains(html, context = {}) {
             !domain.includes('twitter.com') &&
             !collectState.discoveredDomains.has(domain)) {
             collectState.discoveredDomains.add(domain);
-            newlyDiscovered.push({ url: `https://${domain}/`, domain, sourceType: 'ref-domain', sources: ['D'] });
+            newlyDiscovered.push({
+                url: `https://${domain}/`,
+                domain,
+                sourceType: 'ref-domain',
+                sourceTier: SOURCE_TIERS.COMMENT_OBSERVED,
+                sourceTiers: [SOURCE_TIERS.COMMENT_OBSERVED],
+                discoveryEdges: [
+                    buildDiscoveryEdge(
+                        SOURCE_TIERS.COMMENT_OBSERVED,
+                        'commenter-domain',
+                        context.discoveredFromUrl || domain
+                    )
+                ],
+                sources: ['D']
+            });
             if (collectState.discoveryQueue.length < collectState.maxDiscoveryQueue) {
                 collectState.discoveryQueue.push(domain);
             }
@@ -1869,6 +2945,9 @@ async function recursiveDiscovery() {
         normalizedUrl: domain,
         sources: ['D'],
         sourceTypes: ['ref-domain'],
+        sourceTier: SOURCE_TIERS.COMMENT_OBSERVED,
+        sourceTiers: [SOURCE_TIERS.COMMENT_OBSERVED],
+        discoveryEdges: [buildDiscoveryEdge(SOURCE_TIERS.COMMENT_OBSERVED, 'recursive-discovery', domain)],
         candidateType: 'ref-domain',
         domain
     }));
@@ -1912,63 +2991,1660 @@ async function recursiveDiscovery() {
 // 资源保存
 // ============================================================
 
-async function saveResource(result) {
-    const data = await chrome.storage.local.get('resources');
-    const resources = data.resources || [];
-    const normalized = normalizeUrlBg(result.url);
-    const exists = resources.some(r => normalizeUrlBg(r.url) === normalized);
+async function getStoredResources() {
+    return await resourceStore.getResources();
+}
 
-    if (!exists) {
-        resources.push({
+async function writeResourcesToStorage(resources = []) {
+    return await resourceStore.writeResources(resources);
+}
+
+async function performStorageMaintenance() {
+    try {
+        await resourceStore.performMaintenance();
+    } catch {}
+
+    try {
+        await migratePublishTaskCommentStyles();
+    } catch {}
+
+    scheduleResourceSignalNormalization(900);
+
+    try {
+        await ensureDomainIntelLoaded();
+        await flushDomainIntel();
+    } catch {}
+}
+
+async function migratePublishTaskCommentStyles() {
+    await TaskStore.updateTasks((tasks) => {
+        let changed = false;
+        const nextTasks = tasks.map((task) => {
+            if (!task || typeof task !== 'object') return task;
+            const currentVersion = Number(task.commentStyleVersion || 0);
+            if (currentVersion >= PUBLISH_TASK_SCHEMA_VERSION) {
+                return task;
+            }
+
+            const nextTask = { ...task, commentStyleVersion: PUBLISH_TASK_SCHEMA_VERSION };
+            if (task.commentStyle === 'anchor-html') {
+                nextTask.commentStyle = 'anchor-prefer';
+            }
+            if (
+                nextTask.commentStyle !== task.commentStyle
+                || Number(nextTask.commentStyleVersion || 0) !== currentVersion
+            ) {
+                changed = true;
+                return nextTask;
+            }
+            return task;
+        });
+
+        return changed ? nextTasks : tasks;
+    });
+}
+
+function sanitizeResourceSignals(resource = {}) {
+    const nextResource = {
+        ...resource,
+        signalVersion: RESOURCE_SIGNAL_VERSION
+    };
+    const details = Array.from(new Set((nextResource.details || []).filter(Boolean)));
+    const historyEntries = Object.values(nextResource.publishHistory || {});
+    let normalizedUrl = '';
+    try {
+        normalizedUrl = normalizeUrlBg(nextResource.url || '');
+    } catch {}
+    let parsedHost = '';
+    let parsedPath = '';
+    try {
+        if (normalizedUrl) {
+            const parsed = new URL(normalizedUrl);
+            parsedHost = parsed.hostname.replace(/^www\./i, '').toLowerCase();
+            parsedPath = (parsed.pathname || '/').toLowerCase();
+        }
+    } catch {}
+    const looksLikeAmebaOwnd =
+        /(shopinfo\.jp|themedia\.jp)$/i.test(parsedHost)
+        || details.some((detail) => /(ameba-ownd|powered-by-ownd|powered by ownd)/i.test(String(detail || '')))
+        || String(nextResource.publishMeta?.cms || '').trim() === 'ameba-ownd';
+    const isCommentOnly =
+        details.some((detail) => /comment-only/i.test(String(detail || '')))
+        || String(nextResource.publishMeta?.terminalFailureReason || '').trim() === 'comment_only_form'
+        || !!nextResource.publishMeta?.commentOnlyDetected
+        || historyEntries.some((entry) => String(entry?.publishMeta?.terminalFailureReason || '').trim() === 'comment_only_form')
+        || (
+            looksLikeAmebaOwnd
+            && /\/posts\//.test(parsedPath)
+            && !historyEntries.some((entry) => entry?.lastStatus === 'published')
+            && nextResource.status !== 'published'
+            && !nextResource.publishMeta?.anchorVisible
+        );
+
+    if (!isCommentOnly) {
+        return nextResource;
+    }
+
+    nextResource.details = Array.from(new Set([...details, 'comment-only', ...(looksLikeAmebaOwnd ? ['ameba-ownd'] : [])]));
+    nextResource.linkModes = (nextResource.linkModes || []).filter((mode) => compactText(mode || '') === 'profile-link');
+    nextResource.hasUrlField = false;
+    nextResource.directPublishReady = false;
+    if ((nextResource.resourceClass || '') !== 'profile') {
+        nextResource.resourceClass = 'weak';
+    }
+    nextResource.frictionLevel = 'high';
+    if (!(nextResource.linkModes || []).length) {
+        nextResource.linkMethod = 'text';
+    }
+    return nextResource;
+}
+
+function needsResourceSignalNormalization(resource = {}) {
+    return Number(resource?.signalVersion || 0) !== RESOURCE_SIGNAL_VERSION;
+}
+
+function getResourceSignalSnapshot(resource = {}) {
+    return JSON.stringify({
+        signalVersion: Number(resource.signalVersion || 0),
+        details: Array.from(new Set((resource.details || []).filter(Boolean))),
+        linkModes: Array.from(new Set((resource.linkModes || []).filter(Boolean))),
+        hasUrlField: !!resource.hasUrlField,
+        directPublishReady: !!resource.directPublishReady,
+        resourceClass: String(resource.resourceClass || ''),
+        frictionLevel: String(resource.frictionLevel || ''),
+        linkMethod: String(resource.linkMethod || '')
+    });
+}
+
+async function normalizeStoredResourceSignals() {
+    if (resourceSignalNormalizationRunning) return false;
+    resourceSignalNormalizationRunning = true;
+    const resources = await getStoredResources();
+    let changed = false;
+    const nextResources = [...resources];
+
+    try {
+        for (let index = 0; index < resources.length; index++) {
+            const resource = resources[index];
+            if (!needsResourceSignalNormalization(resource)) {
+                continue;
+            }
+
+            const beforeSnapshot = getResourceSignalSnapshot(resource);
+            let nextResource = sanitizeResourceSignals(resource);
+            const recomputedClass = self.ResourceRules?.getResourceClass?.({
+                ...nextResource,
+                resourceClass: ''
+            }) || nextResource.resourceClass || '';
+            const recomputedFriction = self.ResourceRules?.getResourceFrictionLevel?.({
+                ...nextResource,
+                frictionLevel: ''
+            }) || nextResource.frictionLevel || '';
+            const recomputedDirectReady = !!self.ResourceRules?.isDirectPublishReady?.(nextResource);
+
+            nextResource = {
+                ...nextResource,
+                resourceClass: recomputedClass,
+                frictionLevel: recomputedFriction,
+                directPublishReady: recomputedDirectReady
+            };
+            nextResource = sanitizeResourceSignals(nextResource);
+            if (!nextResource.signalVersion) {
+                nextResource.signalVersion = RESOURCE_SIGNAL_VERSION;
+            }
+
+            const afterSnapshot = getResourceSignalSnapshot(nextResource);
+            if (beforeSnapshot !== afterSnapshot) {
+                nextResources[index] = nextResource;
+                changed = true;
+            } else if (nextResource.signalVersion !== resource.signalVersion) {
+                nextResources[index] = nextResource;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            await writeResourcesToStorage(nextResources);
+        }
+        return changed;
+    } finally {
+        resourceSignalNormalizationRunning = false;
+        resourceSignalNormalizationTimer = null;
+    }
+}
+
+function scheduleResourceSignalNormalization(delayMs = 900) {
+    if (resourceSignalNormalizationRunning) return;
+    if (resourceSignalNormalizationTimer) {
+        clearTimeout(resourceSignalNormalizationTimer);
+    }
+    resourceSignalNormalizationTimer = setTimeout(() => {
+        normalizeStoredResourceSignals().catch(() => {});
+    }, Math.max(200, Number(delayMs || 0)));
+}
+
+async function saveResource(result) {
+    const resources = await getStoredResources();
+    const normalized = normalizeUrlBg(result.url);
+    const existingIndex = resources.findIndex((resource) => normalizeUrlBg(resource.url) === normalized);
+    const incomingSourceTypes = result.sourceTypes || [];
+    const incomingOpportunities = Array.from(new Set(result.opportunities || []));
+    const incomingDetails = Array.from(new Set(result.details || []));
+    const incomingLinkModes = Array.from(new Set(result.linkModes || []));
+    const incomingSourceTiers = mergeSourceTierArrays(result.sourceTiers || [], [
+        result.discoverySourceTier || '',
+        result.sourceTier || ''
+    ]);
+    const incomingDiscoveryEdges = mergeDiscoveryEdges([], result.discoveryEdges || []);
+
+    if (existingIndex >= 0) {
+        const existing = resources[existingIndex] || {};
+        const mergedSourceTypes = Array.from(new Set([...(existing.sourceTypes || []), ...incomingSourceTypes]));
+        const mergedOpportunities = Array.from(new Set([...(existing.opportunities || []), ...incomingOpportunities]));
+        const mergedDetails = Array.from(new Set([...(existing.details || []), ...incomingDetails]));
+        const mergedLinkModes = Array.from(new Set([...(existing.linkModes || []), ...incomingLinkModes]));
+        const mergedDiscoverySourceTier = preferHigherSourceTier(existing.discoverySourceTier || '', result.discoverySourceTier || result.sourceTier || '');
+        const mergedSourceTiers = mergeSourceTierArrays(existing.sourceTiers || [], incomingSourceTiers);
+        const mergedDiscoveryEdges = mergeDiscoveryEdges(existing.discoveryEdges || [], incomingDiscoveryEdges);
+
+        let nextResource = {
+            ...existing,
+            pageTitle: result.pageTitle || existing.pageTitle || '',
+            type: mergedOpportunities.join('+'),
+            opportunities: mergedOpportunities,
+            details: mergedDetails,
+            linkModes: mergedLinkModes,
+            linkMethod: resourceStore.getPreferredLinkMethod(existing.linkMethod || '', result.linkMethod || ''),
+            sources: Array.from(new Set([...(existing.sources || []), ...(result.sources || [])])),
+            sourceTypes: mergedSourceTypes,
+            discoverySourceTier: mergedDiscoverySourceTier,
+            sourceTiers: mergedSourceTiers,
+            discoveryEdges: mergedDiscoveryEdges,
+            candidateType: resolveCandidateType(mergedSourceTypes),
+            aiClassified: !!existing.aiClassified || !!result.aiClassified,
+            hasCaptcha: typeof result.hasCaptcha === 'boolean' ? result.hasCaptcha : !!existing.hasCaptcha,
+            hasUrlField: typeof result.hasUrlField === 'boolean' ? result.hasUrlField : !!existing.hasUrlField,
+            directPublishReady: typeof result.directPublishReady === 'boolean'
+                ? result.directPublishReady
+                : !!existing.directPublishReady
+        };
+        nextResource = sanitizeResourceSignals(nextResource);
+        nextResource.resourceClass = self.ResourceRules?.getResourceClass?.({
+            ...nextResource,
+            resourceClass: ''
+        }) || result.resourceClass || existing.resourceClass || '';
+        nextResource.frictionLevel = self.ResourceRules?.getResourceFrictionLevel?.({
+            ...nextResource,
+            frictionLevel: ''
+        }) || result.frictionLevel || existing.frictionLevel || '';
+        nextResource.directPublishReady = !!self.ResourceRules?.isDirectPublishReady?.(nextResource);
+        nextResource = sanitizeResourceSignals(nextResource);
+        nextResource.sourceTier = getEffectiveResourceSourceTier(nextResource) || mergedDiscoverySourceTier;
+        nextResource.sourceTierScore = getSourceTierScore(nextResource.sourceTier);
+        nextResource.sourceEvidence = summarizeSourceEvidenceFromEdges(nextResource.discoveryEdges || []);
+        resources[existingIndex] = nextResource;
+    } else {
+        let nextResource = {
             id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
             url: result.url,
             pageTitle: result.pageTitle,
-            type: result.opportunities.join('+'),
-            opportunities: result.opportunities,
-            details: result.details,
+            type: incomingOpportunities.join('+'),
+            opportunities: incomingOpportunities,
+            details: incomingDetails,
+            linkModes: incomingLinkModes,
             linkMethod: result.linkMethod,
             sources: result.sources,
-            sourceTypes: result.sourceTypes || [],
-            candidateType: result.candidateType || resolveCandidateType(result.sourceTypes || []),
+            sourceTypes: incomingSourceTypes,
+            discoverySourceTier: result.discoverySourceTier || result.sourceTier || '',
+            sourceTiers: incomingSourceTiers,
+            discoveryEdges: incomingDiscoveryEdges,
+            candidateType: result.candidateType || resolveCandidateType(incomingSourceTypes),
             discoveredAt: new Date().toISOString(),
-            status: 'pending'
-        });
-        await chrome.storage.local.set({ resources });
-
-        collectState.stats.blogResources = resources.filter(r => r.status === 'pending').length;
-        broadcastStats();
+            status: 'pending',
+            aiClassified: !!result.aiClassified,
+            hasCaptcha: !!result.hasCaptcha,
+            hasUrlField: !!result.hasUrlField,
+            resourceClass: result.resourceClass || '',
+            frictionLevel: result.frictionLevel || '',
+            directPublishReady: !!result.directPublishReady
+        };
+        nextResource = sanitizeResourceSignals(nextResource);
+        nextResource.resourceClass = self.ResourceRules?.getResourceClass?.({
+            ...nextResource,
+            resourceClass: ''
+        }) || nextResource.resourceClass || '';
+        nextResource.frictionLevel = self.ResourceRules?.getResourceFrictionLevel?.({
+            ...nextResource,
+            frictionLevel: ''
+        }) || nextResource.frictionLevel || '';
+        nextResource.directPublishReady = !!self.ResourceRules?.isDirectPublishReady?.(nextResource);
+        nextResource = sanitizeResourceSignals(nextResource);
+        nextResource.sourceTier = getEffectiveResourceSourceTier(nextResource) || nextResource.discoverySourceTier;
+        nextResource.sourceTierScore = getSourceTierScore(nextResource.sourceTier);
+        nextResource.sourceEvidence = summarizeSourceEvidenceFromEdges(nextResource.discoveryEdges || []);
+        resources.push(nextResource);
     }
+
+    const storedResources = await writeResourcesToStorage(resources);
+    collectState.stats.blogResources = storedResources.filter(r => r.status === 'pending').length;
+    scheduleAutoPublishDispatch('resource-discovered');
+    broadcastStats();
 }
 
 // ============================================================
 // 多网站发布任务
 // ============================================================
 
-async function savePublishTask(task) {
-    const data = await chrome.storage.local.get('publishTasks');
-    const tasks = data.publishTasks || [];
-    task.workflowId = task.workflowId || WorkflowRegistry.DEFAULT_WORKFLOW_ID;
-    task.commentStyle = task.commentStyle || 'standard';
-    task.maxPublishes = Number(task.maxPublishes) > 0 ? Number(task.maxPublishes) : 0;
+function getTaskType(task = {}) {
+    return task.taskType || WorkflowRegistry.get(task?.workflowId || WorkflowRegistry.DEFAULT_WORKFLOW_ID)?.taskType || 'publish';
+}
 
-    if (task.id) {
-        const idx = tasks.findIndex(t => t.id === task.id);
-        if (idx !== -1) tasks[idx] = { ...tasks[idx], ...task };
-    } else {
-        task.id = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
-        task.createdAt = new Date().toISOString();
-        task.stats = { total: 0, success: 0, pending: 0, failed: 0 };
-        tasks.push(task);
+function getNurtureAlarmName(taskId) {
+    return `nurture:${taskId}`;
+}
+
+function getAlarmPeriodMinutes(frequency = 'daily') {
+    switch (frequency) {
+        case 'every-2-days':
+            return 60 * 24 * 2;
+        case 'weekly':
+            return 60 * 24 * 7;
+        case 'daily':
+        default:
+            return 60 * 24;
+    }
+}
+
+function getAlarmPeriodMs(frequency = 'daily') {
+    return getAlarmPeriodMinutes(frequency) * 60 * 1000;
+}
+
+function computeNextNurtureRunAt(frequency = 'daily', fromMs = Date.now()) {
+    return new Date(fromMs + getAlarmPeriodMs(frequency)).toISOString();
+}
+
+function buildMarketingResearchQueries(task = {}, snapshot = {}) {
+    const website = normalizeHttpUrlBg(task.website || '');
+    const domain = getDomainBg(website);
+    const title = compactText(snapshot.title || '').replace(/\s*[|\-–—]\s*.*/, '');
+    const productSeed = title || domain || compactText(task.name || '');
+    const targetAudience = compactText(task.targetAudience || '');
+    const preferredChannels = compactText(task.preferredChannels || '');
+    const brief = compactText(task.campaignBrief || '');
+
+    const rawQueries = [
+        `${productSeed} ${preferredChannels || targetAudience || brief}`.trim(),
+        `${productSeed} site:reddit.com OR site:news.ycombinator.com OR site:dev.to OR site:producthunt.com OR site:indiehackers.com`.trim(),
+        `${productSeed} submit site OR app directory OR startup directory OR product showcase`.trim(),
+        `${productSeed} forum OR community OR launch OR review`.trim()
+    ];
+
+    return Array.from(new Set(rawQueries.map((value) => compactText(value)).filter(Boolean))).slice(0, 4);
+}
+
+async function readMarketingTargetSnapshot(url = '') {
+    const finalUrl = normalizeHttpUrlBg(url);
+    if (!finalUrl) return null;
+
+    const tab = await openOrReuseMarketingTab(finalUrl, { active: false, waitForLoad: true });
+    try {
+        await delay(1200);
+        const results = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => {
+                const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                const description = document.querySelector('meta[name="description"]')?.getAttribute('content')
+                    || document.querySelector('meta[property="og:description"]')?.getAttribute('content')
+                    || '';
+                const headings = Array.from(document.querySelectorAll('h1, h2'))
+                    .map((node) => compact(node.textContent))
+                    .filter(Boolean)
+                    .slice(0, 6);
+                const paragraphs = Array.from(document.querySelectorAll('main p, article p, p'))
+                    .map((node) => compact(node.textContent))
+                    .filter((text) => text.length > 40)
+                    .slice(0, 4);
+
+                return {
+                    title: compact(document.title),
+                    description: compact(description),
+                    headings,
+                    summary: paragraphs.join(' ').slice(0, 600),
+                    url: window.location.href
+                };
+            }
+        });
+        return results?.[0]?.result || null;
+    } catch {
+        return null;
+    }
+}
+
+function getMarketingPageReadScore(item = {}, ownDomain = '') {
+    const url = normalizeHttpUrlBg(item.url || '');
+    const host = getDomainBg(url);
+    const text = compactText([item.title, item.snippet].filter(Boolean).join(' ')).toLowerCase();
+    let score = 0;
+
+    if (!url || !host || (ownDomain && host === ownDomain)) return -999;
+    if (/(google|bing|yahoo)\./.test(host)) return -999;
+
+    if (/(reddit|news\.ycombinator|dev\.to|producthunt|indiehackers|itch\.io|youtube|x\.com|twitter|instagram|facebook|linkedin)\./.test(host)) {
+        score += 120;
+    }
+    if (/(directory|directories|submit|showcase|launch|community|forum|startup|indie|product hunt|appsumo|betalist)/.test(text)) {
+        score += 40;
+    }
+    if (/(post|thread|discussion|launch|listing|directory|submit)/.test(text)) {
+        score += 25;
     }
 
-    await chrome.storage.local.set({ publishTasks: tasks });
-    await Logger.publish(`保存任务: ${task.name || task.website}`);
+    score += Math.max(0, 20 - (item.rank || 0));
+    return score;
+}
+
+function buildMarketingPageReadCandidates(queryResults = [], ownDomain = '') {
+    const scored = [];
+    for (const entry of queryResults) {
+        const results = Array.isArray(entry?.results) ? entry.results : [];
+        for (let index = 0; index < results.length; index++) {
+            const item = results[index] || {};
+            scored.push({
+                ...item,
+                query: entry.query || '',
+                rank: index + 1,
+                score: getMarketingPageReadScore({ ...item, rank: index + 1 }, ownDomain)
+            });
+        }
+    }
+
+    const seenHosts = new Set();
+    return scored
+        .filter((item) => item.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .filter((item) => {
+            const host = getDomainBg(item.url || '');
+            if (!host || seenHosts.has(host)) return false;
+            seenHosts.add(host);
+            return true;
+        })
+        .slice(0, 6);
+}
+
+async function readMarketingPageSnapshot(url = '') {
+    const finalUrl = normalizeHttpUrlBg(url);
+    if (!finalUrl) return null;
+
+    const tab = await openOrReuseMarketingTab(finalUrl, { active: false, waitForLoad: true });
+    try {
+        await delay(1400);
+        const results = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => {
+                const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                const description = document.querySelector('meta[name="description"]')?.getAttribute('content')
+                    || document.querySelector('meta[property="og:description"]')?.getAttribute('content')
+                    || '';
+                const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+                    .map((node) => compact(node.textContent))
+                    .filter(Boolean)
+                    .slice(0, 8);
+                const paragraphs = Array.from(document.querySelectorAll('main p, article p, p'))
+                    .map((node) => compact(node.textContent))
+                    .filter((text) => text.length > 40)
+                    .slice(0, 3);
+                return {
+                    title: compact(document.title),
+                    description: compact(description),
+                    headings,
+                    summary: paragraphs.join(' ').slice(0, 500),
+                    url: window.location.href
+                };
+            }
+        });
+        const snapshot = results?.[0]?.result || null;
+        if (!snapshot) return null;
+        return {
+            ...snapshot,
+            host: getDomainBg(snapshot.url || finalUrl)
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function collectBrowserSearchResults(query = '') {
+    const finalQuery = compactText(query);
+    if (!finalQuery) return [];
+
+    const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(finalQuery)}`;
+    const tab = await openOrReuseMarketingTab(searchUrl, { active: false, waitForLoad: true });
+    try {
+        await delay(1400);
+        const results = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => {
+                const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                return Array.from(document.querySelectorAll('li.b_algo, article[data-testid="result"], .result, .web-result'))
+                    .map((node) => {
+                        const anchor = node.querySelector('a[href]');
+                        if (!anchor) return null;
+                        const title = compact(anchor.textContent);
+                        const url = anchor.href || anchor.getAttribute('href') || '';
+                        const snippet = compact(
+                            node.querySelector('.b_caption p, p, .result__snippet, .snippet, .description')?.textContent || ''
+                        );
+                        return {
+                            title,
+                            url,
+                            snippet
+                        };
+                    })
+                    .filter((item) => item && item.url && /^https?:/i.test(item.url) && item.title)
+                    .slice(0, 8);
+            }
+        });
+        return results?.[0]?.result || [];
+    } catch {
+        return [];
+    }
+}
+
+function normalizePromotionReviewItem(item = {}) {
+    const url = normalizeHttpUrlBg(item.url || '');
+    if (!url) return null;
+    const openedAt = item.openedAt || new Date().toISOString();
+    return {
+        name: compactText(item.name || getKnownMarketingPlatformLabel(getDomainBg(url))),
+        url,
+        host: getDomainBg(url),
+        workflowId: compactText(item.workflowId || ''),
+        openedAt,
+        checkedAt: item.checkedAt || '',
+        openCount: Math.max(1, Number(item.openCount || 1))
+    };
+}
+
+function mergePromotionReviewItems(existingItems = [], item = {}) {
+    const normalized = normalizePromotionReviewItem(item);
+    if (!normalized) return Array.isArray(existingItems) ? existingItems : [];
+
+    const items = Array.isArray(existingItems) ? existingItems : [];
+    const existingIndex = items.findIndex((entry) => normalizeHttpUrlBg(entry?.url || '') === normalized.url);
+    if (existingIndex >= 0) {
+        const existing = items[existingIndex] || {};
+        const merged = {
+            ...existing,
+            ...normalized,
+            name: normalized.name || existing.name || '',
+            openCount: Math.max(1, Number(existing.openCount || 1)) + 1,
+            checkedAt: existing.checkedAt || normalized.checkedAt || ''
+        };
+        const next = items.slice();
+        next[existingIndex] = merged;
+        return next
+            .sort((a, b) => new Date(b.openedAt || 0).getTime() - new Date(a.openedAt || 0).getTime())
+            .slice(0, 20);
+    }
+
+    return [normalized, ...items]
+        .sort((a, b) => new Date(b.openedAt || 0).getTime() - new Date(a.openedAt || 0).getTime())
+        .slice(0, 20);
+}
+
+async function collectMarketingResearchContext(task = {}) {
+    const snapshot = await readMarketingTargetSnapshot(task.website || '');
+    const queries = buildMarketingResearchQueries(task, snapshot || {});
+    const queryResults = [];
+    const seenUrls = new Set();
+    const ownDomain = getDomainBg(task.website || '');
+
+    for (const query of queries) {
+        const results = await collectBrowserSearchResults(query);
+        const filtered = results.filter((item) => {
+            const normalized = normalizeHttpUrlBg(item.url || '');
+            if (!normalized || seenUrls.has(normalized)) return false;
+            seenUrls.add(normalized);
+            return true;
+        });
+        queryResults.push({ query, results: filtered });
+    }
+
+    const candidates = buildMarketingPageReadCandidates(queryResults, ownDomain);
+    const pageReads = [];
+    for (const candidate of candidates) {
+        const page = await readMarketingPageSnapshot(candidate.url || '');
+        if (!page) continue;
+        pageReads.push({
+            query: candidate.query || '',
+            rank: candidate.rank || 0,
+            title: page.title || candidate.title || '',
+            url: page.url || candidate.url || '',
+            description: page.description || '',
+            summary: page.summary || candidate.snippet || '',
+            headings: page.headings || [],
+            host: page.host || getDomainBg(candidate.url || '')
+        });
+    }
+
+    return {
+        generatedAt: new Date().toISOString(),
+        snapshot: snapshot || null,
+        queries: queryResults,
+        pageReads
+    };
+}
+
+function getKnownMarketingPlatformLabel(host = '') {
+    const normalized = String(host || '').toLowerCase();
+    const platformMap = [
+        ['reddit.com', 'Reddit'],
+        ['news.ycombinator.com', 'Hacker News'],
+        ['dev.to', 'Dev.to'],
+        ['producthunt.com', 'Product Hunt'],
+        ['indiehackers.com', 'Indie Hackers'],
+        ['itch.io', 'itch.io'],
+        ['youtube.com', 'YouTube'],
+        ['instagram.com', 'Instagram'],
+        ['x.com', 'X'],
+        ['twitter.com', 'Twitter'],
+        ['facebook.com', 'Facebook'],
+        ['linkedin.com', 'LinkedIn'],
+        ['threads.net', 'Threads'],
+        ['tiktok.com', 'TikTok'],
+        ['alternativeto.net', 'AlternativeTo'],
+        ['betalist.com', 'BetaList'],
+        ['startupstash.com', 'Startup Stash'],
+        ['saashub.com', 'SaaSHub'],
+        ['toolify.ai', 'Toolify'],
+        ['futurepedia.io', 'Futurepedia'],
+        ['thereisanaiforthat.com', 'ThereIsAnAIForThat'],
+        ['launchingnext.com', 'Launching Next'],
+        ['insanelycooltools.com', 'Insanely Cool Tools'],
+        ['chromewebstore.google.com', 'Chrome Web Store'],
+        ['addons.mozilla.org', 'Mozilla Add-ons']
+    ];
+
+    const matched = platformMap.find(([pattern]) => normalized === pattern || normalized.endsWith(`.${pattern}`));
+    if (matched) return matched[1];
+    return normalized.replace(/^www\./, '') || '平台';
+}
+
+function isLikelyMarketingPlatformCandidate(candidate = {}, workflowId = '') {
+    const host = String(candidate.host || getDomainBg(candidate.url || '') || '').toLowerCase();
+    const text = compactText([
+        candidate.title,
+        candidate.description,
+        candidate.summary,
+        candidate.snippet,
+        candidate.query,
+        candidate.reason
+    ].join(' ')).toLowerCase();
+
+    if (!host) return false;
+    if (/google\.com|bing\.com|yahoo\.com|duckduckgo\.com|baidu\.com|wikipedia\.org|fandom\.com/i.test(host)) {
+        return false;
+    }
+    if (/(login|sign in|pricing|docs|documentation|terms|privacy|download|apk|wiki|codes)/i.test(text)
+        && !/(forum|community|discussion|subreddit|directory|listing|submit|launch|show hn|product hunt)/i.test(text)) {
+        return false;
+    }
+
+    const knownPlatform = /(reddit\.com|news\.ycombinator\.com|dev\.to|producthunt\.com|indiehackers\.com|itch\.io|youtube\.com|instagram\.com|x\.com|twitter\.com|facebook\.com|linkedin\.com|threads\.net|tiktok\.com|alternativeto\.net|betalist\.com|startupstash\.com|saashub\.com|toolify\.ai|futurepedia\.io|thereisanaiforthat\.com|launchingnext\.com|insanelycooltools\.com|chromewebstore\.google\.com|addons\.mozilla\.org|g2\.com|capterra\.com|appsumo\.com|discord\.com|devforum\.roblox\.com)/i;
+    if (knownPlatform.test(host)) return true;
+
+    if (workflowId === 'community-post-promote') {
+        return /(forum|community|discussion|thread|subreddit|discourse|phpbb|xenforo|vbulletin|show hn|share your project)/i.test(`${host} ${text}`);
+    }
+    if (workflowId === 'directory-submit-promote') {
+        return /(submit|directory|listing|launch|showcase|catalog|startup directory|tool directory|product hunt|app directory)/i.test(text);
+    }
+    if (workflowId === 'account-nurture') {
+        return /(youtube|instagram|twitter|x\.com|facebook|linkedin|threads|tiktok|discord)/i.test(host);
+    }
+    return false;
+}
+
+function inferMarketingWorkflowId(candidate = {}) {
+    const host = String(candidate.host || getDomainBg(candidate.url || '') || '').toLowerCase();
+    const text = compactText([
+        candidate.title,
+        candidate.description,
+        candidate.summary,
+        candidate.snippet,
+        candidate.query
+    ].join(' ')).toLowerCase();
+
+    const socialHosts = /(youtube\.com|instagram\.com|x\.com|twitter\.com|facebook\.com|linkedin\.com|threads\.net|tiktok\.com|discord\.com)/i;
+    const communityHosts = /(reddit\.com|news\.ycombinator\.com|dev\.to|indiehackers\.com|hashnode\.com|medium\.com|substack\.com|forum|community|discourse|phpbb|xenforo|vbulletin)/i;
+    const directoryHosts = /(producthunt\.com|alternativeto\.net|betalist\.com|startupstash\.com|saashub\.com|toolify\.ai|futurepedia\.io|thereisanaiforthat\.com|launchingnext\.com|insanelycooltools\.com|chromewebstore\.google\.com|addons\.mozilla\.org|g2\.com|capterra\.com|appsumo\.com)/i;
+
+    if (socialHosts.test(host)) return 'account-nurture';
+    if (directoryHosts.test(host)) return 'directory-submit-promote';
+    if (communityHosts.test(host)) return 'community-post-promote';
+
+    if (/\b(submit|directory|listing|launch|showcase|startup directory|product hunt|chrome extension store|add-ons)\b/i.test(text)) {
+        return 'directory-submit-promote';
+    }
+    if (/\b(subreddit|community|forum|discussion|thread|show hn|post idea|devlog|share your project|launch thread)\b/i.test(text)) {
+        return 'community-post-promote';
+    }
+    if (/\b(profile|followers|subscribe|channel|feed|timeline|creator)\b/i.test(text)) {
+        return 'account-nurture';
+    }
+    return 'community-post-promote';
+}
+
+function scoreMarketingCandidate(candidate = {}) {
+    const host = String(candidate.host || getDomainBg(candidate.url || '') || '').toLowerCase();
+    const text = compactText([
+        candidate.title,
+        candidate.description,
+        candidate.summary,
+        candidate.snippet,
+        candidate.query
+    ].join(' ')).toLowerCase();
+
+    let score = Number(candidate.rank || 0) > 0 ? Math.max(0, 40 - (Number(candidate.rank) * 4)) : 8;
+    if (candidate.source === 'page-read') score += 24;
+    if (/reddit\.com|news\.ycombinator\.com|dev\.to|producthunt\.com|indiehackers\.com|itch\.io|alternativeto\.net|betalist\.com|startupstash\.com|saashub\.com/i.test(host)) score += 20;
+    if (/\b(submit|directory|listing|community|forum|discussion|launch|show hn|share your project|product hunt)\b/i.test(text)) score += 12;
+    if (/\b(login|sign in|pricing|docs|documentation|terms|privacy)\b/i.test(text)) score -= 8;
+    if (/google\.com|bing\.com|yahoo\.com|duckduckgo\.com/i.test(host)) score -= 20;
+    return Math.max(0, Math.min(100, score));
+}
+
+function buildMarketingChannelAngle(task = {}, workflowId = '', candidate = {}, researchContext = {}) {
+    const audience = compactText(task.targetAudience || '');
+    const brief = compactText(task.campaignBrief || '').slice(0, 120);
+    const productTitle = compactText(researchContext?.snapshot?.title || task.name || getDomainBg(task.website || '') || '产品');
+    const platform = getKnownMarketingPlatformLabel(candidate.host || getDomainBg(candidate.url || ''));
+
+    if (workflowId === 'directory-submit-promote') {
+        return compactText(`提交 ${productTitle} 到 ${platform}，突出 ${brief || '核心卖点、差异化与落地页价值'}。`);
+    }
+    if (workflowId === 'account-nurture') {
+        return compactText(`围绕 ${platform} 的目标用户 ${audience || '相关受众'} 做低频浏览、点赞和自然互动，逐步建立账号历史。`);
+    }
+    return compactText(`在 ${platform} 以 ${audience || '目标用户'} 为对象，分享 ${brief || `${productTitle} 的使用价值、案例和故事`}。`);
+}
+
+function buildMarketingChannelReason(candidate = {}, workflowId = '') {
+    const query = compactText(candidate.query || '');
+    const evidence = compactText(candidate.summary || candidate.description || candidate.snippet || '').slice(0, 180);
+    const host = candidate.host || getDomainBg(candidate.url || '');
+    const workflowLabelMap = {
+        'community-post-promote': '社区发帖',
+        'directory-submit-promote': '目录提交',
+        'account-nurture': '账号养护'
+    };
+    const label = workflowLabelMap[workflowId] || '宣传渠道';
+    const parts = [
+        `${label}候选`,
+        host ? `来源站点：${host}` : '',
+        query ? `命中搜索：${query}` : '',
+        evidence ? `页面摘要：${evidence}` : ''
+    ].filter(Boolean);
+    return parts.join('；');
+}
+
+function buildMarketingChannelName(candidate = {}, workflowId = '') {
+    const host = candidate.host || getDomainBg(candidate.url || '');
+    const platformLabel = getKnownMarketingPlatformLabel(host);
+    if (workflowId === 'account-nurture') return `${platformLabel} 账号养护`;
+    if (workflowId === 'directory-submit-promote') return `${platformLabel} 目录提交`;
+    return `${platformLabel} 社区发帖`;
+}
+
+function normalizeMarketingChannel(channel = {}, task = {}, researchContext = {}) {
+    const url = normalizeHttpUrlBg(channel.url || '');
+    if (!url) return null;
+    const host = getDomainBg(url);
+    const workflowId = ['community-post-promote', 'directory-submit-promote', 'account-nurture'].includes(channel.workflowId)
+        ? channel.workflowId
+        : inferMarketingWorkflowId({ ...channel, url, host });
+    const score = Number(channel.score || scoreMarketingCandidate({ ...channel, url, host }));
+
+    return {
+        name: compactText(channel.name || buildMarketingChannelName({ ...channel, host }, workflowId)),
+        url,
+        host,
+        workflowId,
+        angle: compactText(channel.angle || buildMarketingChannelAngle(task, workflowId, { ...channel, url, host }, researchContext)),
+        reason: compactText(channel.reason || buildMarketingChannelReason({ ...channel, url, host }, workflowId)),
+        source: compactText(channel.source || 'ai-plan'),
+        query: compactText(channel.query || ''),
+        title: compactText(channel.title || ''),
+        score
+    };
+}
+
+function buildMarketingFallbackChannels(task = {}, researchContext = {}) {
+    const pageReads = Array.isArray(researchContext?.pageReads) ? researchContext.pageReads : [];
+    const queryResults = Array.isArray(researchContext?.queries) ? researchContext.queries : [];
+    const candidates = [];
+
+    for (const page of pageReads) {
+        candidates.push({
+            ...page,
+            source: 'page-read',
+            rank: Number(page.rank || 0)
+        });
+    }
+
+    for (const entry of queryResults) {
+        const query = String(entry?.query || '').trim();
+        const results = Array.isArray(entry?.results) ? entry.results : [];
+        for (let index = 0; index < results.length; index++) {
+            const item = results[index] || {};
+            candidates.push({
+                ...item,
+                query,
+                source: 'search-result',
+                rank: index + 1,
+                host: getDomainBg(item.url || '')
+            });
+        }
+    }
+
+    const deduped = new Map();
+    for (const candidate of candidates) {
+        const normalizedUrl = normalizeHttpUrlBg(candidate.url || '');
+        if (!normalizedUrl) continue;
+        const host = getDomainBg(normalizedUrl);
+        if (!host || host === getDomainBg(task.website || '')) continue;
+
+        const workflowId = inferMarketingWorkflowId({ ...candidate, url: normalizedUrl, host });
+        if (!isLikelyMarketingPlatformCandidate({ ...candidate, url: normalizedUrl, host }, workflowId)) continue;
+        const normalized = normalizeMarketingChannel({
+            ...candidate,
+            url: normalizedUrl,
+            host,
+            workflowId,
+            score: scoreMarketingCandidate({ ...candidate, url: normalizedUrl, host })
+        }, task, researchContext);
+        if (!normalized) continue;
+
+        const key = `${normalized.workflowId}::${normalized.url}`;
+        const existing = deduped.get(key);
+        if (!existing || normalized.score > existing.score) {
+            deduped.set(key, normalized);
+        }
+    }
+
+    const priority = {
+        'community-post-promote': 0,
+        'directory-submit-promote': 1,
+        'account-nurture': 2
+    };
+
+    return Array.from(deduped.values())
+        .sort((a, b) => {
+            const priorityDelta = (priority[a.workflowId] || 9) - (priority[b.workflowId] || 9);
+            if (priorityDelta !== 0) return priorityDelta;
+            return (b.score || 0) - (a.score || 0);
+        })
+        .slice(0, 8);
+}
+
+function summarizeMarketingChannelMix(channels = []) {
+    return channels.reduce((summary, channel) => {
+        const workflowId = channel?.workflowId || '';
+        summary[workflowId] = Number(summary[workflowId] || 0) + 1;
+        return summary;
+    }, {});
+}
+
+function finalizeMarketingPlan(rawPlan = {}, task = {}, researchContext = {}) {
+    const fallbackChannels = buildMarketingFallbackChannels(task, researchContext);
+    const merged = new Map();
+    const priority = {
+        'community-post-promote': 0,
+        'directory-submit-promote': 1,
+        'account-nurture': 2
+    };
+
+    for (const channel of Array.isArray(rawPlan?.channels) ? rawPlan.channels : []) {
+        const normalized = normalizeMarketingChannel(channel, task, researchContext);
+        if (!normalized) continue;
+        merged.set(`${normalized.workflowId}::${normalized.url}`, normalized);
+    }
+
+    for (const channel of fallbackChannels) {
+        const key = `${channel.workflowId}::${channel.url}`;
+        const existing = merged.get(key);
+        if (existing) {
+            merged.set(key, {
+                ...channel,
+                ...existing,
+                angle: existing.angle || channel.angle,
+                reason: existing.reason || channel.reason,
+                score: Math.max(Number(existing.score || 0), Number(channel.score || 0)),
+                source: existing.source || channel.source
+            });
+        } else {
+            merged.set(key, channel);
+        }
+    }
+
+    const channels = Array.from(merged.values()).sort((a, b) => {
+        const priorityDelta = (priority[a.workflowId] || 9) - (priority[b.workflowId] || 9);
+        if (priorityDelta !== 0) return priorityDelta;
+        return Number(b.score || 0) - Number(a.score || 0);
+    });
+    const channelMix = summarizeMarketingChannelMix(channels);
+    const nextSteps = Array.isArray(rawPlan?.nextSteps) && rawPlan.nextSteps.length > 0
+        ? rawPlan.nextSteps
+        : [
+            channelMix['community-post-promote'] ? '优先推进高分社区渠道，准备对应发帖角度与落地页。' : '',
+            channelMix['directory-submit-promote'] ? '整理目录提交所需的标题、描述、分类和截图素材。' : '',
+            channelMix['account-nurture'] ? '把需要长期积累的平台加入养号节奏，降低直接发帖风险。' : ''
+        ].filter(Boolean);
+    const cautions = Array.isArray(rawPlan?.cautions) && rawPlan.cautions.length > 0
+        ? rawPlan.cautions
+        : [
+            '优先在允许推广的社区或目录提交，不要在规则不明的平台直接硬广。',
+            '对需要登录、养号或人工上传素材的平台，保留人工接管点。'
+        ];
+    const summary = compactText(rawPlan?.summary || '')
+        || `已基于浏览器调研整理 ${channels.length} 个可执行渠道，其中社区发帖 ${channelMix['community-post-promote'] || 0} 个、目录提交 ${channelMix['directory-submit-promote'] || 0} 个、账号养护 ${channelMix['account-nurture'] || 0} 个。`;
+
+    return {
+        ...rawPlan,
+        summary,
+        channels,
+        nextSteps,
+        cautions,
+        browserSuggestedCount: fallbackChannels.length,
+        channelMix
+    };
+}
+
+function filterPromotionPlanForUnopenedChannels(plan = {}, reviewItems = []) {
+    const openedUrls = new Set((Array.isArray(reviewItems) ? reviewItems : [])
+        .map((item) => normalizeHttpUrlBg(item?.url || ''))
+        .filter(Boolean));
+
+    const channels = (Array.isArray(plan.channels) ? plan.channels : [])
+        .filter((channel) => {
+            const url = normalizeHttpUrlBg(channel?.url || '');
+            return url && !openedUrls.has(url);
+        });
+
+    const channelMix = summarizeMarketingChannelMix(channels);
+    const totalOpenableChannels = channels.filter((channel) =>
+        channel?.workflowId !== 'account-nurture' && normalizeHttpUrlBg(channel?.url || '')
+    ).length;
+
+    return {
+        ...plan,
+        channels,
+        channelMix,
+        totalOpenableChannels,
+        nextChannelIndex: 0,
+        progressedChannelCount: 0,
+        lastOpenedChannelIndex: -1,
+        openedChannelName: '',
+        openedChannelUrl: '',
+        lastOpenedAt: '',
+        status: totalOpenableChannels > 0 ? 'planned' : 'awaiting_refresh'
+    };
+}
+
+async function syncTaskSchedule(task = {}) {
+    if (!task.id) return;
+    const nurtureAlarmName = getNurtureAlarmName(task.id);
+    const promotionAlarmName = getPromotionRefreshAlarmName(task.id);
+    const taskType = getTaskType(task);
+
+    if (taskType === 'nurture') {
+        try { await chrome.alarms.clear(promotionAlarmName); } catch {}
+        const periodInMinutes = getAlarmPeriodMinutes(task.frequency || 'daily');
+        const now = Date.now();
+        let nextRunAtMs = new Date(task.nextRunAt || '').getTime();
+        if (!Number.isFinite(nextRunAtMs) || nextRunAtMs <= now) {
+            nextRunAtMs = now + getAlarmPeriodMs(task.frequency || 'daily');
+        }
+        await chrome.alarms.create(nurtureAlarmName, {
+            when: nextRunAtMs,
+            periodInMinutes
+        });
+        return;
+    }
+
+    try { await chrome.alarms.clear(nurtureAlarmName); } catch {}
+
+    if (task.workflowId === 'product-promote-campaign') {
+        const nextResearchAtMs = getPromotionNextResearchAtMs(task);
+        if (nextResearchAtMs > Date.now()) {
+            await chrome.alarms.create(promotionAlarmName, {
+                when: nextResearchAtMs
+            });
+        } else {
+            try { await chrome.alarms.clear(promotionAlarmName); } catch {}
+        }
+        return;
+    }
+
+    try { await chrome.alarms.clear(promotionAlarmName); } catch {}
+}
+
+async function restoreTaskSchedules() {
+    const tasks = await TaskStore.getTasks();
+    await Promise.all(tasks.map((task) => syncTaskSchedule(task).catch(() => {})));
+}
+
+function getWorkflowTaskType(workflowId) {
+    return WorkflowRegistry.get(workflowId || WorkflowRegistry.DEFAULT_WORKFLOW_ID)?.taskType || 'publish';
+}
+
+function buildGeneratedMarketingTask(baseTask = {}, channel = {}, index = 0) {
+    const workflowId = ['community-post-promote', 'directory-submit-promote', 'account-nurture'].includes(channel.workflowId)
+        ? channel.workflowId
+        : 'community-post-promote';
+    const taskType = getWorkflowTaskType(workflowId);
+    const platformUrl = normalizeHttpUrlBg(channel.url || '');
+    const workflowLabel = WorkflowRegistry.getLabel(workflowId);
+    const angle = String(channel.angle || '').trim();
+    const reason = String(channel.reason || '').trim();
+    const campaignBrief = [
+        String(baseTask.campaignBrief || '').trim(),
+        reason ? `研究建议：${reason}` : '',
+        angle ? `建议角度：${angle}` : ''
+    ].filter(Boolean).join('\n');
+
+    return {
+        id: `research-${baseTask.id || 'seed'}-${index}-${Math.random().toString(36).slice(2, 7)}`,
+        name: `${baseTask.name || baseTask.website || '营销任务'} · ${channel.name || workflowLabel}`,
+        website: baseTask.website || '',
+        workflowId,
+        taskType,
+        platformUrl,
+        campaignBrief,
+        postAngle: taskType === 'promote' ? angle : '',
+        submitCategory: workflowId === 'directory-submit-promote' ? angle : '',
+        frequency: workflowId === 'account-nurture' ? 'daily' : '',
+        sessionGoal: workflowId === 'account-nurture' ? (angle || reason || '浏览并进行低频互动') : '',
+        nextRunAt: workflowId === 'account-nurture' ? computeNextNurtureRunAt('daily') : '',
+        generatedFromTaskId: baseTask.id || '',
+        generatedByResearch: true,
+        generatedAt: new Date().toISOString(),
+        stats: { total: 0, success: 0, skipped: 0, pending: 0, failed: 0 },
+        runCount: 0,
+        lastRunAt: ''
+    };
+}
+
+async function createNurtureTasksFromPromotionPlan(baseTask = {}, promotionPlan = {}) {
+    const channels = Array.isArray(promotionPlan.channels) ? promotionPlan.channels : [];
+    const nurtureChannels = channels.filter((channel) => channel?.workflowId === 'account-nurture');
+    const scheduledTasks = [];
+    const summary = await TaskStore.updateTasks((tasks) => {
+        let createdCount = 0;
+        let updatedCount = 0;
+
+        for (let index = 0; index < nurtureChannels.length; index++) {
+            const channel = nurtureChannels[index] || {};
+            const normalizedUrl = normalizeHttpUrlBg(channel.url || '');
+            if (!normalizedUrl) continue;
+
+            const existingIndex = tasks.findIndex((task) =>
+                task.generatedFromTaskId === baseTask.id
+                && task.workflowId === 'account-nurture'
+                && normalizeHttpUrlBg(task.platformUrl || '') === normalizedUrl
+            );
+
+            const generatedTask = {
+                ...buildGeneratedMarketingTask(baseTask, channel, index),
+                workflowId: 'account-nurture',
+                taskType: 'nurture',
+                name: `${baseTask.name || baseTask.website || '产品宣传'} · 养号 · ${channel.name || getDomainBg(channel.url || '') || '平台'}`,
+                generatedByCampaign: true
+            };
+
+            if (existingIndex >= 0) {
+                tasks[existingIndex] = {
+                    ...tasks[existingIndex],
+                    ...generatedTask,
+                    id: tasks[existingIndex].id,
+                    createdAt: tasks[existingIndex].createdAt || new Date().toISOString(),
+                    runCount: Number(tasks[existingIndex].runCount || 0),
+                    lastRunAt: tasks[existingIndex].lastRunAt || ''
+                };
+                scheduledTasks.push({ ...tasks[existingIndex] });
+                updatedCount++;
+            } else {
+                generatedTask.createdAt = new Date().toISOString();
+                tasks.push(generatedTask);
+                scheduledTasks.push({ ...generatedTask });
+                createdCount++;
+            }
+        }
+
+        return {
+            tasks,
+            value: {
+                createdCount,
+                updatedCount,
+                totalChannels: nurtureChannels.length
+            }
+        };
+    });
+    await Promise.all(scheduledTasks.map((task) => syncTaskSchedule(task).catch(() => {})));
+    return {
+        createdCount: summary.createdCount,
+        updatedCount: summary.updatedCount,
+        totalChannels: summary.totalChannels
+    };
+}
+
+async function createTasksFromResearchPlan(baseTask = {}, researchResult = {}) {
+    const channels = Array.isArray(researchResult.channels) ? researchResult.channels : [];
+    const scheduledTasks = [];
+    const summary = await TaskStore.updateTasks((tasks) => {
+        let createdCount = 0;
+        let updatedCount = 0;
+
+        for (let index = 0; index < channels.length; index++) {
+            const channel = channels[index] || {};
+            const normalizedUrl = normalizeHttpUrlBg(channel.url || '');
+            if (!normalizedUrl) continue;
+
+            const workflowId = ['community-post-promote', 'directory-submit-promote', 'account-nurture'].includes(channel.workflowId)
+                ? channel.workflowId
+                : 'community-post-promote';
+
+            const existingIndex = tasks.findIndex((task) =>
+                task.generatedFromTaskId === baseTask.id
+                && task.workflowId === workflowId
+                && normalizeHttpUrlBg(task.platformUrl || '') === normalizedUrl
+            );
+
+            const generatedTask = buildGeneratedMarketingTask(baseTask, channel, index);
+
+            if (existingIndex >= 0) {
+                tasks[existingIndex] = {
+                    ...tasks[existingIndex],
+                    ...generatedTask,
+                    id: tasks[existingIndex].id,
+                    createdAt: tasks[existingIndex].createdAt || new Date().toISOString(),
+                    runCount: Number(tasks[existingIndex].runCount || 0),
+                    lastRunAt: tasks[existingIndex].lastRunAt || ''
+                };
+                scheduledTasks.push({ ...tasks[existingIndex] });
+                updatedCount++;
+            } else {
+                generatedTask.createdAt = new Date().toISOString();
+                tasks.push(generatedTask);
+                scheduledTasks.push({ ...generatedTask });
+                createdCount++;
+            }
+        }
+
+        return {
+            tasks,
+            value: {
+                createdCount,
+                updatedCount,
+                totalChannels: channels.length
+            }
+        };
+    });
+    await Promise.all(scheduledTasks.map((task) => syncTaskSchedule(task).catch(() => {})));
+    return {
+        createdCount: summary.createdCount,
+        updatedCount: summary.updatedCount,
+        totalChannels: summary.totalChannels
+    };
+}
+
+async function runPromotionCampaignTask(task = {}, options = {}) {
+    const currentTask = await TaskStore.getTask(task.id) || task;
+    let promotionPlan = currentTask.promotionPlan || null;
+    let researchContext = currentTask.researchContext || null;
+    let nurtureGenerated = { createdCount: 0, updatedCount: 0 };
+    const now = new Date().toISOString();
+    const existingReviewItems = Array.isArray(currentTask?.promotionPlan?.reviewItems)
+        ? currentTask.promotionPlan.reviewItems
+        : [];
+    const refreshDue = !!getPromotionNextResearchAtMs(currentTask) && getPromotionNextResearchAtMs(currentTask) <= Date.now();
+    const forceRefresh = !!options.forceRefresh;
+    let generatedFresh = false;
+
+    if (!Array.isArray(promotionPlan?.channels) || promotionPlan.channels.length === 0 || refreshDue || forceRefresh) {
+        if (!researchContext?.generatedAt || refreshDue || forceRefresh) {
+            researchContext = await collectMarketingResearchContext(currentTask);
+        }
+        promotionPlan = await AIEngine.generateResearchPlan({
+            website: currentTask.website || '',
+            targetAudience: currentTask.targetAudience || '',
+            preferredChannels: currentTask.preferredChannels || '',
+            campaignBrief: currentTask.campaignBrief || '',
+            researchContext
+        });
+        promotionPlan = finalizeMarketingPlan(promotionPlan, currentTask, researchContext);
+        promotionPlan = filterPromotionPlanForUnopenedChannels(promotionPlan, existingReviewItems);
+        nurtureGenerated = await createNurtureTasksFromPromotionPlan(currentTask, promotionPlan);
+        generatedFresh = true;
+    } else {
+        promotionPlan = finalizeMarketingPlan(promotionPlan, currentTask, researchContext || {});
+    }
+
+    const openableChannels = (promotionPlan.channels || []).filter((channel) =>
+        channel?.workflowId !== 'account-nurture' && normalizeHttpUrlBg(channel.url || '')
+    );
+    const totalOpenableChannels = openableChannels.length;
+    const nextChannelIndex = Math.max(0, Math.min(
+        Number.isFinite(Number(promotionPlan.nextChannelIndex))
+            ? Number(promotionPlan.nextChannelIndex)
+            : Number(promotionPlan.progressedChannelCount || 0),
+        totalOpenableChannels
+    ));
+    const primaryChannel = totalOpenableChannels > 0 && nextChannelIndex < totalOpenableChannels
+        ? openableChannels[nextChannelIndex]
+        : null;
+    let openedTabId = null;
+    let openedReviewUrl = '';
+    const nowReview = new Date().toISOString();
+
+    if (primaryChannel) {
+        const tab = await openOrReuseMarketingTab(normalizeHttpUrlBg(primaryChannel.url || ''), {
+            active: options.active !== false,
+            waitForLoad: true
+        });
+        openedTabId = tab.id;
+        openedReviewUrl = normalizeHttpUrlBg(tab.url || primaryChannel.url || '');
+    }
+
+    let savedTask = currentTask;
+    if (currentTask?.id) {
+        const progressedChannelCount = primaryChannel
+            ? Math.min(totalOpenableChannels, nextChannelIndex + 1)
+            : Math.min(totalOpenableChannels, Number(promotionPlan.progressedChannelCount || 0));
+        const reviewItems = primaryChannel
+            ? mergePromotionReviewItems(promotionPlan.reviewItems, {
+                name: primaryChannel.name || '',
+                url: openedReviewUrl || primaryChannel.url || '',
+                workflowId: primaryChannel.workflowId || '',
+                openedAt: nowReview
+            })
+            : (Array.isArray(promotionPlan.reviewItems) ? promotionPlan.reviewItems : []);
+        const nextResearchAt = totalOpenableChannels > 0 && progressedChannelCount >= totalOpenableChannels
+            ? computeNextPromotionResearchAt(currentTask)
+            : '';
+        savedTask = await TaskStore.updateTask(currentTask.id, (storedTask) => ({
+            ...storedTask,
+            lastRunAt: now,
+            runCount: Number(storedTask.runCount || 0) + 1,
+            researchContext: researchContext || storedTask.researchContext || null,
+            promotionPlan: {
+                ...promotionPlan,
+                reviewItems,
+                generatedNurtureTaskCount: generatedFresh
+                    ? nurtureGenerated.createdCount
+                    : Number(promotionPlan.generatedNurtureTaskCount || 0),
+                updatedNurtureTaskCount: generatedFresh
+                    ? nurtureGenerated.updatedCount
+                    : Number(promotionPlan.updatedNurtureTaskCount || 0),
+                totalOpenableChannels,
+                nextChannelIndex: primaryChannel ? progressedChannelCount : nextChannelIndex,
+                progressedChannelCount,
+                lastOpenedChannelIndex: primaryChannel ? nextChannelIndex : Number(promotionPlan.lastOpenedChannelIndex || -1),
+                openedChannelName: primaryChannel?.name || '',
+                openedChannelUrl: openedReviewUrl || primaryChannel?.url || '',
+                generatedAt: promotionPlan.generatedAt || now,
+                lastOpenedAt: primaryChannel ? now : (promotionPlan.lastOpenedAt || ''),
+                nextResearchAt,
+                status: primaryChannel
+                    ? (progressedChannelCount >= totalOpenableChannels ? 'completed' : 'in_progress')
+                    : (nextResearchAt ? 'awaiting_refresh' : (promotionPlan.status || 'planned'))
+            }
+        }));
+        if (savedTask) {
+            await syncTaskSchedule(savedTask);
+        }
+    }
+
+    await Logger.ai(`产品宣传计划已生成: ${task.name || task.website}`, {
+        taskId: task.id || '',
+        channels: promotionPlan.channels?.length || 0,
+        browserSuggestedChannels: promotionPlan.browserSuggestedCount || 0,
+        nextSteps: promotionPlan.nextSteps?.length || 0,
+        nurtureCreated: nurtureGenerated.createdCount,
+        nurtureUpdated: nurtureGenerated.updatedCount,
+        searchQueries: researchContext?.queries?.length || 0,
+        pageReads: researchContext?.pageReads?.length || 0,
+        openedChannel: openedReviewUrl || primaryChannel?.url || ''
+    });
+
+    if (!primaryChannel) {
+        const nextResearchAt = savedTask?.promotionPlan?.nextResearchAt || '';
+        const nextRefreshLabel = formatMarketingRefreshAt(nextResearchAt);
+        return {
+            success: true,
+            message: totalOpenableChannels > 0
+                ? (nextRefreshLabel
+                    ? `宣传渠道已全部推进完，将在 ${nextRefreshLabel} 自动重新调研。`
+                    : `宣传渠道已全部推进完，等待下一次自动调研。`)
+                : '已生成宣传计划，但当前没有可直接打开的宣传渠道。',
+            promotionPlan: savedTask?.promotionPlan || promotionPlan,
+            tabId: null
+        };
+    }
+
+    const openedMessage = `，并已打开第 ${nextChannelIndex + 1}/${totalOpenableChannels} 个执行入口：${primaryChannel.name || primaryChannel.url}`;
+
+    return {
+        success: true,
+        message: `${generatedFresh ? `已生成宣传计划，发现 ${promotionPlan.channels?.length || 0} 个渠道，生成 ${nurtureGenerated.createdCount} 个养号任务${nurtureGenerated.updatedCount ? `，更新 ${nurtureGenerated.updatedCount} 个旧养号任务` : ''}` : '已继续产品宣传流程'}${openedMessage}。`,
+        promotionPlan: savedTask?.promotionPlan || promotionPlan,
+        tabId: openedTabId
+    };
+}
+
+async function runResearchTask(task = {}) {
+    const researchContext = await collectMarketingResearchContext(task);
+    let researchResult = await AIEngine.generateResearchPlan({
+        website: task.website || '',
+        targetAudience: task.targetAudience || '',
+        preferredChannels: task.preferredChannels || '',
+        campaignBrief: task.campaignBrief || '',
+        researchContext
+    });
+    researchResult = finalizeMarketingPlan(researchResult, task, researchContext);
+
+    const generated = await createTasksFromResearchPlan(task, researchResult);
+    const now = new Date().toISOString();
+
+    const savedTask = task?.id
+        ? await TaskStore.updateTask(task.id, (storedTask) => ({
+            ...storedTask,
+            lastRunAt: now,
+            runCount: Number(storedTask.runCount || 0) + 1,
+            researchContext,
+            researchResult: {
+                ...researchResult,
+                generatedTaskCount: generated.createdCount,
+                updatedTaskCount: generated.updatedCount,
+                generatedAt: now
+            }
+        }))
+        : null;
+
+    await Logger.ai(`营销调研计划已生成: ${task.name || task.website}`, {
+        taskId: task.id || '',
+        channels: researchResult.channels?.length || 0,
+        browserSuggestedChannels: researchResult.browserSuggestedCount || 0,
+        nextSteps: researchResult.nextSteps?.length || 0,
+        searchQueries: researchContext?.queries?.length || 0,
+        pageReads: researchContext?.pageReads?.length || 0,
+        createdTasks: generated.createdCount,
+        updatedTasks: generated.updatedCount
+    });
+
+    return {
+        success: true,
+        message: `已生成营销计划，发现 ${researchResult.channels?.length || 0} 个渠道，并生成 ${generated.createdCount} 个新任务${generated.updatedCount ? `，更新 ${generated.updatedCount} 个旧任务` : ''}。`,
+        researchResult: savedTask?.researchResult || researchResult
+    };
+}
+
+async function runNurtureSession(task = {}, options = {}) {
+    const platformUrl = normalizeHttpUrlBg(task.platformUrl || task.website || '');
+    if (!platformUrl) {
+        throw new Error('当前养号任务没有配置平台 URL');
+    }
+
+    const tab = await openOrReuseMarketingTab(platformUrl, { active: !!options.active, waitForLoad: true });
+
+    await delay(1500);
+
+    const executeBrowsePass = async (tabId) => {
+            const results = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: async (payload) => {
+                    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                    const collectLinks = () => Array.from(document.querySelectorAll('a[href]'))
+                        .map((anchor) => ({
+                            href: anchor.href || anchor.getAttribute('href') || '',
+                            text: String(anchor.textContent || '').replace(/\s+/g, ' ').trim()
+                        }))
+                        .filter((item) =>
+                            item.href
+                            && !item.href.startsWith('javascript:')
+                            && !item.href.startsWith('mailto:')
+                            && item.text.length > 8
+                        );
+
+                    const height = Math.max(
+                        document.body?.scrollHeight || 0,
+                        document.documentElement?.scrollHeight || 0,
+                        window.innerHeight
+                    );
+
+                    for (let index = 1; index <= 3; index++) {
+                        const top = Math.min(height, Math.floor(height * (index / 3)));
+                        window.scrollTo({ top, behavior: 'auto' });
+                        await sleep(900);
+                    }
+
+                    const links = collectLinks();
+                    const internalLink = links.find((item) => {
+                        try {
+                            const url = new URL(item.href);
+                            return url.origin === window.location.origin && url.pathname !== window.location.pathname;
+                        } catch {
+                            return false;
+                        }
+                    });
+
+                    return {
+                        title: document.title || '',
+                        url: window.location.href || '',
+                        internalLink: internalLink?.href || '',
+                        internalLinkText: internalLink?.text || '',
+                        visibleLinkCount: links.length,
+                        sessionGoal: payload.sessionGoal || ''
+                    };
+                },
+                args: [{
+                    sessionGoal: task.sessionGoal || ''
+                }]
+            });
+            return results?.[0]?.result || null;
+    };
+
+    const firstPass = await executeBrowsePass(tab.id);
+    let secondPass = null;
+
+    if (firstPass?.internalLink && firstPass.internalLink !== platformUrl) {
+        await chrome.tabs.update(tab.id, { url: firstPass.internalLink, active: !!options.active });
+        await waitForTabLoad(tab.id);
+        await delay(1200);
+        secondPass = await executeBrowsePass(tab.id);
+    }
+
+    return {
+        platformUrl: normalizeHttpUrlBg(secondPass?.url || firstPass?.url || platformUrl),
+        visitedPages: secondPass ? 2 : 1,
+        firstPass,
+        secondPass
+    };
+}
+
+async function executeNurtureTask(taskId, options = {}) {
+    const task = await TaskStore.getTask(taskId);
+    if (!task) return;
+
+    const session = await runNurtureSession(task, options);
+    const now = new Date().toISOString();
+    const updatedTask = await TaskStore.updateTask(taskId, (storedTask) => ({
+        ...storedTask,
+        lastRunAt: now,
+        runCount: Number(storedTask.runCount || 0) + 1,
+        nextRunAt: computeNextNurtureRunAt(storedTask.frequency || 'daily'),
+        lastSession: {
+            platformUrl: session.platformUrl,
+            visitedPages: session.visitedPages,
+            firstTitle: session.firstPass?.title || '',
+            secondTitle: session.secondPass?.title || '',
+            internalLink: session.firstPass?.internalLink || '',
+            completedAt: now
+        }
+    }));
+    if (updatedTask) {
+        await syncTaskSchedule(updatedTask);
+    }
+
+    await Logger.publish(`养号任务已执行: ${updatedTask?.name || task.name || task.platformUrl || task.website}`, {
+        taskId,
+        platformUrl: updatedTask?.platformUrl || task.platformUrl || '',
+        frequency: updatedTask?.frequency || task.frequency || 'daily',
+        visitedPages: session.visitedPages
+    });
+
+    return {
+        success: true,
+        session
+    };
+}
+
+async function handleNurtureAlarm(taskId) {
+    try {
+        await executeNurtureTask(taskId, { active: false });
+    } catch (error) {
+        await Logger.error(`养号任务执行失败: ${error.message}`, { taskId });
+    }
+}
+
+async function handleMarketingRefreshAlarm(taskId) {
+    try {
+        await ensureMarketingAutomationLoaded();
+        if (marketingAutomationState.isPaused && marketingAutomationState.pauseReason === 'manual') {
+            await Logger.publish('营销刷新已到期，但当前持续宣传处于手动暂停状态', { taskId });
+            return;
+        }
+        await Logger.publish('营销刷新已到期，自动继续持续宣传', { taskId });
+        await startMarketingAutomation({ forcePromotionRefresh: false });
+    } catch (error) {
+        await Logger.error(`营销刷新任务执行失败: ${error.message}`, { taskId });
+    }
+}
+
+async function runMarketingTask(task = {}, options = {}) {
+    try {
+        const taskType = getTaskType(task);
+        const targetUrl = task.platformUrl || task.website || '';
+
+        if (task.workflowId === 'product-promote-campaign') {
+            return await runPromotionCampaignTask(task, options);
+        }
+
+        if (taskType === 'research') {
+            return await runResearchTask(task);
+        }
+
+        if (!targetUrl) {
+            return {
+                success: false,
+                message: '当前任务还没有配置可打开的平台 URL'
+            };
+        }
+
+        const url = normalizeHttpUrlBg(targetUrl);
+
+        if (taskType === 'nurture') {
+            const result = await executeNurtureTask(task.id, { active: options.active !== false });
+            return {
+                success: true,
+                message: `已完成一次养号会话，浏览 ${result.session?.visitedPages || 1} 个页面。`,
+                session: result.session
+            };
+        }
+
+        const tab = await openOrReuseMarketingTab(url, { active: options.active !== false, waitForLoad: true });
+        await Logger.publish(`已打开营销任务入口: ${task.name || url}`, {
+            taskId: task.id || '',
+            taskType,
+            targetUrl: url
+        });
+
+        return {
+            success: true,
+            message: '已打开发帖/提交通道，下一步会补自动化执行器。',
+            tabId: tab.id
+        };
+    } catch (error) {
+        await Logger.error(`营销任务执行失败: ${error.message}`, {
+            taskId: task.id || '',
+            workflowId: task.workflowId || '',
+            taskType: getTaskType(task)
+        });
+        return {
+            success: false,
+            message: error.message || '营销任务执行失败'
+        };
+    }
+}
+
+async function inspectMarketingReview(taskId = '', url = '') {
+    const finalUrl = normalizeHttpUrlBg(url || '');
+    if (!taskId || !finalUrl) {
+        return { success: false, message: '缺少待检查页面地址' };
+    }
+
+    const updatedTask = await TaskStore.updateTask(taskId, (storedTask) => {
+        const promotionPlan = storedTask.promotionPlan || {};
+        const reviewItems = Array.isArray(promotionPlan.reviewItems) ? promotionPlan.reviewItems : [];
+        const checkedAt = new Date().toISOString();
+        return {
+            ...storedTask,
+            promotionPlan: {
+                ...promotionPlan,
+                reviewItems: reviewItems.map((item) =>
+                    normalizeHttpUrlBg(item?.url || '') === finalUrl
+                        ? { ...item, checkedAt }
+                        : item
+                )
+            }
+        };
+    });
+    if (!updatedTask) {
+        return { success: false, message: '找不到对应营销任务' };
+    }
+
+    const tab = await openOrReuseMarketingTab(finalUrl, { active: true, waitForLoad: true });
+    return {
+        success: true,
+        url: finalUrl,
+        tabId: tab.id
+    };
+}
+
+async function savePublishTask(task) {
+    task.workflowId = task.workflowId || WorkflowRegistry.DEFAULT_WORKFLOW_ID;
+    task.taskType = getTaskType(task);
+    task.commentStyle = task.commentStyle || 'standard';
+    task.commentStyleVersion = PUBLISH_TASK_SCHEMA_VERSION;
+    task.maxPublishes = Number(task.maxPublishes) > 0 ? Number(task.maxPublishes) : 0;
+
+    const savedTask = await TaskStore.updateTasks((tasks) => {
+        let nextTask = { ...task };
+
+        if (nextTask.id) {
+            const idx = tasks.findIndex((item) => item.id === nextTask.id);
+            if (idx !== -1) {
+                const existingTask = tasks[idx];
+                const mergedTask = { ...existingTask, ...nextTask };
+
+                if (getTaskType(mergedTask) === 'nurture') {
+                    const frequencyChanged = existingTask.frequency !== mergedTask.frequency;
+                    if (!mergedTask.nextRunAt || frequencyChanged) {
+                        mergedTask.nextRunAt = computeNextNurtureRunAt(mergedTask.frequency || 'daily');
+                    }
+                }
+
+                if (mergedTask.workflowId === 'product-promote-campaign') {
+                    const campaignInputsChanged =
+                        existingTask.website !== mergedTask.website
+                        || existingTask.targetAudience !== mergedTask.targetAudience
+                        || existingTask.preferredChannels !== mergedTask.preferredChannels
+                        || existingTask.campaignBrief !== mergedTask.campaignBrief;
+                    if (campaignInputsChanged) {
+                        delete mergedTask.promotionPlan;
+                        delete mergedTask.researchContext;
+                    }
+                }
+
+                tasks[idx] = mergedTask;
+                nextTask = mergedTask;
+            }
+        } else {
+            nextTask.id = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+            nextTask.createdAt = new Date().toISOString();
+            nextTask.stats = { total: 0, success: 0, skipped: 0, pending: 0, failed: 0 };
+            nextTask.runCount = Number(nextTask.runCount || 0);
+            nextTask.lastRunAt = nextTask.lastRunAt || '';
+            if (getTaskType(nextTask) === 'nurture') {
+                nextTask.nextRunAt = computeNextNurtureRunAt(nextTask.frequency || 'daily');
+            }
+            tasks.push(nextTask);
+        }
+
+        return { tasks, value: nextTask };
+    });
+
+    await syncTaskSchedule(savedTask);
+    await Logger.publish(`保存任务: ${savedTask.name || savedTask.website}`);
+    if (isAutoPublishTask(savedTask)) {
+        scheduleAutoPublishDispatch('task-saved', 600);
+    }
 }
 
 async function deletePublishTask(taskId) {
-    const data = await chrome.storage.local.get('publishTasks');
-    const tasks = (data.publishTasks || []).filter(t => t.id !== taskId);
-    await chrome.storage.local.set({ publishTasks: tasks });
+    await TaskStore.removeTask(taskId);
+    try { await chrome.alarms.clear(getNurtureAlarmName(taskId)); } catch {}
+    try { await chrome.alarms.clear(getPromotionRefreshAlarmName(taskId)); } catch {}
 }
 
 function getPublishWorkflow(task) {
@@ -1988,6 +4664,10 @@ function getTaskPublishTarget(task = {}) {
     };
 }
 
+function isPublishCandidateForTask(resource, task = {}) {
+    return !!self.ResourceRules?.isPublishCandidateForTask?.(resource, task);
+}
+
 function getResourcePublishHistoryEntry(resource, taskOrTarget) {
     const targetKey = typeof taskOrTarget === 'string' ? taskOrTarget : taskOrTarget?.key;
     if (!targetKey) return null;
@@ -1995,16 +4675,95 @@ function getResourcePublishHistoryEntry(resource, taskOrTarget) {
 }
 
 function canPublishResourceForTask(resource, task) {
-    if (resource.status !== 'pending') return false;
+    if (!isPublishCandidateForTask(resource, task)) {
+        return false;
+    }
 
     const historyEntry = getResourcePublishHistoryEntry(resource, getTaskPublishTarget(task));
     if (!historyEntry) return true;
+    if (historyEntry.lastStatus === 'pending' && historyEntry?.publishMeta?.reviewPending) {
+        return false;
+    }
+    if (historyEntry.lastStatus === 'failed') {
+        const failureRecovery = getPublishFailureRecoveryPolicy(historyEntry?.publishMeta || {}, historyEntry);
+        return !!failureRecovery.retryable;
+    }
 
     return !['published', 'skipped', 'failed'].includes(historyEntry.lastStatus);
 }
 
 function isRateLimitReason(reason = '') {
     return String(reason || '').toLowerCase() === 'comment_rate_limited';
+}
+
+function getPublishFailureRecoveryPolicy(publishMeta = {}, historyEntry = null) {
+    const reason = compactText(publishMeta?.submissionBlockReason || '').toLowerCase();
+    const failedAttempts = Number(historyEntry?.attempts?.failed || 0);
+    const maxAttempts = Number(PUBLISH_STRATEGY.RETRYABLE_FAILURE_MAX_ATTEMPTS || 0) || 3;
+
+    if (publishMeta?.websiteRetryExhausted) {
+        return {
+            retryable: false,
+            terminalStatus: 'skipped',
+            reason: 'website-field-blocked-exhausted',
+            cooldownMs: 0,
+            failedAttempts,
+            maxAttempts
+        };
+    }
+
+    if (reason === 'duplicate_comment') {
+        return {
+            retryable: false,
+            terminalStatus: 'skipped',
+            reason,
+            cooldownMs: 0,
+            failedAttempts,
+            maxAttempts
+        };
+    }
+
+    if (reason === 'comment_submission_blocked') {
+        return {
+            retryable: false,
+            terminalStatus: 'skipped',
+            reason,
+            cooldownMs: 0,
+            failedAttempts,
+            maxAttempts
+        };
+    }
+
+    if (reason === 'publish-runtime-timeout' || reason === 'submit-confirm-timeout') {
+        return {
+            retryable: failedAttempts < maxAttempts,
+            terminalStatus: 'failed',
+            reason,
+            cooldownMs: Number(PUBLISH_STRATEGY.RETRYABLE_FAILURE_COOLDOWN_MS || 0) || 0,
+            failedAttempts,
+            maxAttempts
+        };
+    }
+
+    if (!reason || reason === 'unknown') {
+        return {
+            retryable: failedAttempts < maxAttempts,
+            terminalStatus: 'failed',
+            reason: reason || 'unknown',
+            cooldownMs: Number(PUBLISH_STRATEGY.UNKNOWN_FAILURE_COOLDOWN_MS || 0) || 0,
+            failedAttempts,
+            maxAttempts
+        };
+    }
+
+    return {
+        retryable: false,
+        terminalStatus: 'failed',
+        reason: reason || 'unknown',
+        cooldownMs: 0,
+        failedAttempts,
+        maxAttempts
+    };
 }
 
 function interleaveResourcesByDomain(resources = []) {
@@ -2059,321 +4818,173 @@ function mergePublishHistoryEntry(existingEntry, target, status, publishMeta = {
     };
 }
 
-async function startPublish(task) {
-    if (publishState.isPublishing) {
-        await Logger.publish('已有发布任务在运行，请先暂停当前任务后再启动新的任务');
-        return {
-            success: false,
-            code: 'already_running',
-            message: '已有发布任务在运行，请先停止当前任务。'
+async function updateTaskPublishStats(taskId, resourceId, status, currentTask = {}) {
+    if (!taskId) return;
+    await TaskStore.updateTask(taskId, (task) => {
+        const stats = task.stats || { total: 0, success: 0, skipped: 0, pending: 0, failed: 0 };
+        const nextStats = {
+            total: Number(stats.total || 0),
+            success: Number(stats.success || 0),
+            skipped: Number(stats.skipped || 0),
+            pending: Number(stats.pending || 0),
+            failed: Number(stats.failed || 0)
         };
-    }
 
-    const data = await chrome.storage.local.get('resources');
-    const resources = data.resources || [];
-    const workflow = getPublishWorkflow(task);
-    const policies = await getAllDomainPublishPolicies();
-    const workflowPending = resources.filter(r => r.status === 'pending' && WorkflowRegistry.supportsResource(workflow, r));
-    const pendingAll = resources.filter(r => WorkflowRegistry.supportsResource(workflow, r) && canPublishResourceForTask(r, task));
-    const pendingReady = pendingAll.filter((resource) => !isResourceCoolingDown(resource, policies));
-    const maxPublishes = Number(task?.maxPublishes) > 0 ? Number(task.maxPublishes) : 0;
-    const pendingBase = maxPublishes > 0 ? pendingReady.slice(0, maxPublishes) : pendingReady;
-    const pending = interleaveResourcesByDomain(pendingBase);
+        if (status !== 'pending') {
+            nextStats.total++;
+            if (status === 'published') nextStats.success++;
+            else if (status === 'skipped') nextStats.skipped++;
+            else if (status === 'failed') nextStats.failed++;
+        }
 
-    if (pending.length === 0) {
-        const hasWorkflowPending = workflowPending.length > 0;
-        const targetUrl = getTaskPublishTarget(task).url || task.website || '';
-        const hasOnlyCooldownBlocked = pendingAll.length > 0 && pendingReady.length === 0;
-        const message = hasOnlyCooldownBlocked
-            ? '当前可发资源都处于域名冷却中，请稍后再试。'
-            : hasWorkflowPending
-                ? '当前网站之前已经发过这些资源了，没有新的可发资源。'
-                : '当前没有可直接发布的博客评论资源。';
-        await Logger.publish(`没有找到可用于当前网站且未发布过的资源`, {
-            workflowId: workflow?.id || WorkflowRegistry.DEFAULT_WORKFLOW_ID,
-            target: targetUrl,
-            workflowPending: workflowPending.length,
-            cooldownBlocked: pendingAll.length - pendingReady.length
-        });
         return {
-            success: false,
-            code: hasOnlyCooldownBlocked
-                ? 'domain_cooldown_active'
-                : hasWorkflowPending
-                    ? 'site_history_exhausted'
-                    : 'no_pending_resources',
-            message,
-            workflowPending: workflowPending.length,
-            eligiblePending: pendingAll.length,
-            readyPending: pendingReady.length,
-            target: targetUrl
+            ...task,
+            stats: nextStats
         };
-    }
-
-    publishState = {
-        isPublishing: true,
-        currentTask: task,
-        queue: pending,
-        currentIndex: 0,
-        currentWorkflowId: workflow?.id || WorkflowRegistry.DEFAULT_WORKFLOW_ID,
-        currentTabId: null,
-        currentUrl: pending[0]?.url || '',
-        stopRequested: false,
-        awaitingManualContinue: false,
-        pendingSubmission: null
-    };
-
-    await Logger.publish(`开始发布: ${task.name || task.website}`, {
-        total: pending.length,
-        workflowId: workflow?.id || WorkflowRegistry.DEFAULT_WORKFLOW_ID,
-        maxPublishes
     });
-    await publishNext();
+}
+
+async function syncPublishLog(resourceId, status, currentTask = {}) {
+    try {
+        const settings = await getSettings();
+        if (!settings.googleSheetId) return;
+
+        const resources = await getStoredResources();
+        const resource = resources.find((item) => item.id === resourceId);
+        if (!resource) return;
+
+        await GoogleSheets.syncPublishLog(settings.googleSheetId, {
+            timestamp: new Date().toISOString(),
+            url: resource.url,
+            status,
+            taskName: currentTask?.name || ''
+        });
+    } catch {}
+}
+
+function getPublishRuntimeContext(taskId) {
     return {
-        success: true,
-        queued: pending.length
+        defaultWorkflowId: WorkflowRegistry.DEFAULT_WORKFLOW_ID,
+        publishStrategy: PUBLISH_STRATEGY,
+        logger: Logger,
+        buildWorkflowTask: (task) => PublishWorkflowTask.buildTask(task),
+        getState: () => getPublishSessionState(taskId),
+        setState: (nextState) => {
+            setPublishSessionState(taskId, nextState);
+        },
+        updateState: (patch = {}) => {
+            updatePublishSessionState(taskId, patch);
+        },
+        getResources: async () => await getStoredResources(),
+        getResourcesAndTasks: async () => {
+            return {
+                resources: await getStoredResources(),
+                publishTasks: await TaskStore.getTasks()
+            };
+        },
+        getSiteTemplates: async () => await self.PublishMemory?.getSiteTemplates?.() || {},
+        getSettings,
+        getPublishWorkflow,
+        workflowSupportsResource: (workflow, resource, task) => WorkflowRegistry.supportsResource(workflow, resource, task),
+        canPublishResourceForTask,
+        getAllDomainPublishPolicies,
+        isResourceCoolingDown,
+        interleaveResourcesByDomain,
+        getPublishCandidatePriority: (resource, task) => self.ResourceRules?.getPublishCandidatePriority?.(resource, task) || 0,
+        getResourcePublishRankingScore: (resource, task, siteTemplates = {}) => getResourcePublishRankingScore(resource, task, siteTemplates),
+        getTaskPublishTarget,
+        rebalanceCooldownQueue: () => rebalanceCooldownQueue(taskId),
+        shouldPreferCommentViewport,
+        openOrReusePublishTab: (url, options = {}) => openOrReusePublishTab(taskId, url, options),
+        sendPublishToTab,
+        delay,
+        updateResourceStatus,
+        verifyPublishedAnchor,
+        recordDomainPublishEvidence,
+        rememberPublishOutcome: async (resource, task, status, publishMeta) => {
+            if (!self.PublishMemory?.rememberPublishOutcome) return null;
+            return await self.PublishMemory.rememberPublishOutcome({ resource, task, status, publishMeta });
+        },
+        setDomainPublishPolicy,
+        isRateLimitReason,
+        getFailureRecoveryPolicy: (publishMeta = {}, historyEntry = null) => (
+            getPublishFailureRecoveryPolicy(publishMeta, historyEntry)
+        ),
+        focusPublishTab: () => focusPublishTab(taskId),
+        shouldFocusPublishTab,
+        moveCurrentResourceToQueueTail: () => moveCurrentResourceToQueueTail(taskId),
+        resetResourcePublishState,
+        updateTaskStats: updateTaskPublishStats,
+        syncPublishLog,
+        sendStopMessage: async (tabId) => {
+            await chrome.tabs.sendMessage(tabId, { action: 'stopPublishSession' });
+        },
+        broadcastDone: () => {
+            broadcastToPopup({ action: 'publishDone', taskId });
+            schedulePublishBatchAdvance('publish-done', 700);
+        },
+        broadcastProgress: (payload = {}) => {
+            broadcastToPopup({
+                action: 'publishProgress',
+                taskId,
+                ...payload
+            });
+        }
     };
 }
 
-async function publishNext() {
-    if (!publishState.isPublishing) return;
-    if (publishState.awaitingManualContinue) return;
-    const cooldownState = await rebalanceCooldownQueue();
-    if (cooldownState.moved > 0) {
-        await Logger.publish(`已重排 ${cooldownState.moved} 个处于域名冷却中的资源`, {
-            taskId: publishState.currentTask?.id || ''
-        });
+async function startPublish(task, options = {}) {
+    await ensurePublishSessionsLoaded();
+    await ensurePublishBatchStateLoaded();
+    if (!options.fromBatch && isPublishBatchRunning()) {
+        return {
+            success: false,
+            code: 'publish_batch_busy',
+            message: '当前批量发布进行中，请先停止批量发布后再单独启动任务。'
+        };
     }
-    if (cooldownState.blocked) {
-        publishState.isPublishing = false;
-        broadcastToPopup({ action: 'publishDone' });
-        await Logger.publish('剩余资源全部处于域名冷却中，已暂停本轮发布', {
-            taskId: publishState.currentTask?.id || '',
-            cooldownUntil: cooldownState.cooldownUntil || ''
-        });
-        return;
-    }
-    if (publishState.currentIndex >= publishState.queue.length) {
-        publishState.isPublishing = false;
-        broadcastToPopup({ action: 'publishDone' });
-        await Logger.publish('发布完成');
-        return;
-    }
-
-    const resource = publishState.queue[publishState.currentIndex];
-    const task = publishState.currentTask;
-    const workflow = getPublishWorkflow(task);
-    const settings = await getSettings();
-    const shouldFocus = shouldFocusPublishTab(task, settings);
-    let url = resource.url;
-    if (!url.startsWith('http')) url = 'https://' + url;
-    publishState.currentUrl = resource.url;
-
-    broadcastToPopup({
-        action: 'publishProgress',
-        currentUrl: resource.url,
-        current: publishState.currentIndex + 1,
-        total: publishState.queue.length,
-        taskId: task.id,
-        isPublishing: true
+    const hasOtherActivePublish = Object.entries(publishSessions || {}).some(([activeTaskId, session]) => {
+        if (activeTaskId === task?.id) return false;
+        return !!session?.isPublishing || !!session?.awaitingManualContinue || !!session?.pendingSubmission;
     });
-
-    try {
-        const tab = await openOrReusePublishTab(url, { active: shouldFocus });
-        await delay(2000);
-
-        if (!publishState.isPublishing) {
-            return;
-        }
-
-        await sendPublishToTab(tab.id, resource, task, workflow, settings);
-    } catch (e) {
-        await Logger.error(`发布失败: ${resource.url}`, { error: e.message });
-        await updateResourceStatus(resource.id, 'failed');
-        publishState.currentIndex++;
-        await publishNext();
+    if (hasOtherActivePublish) {
+        return {
+            success: false,
+            code: 'publish_session_busy',
+            message: '当前已有其他发布任务在运行，请先停止或完成后再启动新的任务。'
+        };
     }
+    return await PublishRuntime.start(getPublishRuntimeContext(task.id), task);
+}
+
+async function publishNext(taskId) {
+    await ensurePublishSessionsLoaded();
+    return await PublishRuntime.dispatchQueue(getPublishRuntimeContext(taskId));
 }
 
 async function handleCommentAction(resourceId, result, taskId, meta = {}) {
-    const activeResourceId = publishState.queue?.[publishState.currentIndex]?.id || '';
-    if (activeResourceId && activeResourceId !== resourceId) {
-        return;
+    await ensurePublishSessionsLoaded();
+    await ensurePublishBatchStateLoaded();
+    const runtimeTaskId = taskId || findPublishSessionTaskIdByResource(resourceId);
+    if (!runtimeTaskId) return;
+    clearPublishWatchdog(runtimeTaskId);
+    const actionResult = await PublishRuntime.handleAction(
+        getPublishRuntimeContext(runtimeTaskId),
+        resourceId,
+        result,
+        runtimeTaskId,
+        meta
+    );
+    const session = getPublishSessionState(runtimeTaskId);
+    if (!session.isPublishing && !session.awaitingManualContinue && !session.pendingSubmission) {
+        schedulePublishBatchAdvance('publish-session-idle', 500);
+        scheduleAutoPublishDispatch('publish-session-idle', 700);
     }
-
-    if (publishState.pendingSubmission?.resourceId === resourceId) {
-        publishState.pendingSubmission = null;
-    }
-
-    const statusMap = { submitted: 'published', skipped: 'skipped', failed: 'failed' };
-    let status = statusMap[result] || result;
-    const publishMeta = {
-        ...(meta || {}),
-        commentStyle: meta.commentStyle || publishState.currentTask?.commentStyle || 'standard',
-        anchorRequested: !!meta.anchorRequested,
-        anchorInjected: !!meta.anchorInjected,
-        anchorText: meta.anchorText || publishState.currentTask?.anchorKeyword || '',
-        anchorUrl: meta.anchorUrl || publishState.currentTask?.anchorUrl || publishState.currentTask?.website || '',
-        updatedAt: new Date().toISOString()
-    };
-
-    if (status === 'published' && publishState.currentTabId) {
-        const verification = await verifyPublishedAnchor(publishState.currentTabId, {
-            anchorUrl: publishMeta.anchorUrl,
-            anchorText: publishMeta.anchorText,
-            commenterName: publishState.currentTask?.name_commenter || publishState.currentTask?.name || ''
-        });
-        if (publishMeta.anchorRequested) {
-            publishMeta.anchorVisible = !!verification?.anchorVisible;
-            publishMeta.anchorVerified = !!verification;
-            publishMeta.anchorVerification = verification || null;
-        }
-        publishMeta.websiteFieldBlockedFirstComment = !!verification?.websiteFieldBlockedFirstComment;
-        if (verification?.noticeExcerpt) {
-            publishMeta.websiteFieldNotice = verification.noticeExcerpt;
-        }
-        publishMeta.submissionBlocked = !!verification?.submissionBlocked;
-        publishMeta.submissionBlockReason = verification?.submissionBlockReason || '';
-        publishMeta.pageUrlAfterSubmit = verification?.pageUrl || '';
-        if (publishMeta.submissionBlocked) {
-            status = 'failed';
-            await Logger.error('评论提交被站点拦截，已改判为失败', {
-                url: publishState.currentUrl,
-                reason: publishMeta.submissionBlockReason || '',
-                pageUrl: publishMeta.pageUrlAfterSubmit || ''
-            });
-        }
-    }
-
-    if (publishMeta.websiteFieldBlockedFirstComment) {
-        const resource = publishState.queue[publishState.currentIndex];
-        const settings = await getSettings();
-        const shouldFocus = shouldFocusPublishTab(publishState.currentTask, settings);
-        await setDomainPublishPolicy(resource?.url || publishState.currentUrl || '', {
-            omitWebsiteField: true,
-            reason: 'first-comment-website-block',
-            updatedAt: new Date().toISOString()
-        });
-
-        if (!meta.retryWithoutWebsite && publishState.currentTabId && resource && publishState.currentTask) {
-            const workflow = getPublishWorkflow(publishState.currentTask);
-            let retryUrl = resource.url;
-            if (retryUrl && !retryUrl.startsWith('http')) retryUrl = 'https://' + retryUrl;
-
-            await Logger.publish('检测到首评禁止 Website 字段，已自动改为清空 Website 字段后重试', {
-                url: resource.url
-            });
-
-            const tab = await openOrReusePublishTab(retryUrl, { active: shouldFocus });
-            await delay(2000);
-
-            if (!publishState.isPublishing) return;
-
-            await sendPublishToTab(tab.id, resource, publishState.currentTask, workflow, settings, {
-                website: '',
-                retryWithoutWebsite: true
-            });
-            return;
-        }
-
-        if (meta.retryWithoutWebsite) {
-            status = 'failed';
-            publishMeta.websiteRetryExhausted = true;
-            await Logger.error('清空 Website 字段后重试仍被站点拦截', {
-                url: publishState.currentUrl,
-                notice: publishMeta.websiteFieldNotice || ''
-            });
-        }
-    }
-
-    if (status === 'failed' && isRateLimitReason(publishMeta.submissionBlockReason)) {
-        const cooldownUntil = new Date(Date.now() + PUBLISH_STRATEGY.DOMAIN_RATE_LIMIT_COOLDOWN_MS).toISOString();
-        await setDomainPublishPolicy(publishState.currentUrl || '', {
-            cooldownUntil,
-            cooldownReason: publishMeta.submissionBlockReason,
-            updatedAt: new Date().toISOString()
-        });
-        publishMeta.cooldownUntil = cooldownUntil;
-        publishMeta.cooldownDeferred = true;
-        status = 'pending';
-        await Logger.publish('站点触发评论限流，已自动进入域名冷却', {
-            url: publishState.currentUrl,
-            cooldownUntil
-        });
-    }
-
-    const publishTarget = getTaskPublishTarget(publishState.currentTask || {});
-    await updateResourceStatus(resourceId, status, {
-        publishMeta,
-        publishHistoryEntry: publishTarget.key ? { target: publishTarget } : null
-    });
-    await Logger.publish(`评论${result}: ${resourceId}`);
-
-    // 更新任务统计
-    if (taskId) {
-        const data = await chrome.storage.local.get('publishTasks');
-        const tasks = data.publishTasks || [];
-        const task = tasks.find(t => t.id === taskId);
-        if (task) {
-            task.stats = task.stats || { total: 0, success: 0, pending: 0, failed: 0 };
-            if (status !== 'pending') {
-                task.stats.total++;
-                if (status === 'published') task.stats.success++;
-                else if (status === 'failed') task.stats.failed++;
-            }
-            await chrome.storage.local.set({ publishTasks: tasks });
-        }
-    }
-
-    // Google Sheets 同步
-    try {
-        const settings = await getSettings();
-        if (settings.googleSheetId) {
-            const resData = await chrome.storage.local.get('resources');
-            const resource = (resData.resources || []).find(r => r.id === resourceId);
-            if (resource) {
-                await GoogleSheets.syncPublishLog(settings.googleSheetId, {
-                    timestamp: new Date().toISOString(),
-                    url: resource.url,
-                    status,
-                    taskName: publishState.currentTask?.name || ''
-                });
-            }
-        }
-    } catch {}
-
-    if (result === 'submitted' && status === 'published') {
-        const settings = await getSettings();
-        const shouldHoldForReview = publishState.currentTask?.mode !== 'full-auto' || !!settings.publishDebugMode;
-
-        if (shouldHoldForReview) {
-            await focusPublishTab();
-            publishState.awaitingManualContinue = true;
-            broadcastToPopup({
-                action: 'publishProgress',
-                currentUrl: publishState.currentUrl,
-                current: publishState.currentIndex + 1,
-                total: publishState.queue.length,
-                taskId: publishState.currentTask?.id,
-                isPublishing: true,
-                awaitingManualContinue: true
-            });
-            await Logger.publish('当前资源已提交，等待手动继续到下一个页面');
-            return;
-        }
-    }
-
-    if (status === 'pending' && publishMeta.cooldownDeferred) {
-        moveCurrentResourceToQueueTail();
-    } else {
-        publishState.currentIndex++;
-    }
-    await publishNext();
+    return actionResult;
 }
 
 async function updateResourceStatus(id, status, patch = {}) {
-    const data = await chrome.storage.local.get('resources');
-    const resources = data.resources || [];
+    const resources = await getStoredResources();
     const idx = resources.findIndex(r => r.id === id);
     if (idx !== -1) {
         const current = resources[idx];
@@ -2399,6 +5010,10 @@ async function updateResourceStatus(id, status, patch = {}) {
 
             if (publishMeta) {
                 next.publishMeta = { ...(current.publishMeta || {}), ...publishMeta };
+                if (next.publishMeta.terminalFailureReason === 'comment_only_form' || next.publishMeta.linkMode === 'comment-only') {
+                    next.publishMeta.commentOnlyDetected = true;
+                    next.details = Array.from(new Set([...(next.details || []), 'comment-only']));
+                }
             }
 
             if (publishHistoryEntry?.target?.key) {
@@ -2415,15 +5030,29 @@ async function updateResourceStatus(id, status, patch = {}) {
             }
         }
 
+        const nextSourceTiers = mergeSourceTierArrays(next.sourceTiers || [], [
+            next.discoverySourceTier || '',
+            status === 'published' ? SOURCE_TIERS.HISTORICAL_SUCCESS : ''
+        ]);
+        const nextDiscoveryEdges = mergeDiscoveryEdges(next.discoveryEdges || [], status === 'published'
+            ? [buildDiscoveryEdge(SOURCE_TIERS.HISTORICAL_SUCCESS, 'publish-success', next.url || '')]
+            : []);
+        next.sourceTiers = nextSourceTiers;
+        next.discoveryEdges = nextDiscoveryEdges;
+        Object.assign(next, sanitizeResourceSignals(next));
+        next.sourceTier = getEffectiveResourceSourceTier(next) || next.discoverySourceTier || next.sourceTier || '';
+        next.sourceTierScore = getSourceTierScore(next.sourceTier);
+        next.sourceEvidence = summarizeSourceEvidenceFromEdges(next.discoveryEdges || []);
+
         resources[idx] = next;
-        await chrome.storage.local.set({ resources });
+        await writeResourcesToStorage(resources);
+        scheduleAutoPublishDispatch(`resource-status:${status}`, 900);
     }
 }
 
 async function resetResourcePublishState(resourceId, options = {}) {
     const { preserveHistory = false } = options;
-    const data = await chrome.storage.local.get('resources');
-    const resources = data.resources || [];
+    const resources = await getStoredResources();
     const idx = resources.findIndex(r => r.id === resourceId);
     if (idx === -1) return false;
 
@@ -2434,48 +5063,74 @@ async function resetResourcePublishState(resourceId, options = {}) {
         delete nextResource.publishHistory;
     }
     resources[idx] = nextResource;
-    await chrome.storage.local.set({ resources });
+    await writeResourcesToStorage(resources);
     return true;
 }
 
 async function resetAllPublishStatuses() {
-    if (publishState.isPublishing) {
+    await ensurePublishSessionsLoaded();
+    await ensurePublishBatchStateLoaded();
+    const hasActivePublish = Object.values(publishSessions || {}).some((session) => session.isPublishing || session.awaitingManualContinue);
+    if (hasActivePublish || isPublishBatchRunning()) {
         return { success: false, error: '请先停止当前发布任务，再执行重置。' };
     }
 
-    const data = await chrome.storage.local.get('resources');
-    const resources = data.resources || [];
-
+    const resources = await getStoredResources();
     let resetCount = 0;
-    let deletedFailedCount = 0;
-    const nextResources = resources.reduce((list, resource) => {
-        if (resource.status === 'pending' && !resource.publishedAt && !resource.publishMeta) {
-            list.push(resource);
-            return list;
-        }
+    let clearedHistoryCount = 0;
+    const nextResources = resources.map((resource) => {
+        const historyCount = Object.keys(resource.publishHistory || {}).length;
+        const needsReset =
+            resource.status !== 'pending'
+            || !!resource.publishedAt
+            || !!resource.publishMeta
+            || historyCount > 0;
 
-        if (resource.status === 'failed') {
-            deletedFailedCount++;
-            return list;
+        if (!needsReset) {
+            return resource;
         }
 
         resetCount++;
+        clearedHistoryCount += historyCount;
         const nextResource = { ...resource, status: 'pending' };
         delete nextResource.publishedAt;
         delete nextResource.publishMeta;
-        list.push(nextResource);
-        return list;
-    }, []);
-
-    await chrome.storage.local.set({
-        resources: nextResources
+        delete nextResource.publishHistory;
+        return nextResource;
     });
-    await Logger.publish(`已重置当前发布状态，并保留各网站历史记录`, {
+
+    await writeResourcesToStorage(nextResources);
+    await TaskStore.updateTasks((tasks) => tasks.map((task) => {
+        if (getTaskType(task) !== 'publish') {
+            return task;
+        }
+
+        return {
+            ...task,
+            stats: {
+                total: 0,
+                success: 0,
+                skipped: 0,
+                pending: 0,
+                failed: 0
+            }
+        };
+    }));
+
+    publishSessions = createDefaultPublishSessions();
+    publishSessionsLoaded = true;
+    await flushPublishSessions();
+    publishBatchState = createDefaultPublishBatchState();
+    publishBatchLoaded = true;
+    await flushPublishBatchState();
+    broadcastPublishBatchState();
+
+    await Logger.publish(`已将发布资源重置为待发布，并清空历史尝试记录`, {
         resetCount,
-        deletedFailedCount
+        clearedHistoryCount
     });
 
-    return { success: true, count: resetCount, deletedFailedCount };
+    return { success: true, count: resetCount, clearedHistoryCount };
 }
 
 function stopCollect() {
@@ -2493,67 +5148,49 @@ function stopCollect() {
     Logger.collect('手动停止收集');
 }
 
-async function stopPublish() {
-    publishState.isPublishing = false;
-    publishState.stopRequested = true;
-    publishState.awaitingManualContinue = false;
-    publishState.pendingSubmission = null;
-    const currentTabId = publishState.currentTabId;
-    publishState.currentTabId = null;
-
-    if (currentTabId) {
-        try {
-            await chrome.tabs.sendMessage(currentTabId, { action: 'stopPublishSession' });
-        } catch {}
+async function stopPublish(taskId, options = {}) {
+    await ensurePublishSessionsLoaded();
+    await ensurePublishBatchStateLoaded();
+    const batchCurrentTaskId = publishBatchState.currentTaskId || '';
+    const shouldStopBatch = !options.skipBatchStop
+        && isPublishBatchRunning()
+        && (!taskId || !batchCurrentTaskId || batchCurrentTaskId === taskId);
+    if (shouldStopBatch) {
+        await stopPublishBatch({ stopActiveTask: false, message: '已停止批量发布' });
     }
-
-    broadcastToPopup({ action: 'publishDone' });
-    Logger.publish('手动停止发布');
+    const activeTaskIds = taskId
+        ? [taskId]
+        : Object.entries(publishSessions || {})
+            .filter(([, session]) => session.isPublishing || session.awaitingManualContinue)
+            .map(([activeTaskId]) => activeTaskId);
+    for (const taskId of activeTaskIds) {
+        clearPublishWatchdog(taskId);
+        await PublishRuntime.stop(getPublishRuntimeContext(taskId));
+    }
 }
 
-async function continuePublish() {
-    if (!publishState.isPublishing || !publishState.awaitingManualContinue) return;
-    publishState.awaitingManualContinue = false;
-    publishState.currentIndex++;
-    await publishNext();
+async function continuePublish(taskId) {
+    await ensurePublishSessionsLoaded();
+    if (!taskId) return;
+    await PublishRuntime.continue(getPublishRuntimeContext(taskId));
 }
 
 async function republishResource(resourceId, taskId) {
-    const data = await chrome.storage.local.get(['resources', 'publishTasks']);
-    const resources = data.resources || [];
-    const resource = resources.find(r => r.id === resourceId);
-    if (!resource) return;
-
-    await resetResourcePublishState(resourceId, { preserveHistory: true });
-
-    const tasks = data.publishTasks || [];
-    const task = taskId ? tasks.find(t => t.id === taskId) : tasks[0];
-    if (!task) return;
-
-    publishState = {
-        isPublishing: true,
-        currentTask: task,
-        queue: [resource],
-        currentIndex: 0,
-        currentWorkflowId: getPublishWorkflow(task)?.id || WorkflowRegistry.DEFAULT_WORKFLOW_ID,
-        currentTabId: null,
-        currentUrl: resource.url || '',
-        stopRequested: false,
-        awaitingManualContinue: false,
-        pendingSubmission: null
-    };
-    await publishNext();
+    await ensurePublishSessionsLoaded();
+    if (!taskId) return;
+    await PublishRuntime.republish(getPublishRuntimeContext(taskId), resourceId, taskId);
 }
 
 function shouldFocusPublishTab(task, settings = {}) {
     return task?.mode !== 'full-auto' || !!settings.publishDebugMode;
 }
 
-async function focusPublishTab() {
-    if (!publishState.currentTabId) return;
+async function focusPublishTab(taskId) {
+    const session = getPublishSessionState(taskId);
+    if (!session.currentTabId) return;
 
     try {
-        const tab = await chrome.tabs.get(publishState.currentTabId);
+        const tab = await chrome.tabs.get(session.currentTabId);
         await chrome.tabs.update(tab.id, { active: true });
         if (typeof tab.windowId === 'number') {
             await chrome.windows.update(tab.windowId, { focused: true });
@@ -2561,33 +5198,96 @@ async function focusPublishTab() {
     } catch {}
 }
 
-async function openOrReusePublishTab(url, options = {}) {
-    const { active = true } = options;
-    const existingTabId = publishState.currentTabId;
+async function openOrReusePublishTab(taskId, url, options = {}) {
+    const { active = true, preferCommentAnchor = true, commentHash = 'comments' } = options;
+    const session = getPublishSessionState(taskId);
+    const existingTabId = session.currentTabId;
+    const navigateUrl = preferCommentAnchor
+        ? buildPublishViewportUrl(url, { commentHash })
+        : url;
 
     if (existingTabId) {
         try {
             await chrome.tabs.get(existingTabId);
-            await chrome.tabs.update(existingTabId, { url, active });
+            await chrome.tabs.update(existingTabId, { url: navigateUrl, active });
             await waitForTabLoad(existingTabId);
             return { id: existingTabId };
         } catch {
-            publishState.currentTabId = null;
+            updatePublishSessionState(taskId, { currentTabId: null });
         }
     }
 
-    const tab = await chrome.tabs.create({ url, active });
-    publishState.currentTabId = tab.id;
+    const tab = await chrome.tabs.create({ url: navigateUrl, active });
+    updatePublishSessionState(taskId, { currentTabId: tab.id });
     await waitForTabLoad(tab.id);
     return tab;
 }
 
+function buildPublishViewportUrl(url, options = {}) {
+    const rawUrl = String(url || '').trim();
+    if (!rawUrl) return rawUrl;
+
+    try {
+        const parsed = new URL(rawUrl);
+        if (!/^https?:$/i.test(parsed.protocol || '')) {
+            return rawUrl;
+        }
+
+        if (parsed.hash) {
+            return parsed.toString();
+        }
+
+        const commentHash = String(options.commentHash || 'comments').trim().replace(/^#+/, '');
+        if (!commentHash) {
+            return parsed.toString();
+        }
+
+        parsed.hash = commentHash;
+        return parsed.toString();
+    } catch {
+        return rawUrl;
+    }
+}
+
+function shouldPreferCommentViewport(resource = {}, task = {}, workflow = null) {
+    const workflowId = workflow?.id || task?.workflowId || '';
+    const rules = self.ResourceRules;
+    if (!rules) return false;
+
+    if (workflowId === 'blog-comment-backlink') {
+        return !!(
+            rules.resourceLooksLikeArticleComment?.(resource)
+            || rules.resourceHasInlineSubmitForm?.(resource)
+            || (
+                rules.resourceLooksLikeComment?.(resource)
+                && (
+                    rules.resourceSupportsWebsiteField?.(resource)
+                    || rules.resourceSupportsInlineCommentLink?.(resource)
+                )
+            )
+        );
+    }
+
+    return !!(
+        rules.resourceLooksLikeArticleComment?.(resource)
+        || rules.resourceHasInlineSubmitForm?.(resource)
+    );
+}
+
 async function sendPublishToTab(tabId, resource, task, workflow, settings, overrides = {}) {
     const domainPolicy = await getDomainPublishPolicy(resource?.url || '');
+    const templateHint = await self.PublishMemory?.getTemplateHint?.(resource?.url || '');
+    const shouldOmitWebsiteField = !!domainPolicy.omitWebsiteField || !!templateHint?.avoidWebsiteField;
     const websiteValue = Object.prototype.hasOwnProperty.call(overrides, 'website')
         ? overrides.website
-        : (domainPolicy.omitWebsiteField ? '' : (task.website || ''));
-    const scriptFiles = workflow?.scripts?.length ? workflow.scripts : ['content/comment-publisher.js'];
+        : (shouldOmitWebsiteField ? '' : (task.website || settings.website || ''));
+    const workflowScriptFiles = workflow?.scripts?.length ? [...workflow.scripts] : [
+        'content/comment-standard-flow.js',
+        'content/comment-executor.js',
+        'content/comment-preflight.js',
+        'content/comment-publisher.js'
+    ];
+    const scriptFiles = ensurePublishContentScripts(workflowScriptFiles);
     const styleFiles = workflow?.styles?.length ? workflow.styles : ['content/comment-publisher.css'];
 
     await chrome.scripting.executeScript({
@@ -2604,13 +5304,13 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
     await chrome.tabs.sendMessage(tabId, {
         action: 'fillComment',
         data: {
-            name: task.name_commenter || task.name || '',
-            email: task.email || '',
+            name: task.name_commenter || settings.name || task.name || '',
+            email: task.email || settings.email || '',
             website: websiteValue,
             mode: task.mode || 'semi-auto',
             resourceId: resource.id,
             taskId: task.id,
-            useAI: true,
+            useAI: workflow?.defaults?.useAI !== false,
             pageTitle: resource.pageTitle || '',
             debugMode: !!settings.publishDebugMode,
             workflow,
@@ -2623,18 +5323,49 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
                 url: resource.url,
                 pageTitle: resource.pageTitle || '',
                 linkMethod: resource.linkMethod || '',
+                linkModes: resource.linkModes || [],
                 opportunities: resource.opportunities || [],
                 details: resource.details || []
-            }
+            },
+            siteTemplate: templateHint || null
         }
+    });
+
+    schedulePublishWatchdog(task.id, {
+        stage: 'dispatch',
+        resourceId: resource.id,
+        currentUrl: resource.url
     });
 }
 
-async function finalizePendingSubmissionFromNavigation(tabId) {
-    const pending = publishState.pendingSubmission;
+function ensurePublishContentScripts(scriptFiles = []) {
+    const nextFiles = Array.isArray(scriptFiles) ? [...scriptFiles] : [];
+    if (!nextFiles.includes('content/comment-publisher.js')) {
+        return nextFiles;
+    }
+
+    const requiredFiles = [
+        'content/comment-standard-flow.js',
+        'content/comment-executor.js',
+        'content/comment-preflight.js'
+    ];
+
+    for (const file of requiredFiles.reverse()) {
+        if (!nextFiles.includes(file)) {
+            nextFiles.unshift(file);
+        }
+    }
+
+    return nextFiles;
+}
+
+async function finalizePendingSubmissionFromNavigation(taskId, tabId) {
+    await ensurePublishSessionsLoaded();
+    const pending = getPublishSessionState(taskId).pendingSubmission;
     if (!pending || pending.tabId !== tabId) return;
 
-    publishState.pendingSubmission = null;
+    clearPublishWatchdog(taskId);
+    updatePublishSessionState(taskId, { pendingSubmission: null });
     await handleCommentAction(
         pending.resourceId,
         'submitted',
@@ -2667,13 +5398,43 @@ async function verifyPublishedAnchor(tabId, options = {}) {
                         .replace(/^https?:\/\//, '')
                         .replace(/^www\./, '')
                         .replace(/\/+$/, '');
+                    const getCommentBlockSelector = () => 'li, article, .comment, .comment-body, .commentlist li, .comment-content, .comment_container, .comments-area article, .comments-area li';
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect?.();
+                        return !!rect && rect.width > 0 && rect.height > 0;
+                    };
+                    const buildCommentPreviewTokens = (value) => {
+                        const normalized = normalizeText(value || '');
+                        if (!normalized) return [];
+                        const tokens = normalized
+                            .split(/[.!?。！？]/)
+                            .map((item) => item.trim())
+                            .filter((item) => item.length >= 18)
+                            .map((item) => item.slice(0, 120));
+                        if (tokens.length > 0) {
+                            return Array.from(new Set(tokens)).slice(0, 3);
+                        }
+                        return [normalized.slice(0, 120)].filter(Boolean);
+                    };
+                    const clearReviewMarkers = () => {
+                        document.querySelectorAll('[data-bla-review-target="1"]').forEach((node) => {
+                            node.removeAttribute('data-bla-review-target');
+                            node.style.outline = '';
+                            node.style.outlineOffset = '';
+                            node.style.backgroundColor = '';
+                            node.style.scrollMarginTop = '';
+                        });
+                    };
 
                     const targetUrl = normalizeUrl(payload.anchorUrl || '');
                     const anchorText = normalizeText(payload.anchorText || '');
                     const commenterName = normalizeText(payload.commenterName || '');
+                    const commentPreviewTokens = buildCommentPreviewTokens(payload.commentPreview || '');
                     const pageTextRaw = String(document.body?.innerText || '').trim();
                     const pageText = normalizeText(pageTextRaw);
                     const pageUrl = String(window.location.href || '');
+                    const pageUrlLower = pageUrl.toLowerCase();
                     const pagePath = String(window.location.pathname || '').toLowerCase();
 
                     const anchors = Array.from(document.querySelectorAll('a[href]'));
@@ -2685,14 +5446,95 @@ async function verifyPublishedAnchor(tabId, options = {}) {
                         return hrefMatches && textMatches;
                     });
 
-                    const relatedAnchor = matchingAnchors.find((anchor) => {
-                        if (!commenterName) return true;
-                        const block = anchor.closest('li, article, .comment, .comment-body, .commentlist li, .comment-content, .comment_container, .comments-area');
-                        return normalizeText(block?.textContent || '').includes(commenterName);
-                    }) || matchingAnchors[0] || null;
+                    const relatedAnchor = commenterName
+                        ? (matchingAnchors.find((anchor) => {
+                            const block = anchor.closest(getCommentBlockSelector());
+                            return normalizeText(block?.textContent || '').includes(commenterName);
+                        }) || null)
+                        : (matchingAnchors[0] || null);
+                    const commentBlocks = Array.from(document.querySelectorAll(getCommentBlockSelector()))
+                        .filter((block) => isVisible(block))
+                        .filter((block, index, list) => list.indexOf(block) === index);
+                    const anchorBlock = relatedAnchor?.closest(getCommentBlockSelector()) || null;
+                    const scoredBlocks = commentBlocks
+                        .map((block) => {
+                            const text = normalizeText(block.textContent || '');
+                            let score = 0;
+                            if (!text) return { block, score: 0, excerpt: '' };
+                            if (anchorBlock && block === anchorBlock) score += 10;
+                            if (commenterName && text.includes(commenterName)) score += 5;
+                            if (commentPreviewTokens.some((token) => token && text.includes(token))) score += 6;
+                            if (targetUrl) {
+                                const localAnchors = Array.from(block.querySelectorAll('a[href]'));
+                                if (localAnchors.some((anchor) => {
+                                    const href = normalizeUrl(anchor.getAttribute('href') || anchor.href || '');
+                                    return href && (href === targetUrl || href.includes(targetUrl) || targetUrl.includes(href));
+                                })) {
+                                    score += 4;
+                                }
+                            }
+                            return {
+                                block,
+                                score,
+                                excerpt: String(block.textContent || '').trim().slice(0, 220)
+                            };
+                        })
+                        .sort((left, right) => right.score - left.score);
+                    const locatedBlock = anchorBlock || scoredBlocks.find((entry) => entry.score >= 6)?.block || null;
+                    const locationMethod = anchorBlock
+                        ? 'anchor-block'
+                        : (locatedBlock ? 'comment-block' : '');
+                    if (locatedBlock) {
+                        clearReviewMarkers();
+                        locatedBlock.setAttribute('data-bla-review-target', '1');
+                        locatedBlock.style.outline = '3px solid #14d39a';
+                        locatedBlock.style.outlineOffset = '6px';
+                        locatedBlock.style.backgroundColor = 'rgba(20, 211, 154, 0.08)';
+                        locatedBlock.style.scrollMarginTop = '120px';
+                        try {
+                            locatedBlock.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        } catch {}
+                    }
                     const websiteFieldBlockedFirstComment =
                         pageText.includes('not permitted to submit a website address')
                         && pageText.includes('delete the website in the website field');
+                    const reviewPendingPatterns = [
+                        {
+                            reason: 'moderated',
+                            test: () => pageUrlLower.includes('unapproved=')
+                                && pageUrlLower.includes('moderation-hash=')
+                        },
+                        {
+                            reason: 'moderated',
+                            test: () => pageText.includes('your comment is awaiting moderation')
+                                || pageText.includes('comment is awaiting moderation')
+                                || pageText.includes('held for moderation')
+                        },
+                        {
+                            reason: 'moderated',
+                            test: () => pageText.includes('awaiting approval')
+                                || pageText.includes('pending approval')
+                                || pageText.includes('pending moderation')
+                        },
+                        {
+                            reason: 'moderated',
+                            test: () => pageText.includes('评论正在等待审核')
+                                || pageText.includes('评论正在审核')
+                                || pageText.includes('审核后显示')
+                                || pageText.includes('留言正在审核')
+                        },
+                        {
+                            reason: 'moderated',
+                            test: () => pageText.includes('votre commentaire est en attente de moderation')
+                                || pageText.includes('votre commentaire est en attente de modération')
+                                || pageText.includes('en attente de moderation')
+                                || pageText.includes('en attente de modération')
+                                || pageText.includes('sera visible apres validation')
+                                || pageText.includes('sera visible après validation')
+                                || pageText.includes('apercu, votre commentaire sera visible apres validation')
+                                || pageText.includes('aperçu, votre commentaire sera visible après validation')
+                        }
+                    ];
                     const submissionBlockedPatterns = [
                         {
                             reason: 'comment_rate_limited',
@@ -2720,9 +5562,17 @@ async function verifyPublishedAnchor(tabId, options = {}) {
                             test: () => pagePath.includes('wp-comments-post.php')
                                 && !websiteFieldBlockedFirstComment
                                 && !relatedAnchor
+                                && !locatedBlock
                         }
                     ];
                     const submissionBlockedMatch = submissionBlockedPatterns.find((pattern) => {
+                        try {
+                            return pattern.test();
+                        } catch {
+                            return false;
+                        }
+                    });
+                    const reviewPendingMatch = reviewPendingPatterns.find((pattern) => {
                         try {
                             return pattern.test();
                         } catch {
@@ -2736,10 +5586,17 @@ async function verifyPublishedAnchor(tabId, options = {}) {
                         anchorText: relatedAnchor ? String(relatedAnchor.textContent || '').trim() : '',
                         anchorHref: relatedAnchor ? String(relatedAnchor.getAttribute('href') || relatedAnchor.href || '') : '',
                         commenterMatched: !!relatedAnchor && !!commenterName,
+                        commentLocated: !!locatedBlock,
+                        commentLocationMethod: locationMethod,
+                        commentExcerpt: locatedBlock ? String(locatedBlock.textContent || '').trim().slice(0, 220) : '',
                         websiteFieldBlockedFirstComment,
+                        reviewPending: !!reviewPendingMatch,
+                        reviewPolicy: reviewPendingMatch?.reason || '',
                         submissionBlocked: !!submissionBlockedMatch,
                         submissionBlockReason: submissionBlockedMatch?.reason || '',
-                        noticeExcerpt: (websiteFieldBlockedFirstComment || submissionBlockedMatch) ? pageTextRaw.slice(0, 280) : '',
+                        noticeExcerpt: (websiteFieldBlockedFirstComment || submissionBlockedMatch || reviewPendingMatch)
+                            ? pageTextRaw.slice(0, 280)
+                            : '',
                         pageUrl
                     };
                 },
@@ -2747,7 +5604,13 @@ async function verifyPublishedAnchor(tabId, options = {}) {
             });
 
             lastResult = results?.[0]?.result || null;
-            if (lastResult?.anchorVisible || lastResult?.websiteFieldBlockedFirstComment || lastResult?.submissionBlocked) {
+            if (
+                lastResult?.anchorVisible
+                || lastResult?.commentLocated
+                || lastResult?.websiteFieldBlockedFirstComment
+                || lastResult?.submissionBlocked
+                || lastResult?.reviewPending
+            ) {
                 return lastResult;
             }
         } catch {}
@@ -2766,8 +5629,8 @@ async function syncToGoogleSheets() {
         if (!settings.googleSheetId) {
             return { success: false, message: 'Google Sheet ID 未配置' };
         }
-        const data = await chrome.storage.local.get('resources');
-        const result = await GoogleSheets.syncResources(settings.googleSheetId, data.resources || []);
+        const resources = await getStoredResources();
+        const result = await GoogleSheets.syncResources(settings.googleSheetId, resources);
         await Logger.info(`Sheets 同步完成: ${result.rows} 条`);
         return { success: true, message: `已同步 ${result.rows} 条资源` };
     } catch (e) {
@@ -2795,6 +5658,12 @@ function normalizeUrlBg(url) {
     } catch { return url.trim().toLowerCase(); }
 }
 
+function normalizeHttpUrlBg(url) {
+    const value = String(url || '').trim();
+    if (!value) return '';
+    return /^https?:\/\//i.test(value) ? value : `https://${value}`;
+}
+
 function normalizeCollectedItems(items = [], urls = [], source = '') {
     const defaultSourceType = inferDefaultSourceType(source);
     const rawItems = Array.isArray(items) && items.length > 0
@@ -2813,9 +5682,18 @@ function normalizeCollectedItems(items = [], urls = [], source = '') {
         const dedupeKey = `${normalizedUrl}@@${sourceType}`;
         if (seen.has(dedupeKey)) continue;
         seen.add(dedupeKey);
+        const sourceTier = SOURCE_TIERS.COMPETITOR_BACKLINK;
         normalized.push({
             url: normalizedUrl,
-            sourceType
+            sourceType,
+            sourceTier,
+            discoveryEdges: [
+                buildDiscoveryEdge(
+                    sourceTier,
+                    'collector-backlink',
+                    `${String(source || '').replace(/^my-/, '')}:${sourceType}`
+                )
+            ]
         });
     }
 
@@ -2917,6 +5795,7 @@ function getAnalysisSeedScore(link = {}) {
     if (sourceSet.has('A')) score += 35;
     if (sourceSet.has('M')) score += 20;
     if (sourceSet.has('W')) score += 15;
+    score += getSourceTierScore(link.sourceTier || '');
     return score;
 }
 
@@ -2925,6 +5804,7 @@ function getAnalysisTargetScore(link = {}) {
     if (link.analysisStage === 'direct-page') score += 40;
     if (link.analysisStage === 'domain-drilldown') score += 25;
     if (link.analysisStage === 'domain-homepage') score -= 10;
+    score += Math.min((link.discoveryEdges || []).length * 2, 10);
     return score;
 }
 
@@ -2935,7 +5815,314 @@ function getDomainBg(url) {
     } catch { return ''; }
 }
 
+function getBestTemplateHostScore(host = '', siteTemplates = {}) {
+    if (!host) return 0;
+
+    let bestScore = 0;
+    for (const template of Object.values(siteTemplates || {})) {
+        if ((template?.host || '') !== host) continue;
+        const score =
+            Number(template.successCount || 0) * 18
+            + Number(template.verifiedCount || 0) * 7
+            - Number(template.failureCount || 0) * 4
+            - Number(template.reviewPendingCount || 0) * 3
+            - Number(template.blockedCount || 0) * 6;
+        if (score > bestScore) bestScore = score;
+    }
+
+    return bestScore;
+}
+
+function getResourcePublishRankingScore(resource = {}, task = {}, siteTemplates = {}) {
+    const basePriority = self.ResourceRules?.getPublishCandidatePriority?.(resource, task) || 0;
+    const resourceClass = self.ResourceRules?.getResourceClass?.(resource) || resource.resourceClass || 'weak';
+    const frictionLevel = self.ResourceRules?.getResourceFrictionLevel?.(resource) || resource.frictionLevel || 'high';
+    const hasWebsiteField = !!self.ResourceRules?.resourceSupportsWebsiteField?.(resource);
+    const hasInlineSubmitForm = !!self.ResourceRules?.resourceHasInlineSubmitForm?.(resource);
+    const hasCaptcha = !!self.ResourceRules?.resourceHasCaptcha?.(resource);
+    const hasUrlField = !!self.ResourceRules?.resourceHasUrlField?.(resource);
+    const directPublishReady = !!self.ResourceRules?.isDirectPublishReady?.(resource);
+    const effectiveTier = getEffectiveResourceSourceTier(resource);
+    const host = getDomainBg(resource.url || '');
+    const templateScore = getBestTemplateHostScore(host, siteTemplates);
+    const publishedSuccessCount = getResourcePublishedSuccessCount(resource);
+    const anchorVerifiedCount = getResourceAnchorVerifiedCount(resource);
+    const discoveryEdgeCount = (resource.discoveryEdges || []).length;
+    const sourceEvidence = resource.sourceEvidence || {};
+    const taskHistoryEntry = getResourcePublishHistoryEntry(resource, getTaskPublishTarget(task));
+    const failureRecovery = taskHistoryEntry?.lastStatus === 'failed'
+        ? getPublishFailureRecoveryPolicy(taskHistoryEntry?.publishMeta || {}, taskHistoryEntry)
+        : null;
+    const blockedPenalty = Number(resource.publishMeta?.submissionBlocked ? 1 : 0)
+        + Number(resource.publishMeta?.websiteFieldBlockedFirstComment ? 1 : 0);
+    const reviewPenalty = Number(resource.publishMeta?.reviewPending ? 1 : 0);
+    const recencyScore = Number(new Date(resource.publishedAt || resource.discoveredAt || 0).getTime() || 0) / 1e11;
+    const classScoreMap = {
+        'blog-comment': 2800,
+        profile: 1900,
+        'inline-comment': 1600,
+        weak: 0
+    };
+    const frictionScoreMap = {
+        low: 3800,
+        medium: 1200,
+        high: -2200
+    };
+
+    let score = basePriority * 1e6;
+    score += getSourceTierScore(effectiveTier) * 1e4;
+    score += publishedSuccessCount * 3500;
+    score += anchorVerifiedCount * 5200;
+    score += Number(classScoreMap[resourceClass] || 0);
+    score += Number(frictionScoreMap[frictionLevel] || 0);
+    if (directPublishReady) score += 2600;
+    if (hasWebsiteField) score += 2400;
+    if (hasUrlField) score += 1100;
+    if (hasInlineSubmitForm) score += 1700;
+    if (hasCaptcha) score -= 2800;
+    score += Math.min(templateScore, 80) * 120;
+    score += Math.min(discoveryEdgeCount, 8) * 90;
+    score += Number(sourceEvidence.commentObserved || 0) * 240;
+    score += Number(sourceEvidence.competitorBacklink || 0) * 120;
+    score -= blockedPenalty * 1800;
+    score -= reviewPenalty * 750;
+    if (failureRecovery?.retryable) {
+        score -= 4200 + Math.min(Number(failureRecovery.failedAttempts || 0), 6) * 1200;
+    } else if (taskHistoryEntry?.lastStatus === 'failed') {
+        score -= 12000;
+    }
+    score += recencyScore;
+
+    return Math.round(score);
+}
+
+function getAutoPublishTaskScore(summary = {}) {
+    let score = Number(summary.topScore || 0);
+    score += Math.min(Number(summary.readyCount || 0), 40) * 800;
+    score += Math.min(Number(summary.verifiedCount || 0), 12) * 1200;
+    score += Math.min(Number(summary.commentObservedCount || 0), 12) * 220;
+    if (summary.commentStyle === 'anchor-html') {
+        score += 1600;
+    } else if (summary.commentStyle === 'anchor-prefer') {
+        score += 900;
+    }
+    return Math.round(score);
+}
+
+function buildDurationSummary(values = []) {
+    const durations = (values || [])
+        .map((value) => Number(value || 0))
+        .filter((value) => Number.isFinite(value) && value > 0)
+        .sort((left, right) => left - right);
+    if (durations.length === 0) {
+        return { count: 0, p50: 0, p90: 0, avg: 0 };
+    }
+
+    const getPercentile = (ratio) => {
+        const index = Math.min(durations.length - 1, Math.max(0, Math.ceil(durations.length * ratio) - 1));
+        return Math.round(durations[index] || 0);
+    };
+
+    const avg = durations.reduce((total, value) => total + value, 0) / durations.length;
+    return {
+        count: durations.length,
+        p50: getPercentile(0.5),
+        p90: getPercentile(0.9),
+        avg: Math.round(avg)
+    };
+}
+
+async function getPublishInsights() {
+    const attempts = await self.PublishMemory?.getPublishAttempts?.() || [];
+    const templates = await self.PublishMemory?.getSiteTemplates?.() || {};
+    const resources = await getStoredResources();
+
+    const standardAttempts = attempts.filter((attempt) => !['anchor-html', 'anchor-prefer'].includes(attempt.commentStyle));
+    const anchorAttempts = attempts.filter((attempt) => ['anchor-html', 'anchor-prefer'].includes(attempt.commentStyle));
+    const commentVerifiedAttempts = attempts.filter((attempt) => attempt.commentFieldVerified);
+    const anchorVisibleAttempts = attempts.filter((attempt) => attempt.anchorVisible);
+    const reviewPendingAttempts = attempts.filter((attempt) => attempt.reviewPending);
+
+    const blockedReasons = Object.entries(attempts.reduce((map, attempt) => {
+        const reason = compactText(attempt.submissionBlockReason || '');
+        if (!reason) return map;
+        map[reason] = Number(map[reason] || 0) + 1;
+        return map;
+    }, {}))
+        .sort((left, right) => right[1] - left[1])
+        .slice(0, 8)
+        .map(([reason, count]) => ({ reason, count }));
+
+    const linkModes = Object.entries(attempts.reduce((map, attempt) => {
+        const mode = compactText(attempt.linkMode || 'unknown');
+        map[mode] = Number(map[mode] || 0) + 1;
+        return map;
+    }, {}))
+        .sort((left, right) => right[1] - left[1])
+        .slice(0, 8)
+        .map(([mode, count]) => ({ mode, count }));
+
+    const sourceTierCounts = Object.entries(resources.reduce((map, resource) => {
+        const tier = getEffectiveResourceSourceTier(resource) || 'unknown';
+        map[tier] = Number(map[tier] || 0) + 1;
+        return map;
+    }, {}))
+        .sort((left, right) => right[1] - left[1])
+        .map(([tier, count]) => ({ tier, count }));
+
+    return {
+        generatedAt: new Date().toISOString(),
+        attempts: {
+            total: attempts.length,
+            published: attempts.filter((attempt) => attempt.status === 'published').length,
+            failed: attempts.filter((attempt) => attempt.status === 'failed').length,
+            skipped: attempts.filter((attempt) => attempt.status === 'skipped').length,
+            pendingReview: reviewPendingAttempts.length
+        },
+        quality: {
+            commentFieldVerifiedRate: attempts.length ? Math.round((commentVerifiedAttempts.length / attempts.length) * 1000) / 10 : 0,
+            anchorVisibleRate: attempts.length ? Math.round((anchorVisibleAttempts.length / attempts.length) * 1000) / 10 : 0,
+            reviewPendingRate: attempts.length ? Math.round((reviewPendingAttempts.length / attempts.length) * 1000) / 10 : 0
+        },
+        speed: {
+            standard: buildDurationSummary(standardAttempts.map((attempt) => attempt.durationMs)),
+            anchor: buildDurationSummary(anchorAttempts.map((attempt) => attempt.durationMs))
+        },
+        resources: {
+            total: resources.length,
+            pending: resources.filter((resource) => resource.status === 'pending').length,
+            published: resources.filter((resource) => resource.status === 'published').length,
+            sourceTiers: sourceTierCounts
+        },
+        templates: {
+            total: Object.keys(templates || {}).length,
+            avoidWebsiteField: Object.values(templates || {}).filter((template) =>
+                Number(template.websiteFieldBlockedCount || 0) >= Number(template.successCount || 0)
+                && Number(template.websiteFieldBlockedCount || 0) > 0
+            ).length
+        },
+        blockers: blockedReasons,
+        linkModes
+    };
+}
+
+function isAutoPublishTask(task = {}) {
+    return getTaskType(task) === 'publish'
+        && task.workflowId === 'blog-comment-backlink'
+        && task.mode === 'full-auto'
+        && !!compactText(task.website || task.anchorUrl || '');
+}
+
+function summarizeAutoPublishTask(task = {}, resources = [], policies = {}, siteTemplates = {}) {
+    if (!isAutoPublishTask(task)) return null;
+
+    const workflow = getPublishWorkflow(task);
+    const readyResources = (resources || [])
+        .filter((resource) =>
+            canPublishResourceForTask(resource, task)
+            && WorkflowRegistry.supportsResource(workflow, resource, task)
+            && !isResourceCoolingDown(resource, policies)
+        )
+        .map((resource) => ({
+            resource,
+            score: getResourcePublishRankingScore(resource, task, siteTemplates)
+        }))
+        .sort((left, right) => right.score - left.score);
+
+    if (readyResources.length === 0) return null;
+
+    const top = readyResources[0];
+    const topResource = top?.resource || {};
+    const topSourceEvidence = topResource.sourceEvidence || {};
+    const summary = {
+        task,
+        readyCount: readyResources.length,
+        topScore: Number(top?.score || 0),
+        topResourceId: topResource.id || '',
+        topResourceUrl: topResource.url || '',
+        verifiedCount: getResourceAnchorVerifiedCount(topResource),
+        commentObservedCount: Number(topSourceEvidence.commentObserved || 0),
+        commentStyle: task.commentStyle || 'standard'
+    };
+    summary.dispatchScore = getAutoPublishTaskScore(summary);
+    return summary;
+}
+
+function scheduleAutoPublishDispatch(reason = 'resource-update', delayMs = 1200) {
+    if (isPublishBatchRunning()) {
+        return;
+    }
+    if (autoPublishDispatchTimer) {
+        clearTimeout(autoPublishDispatchTimer);
+    }
+    autoPublishDispatchTimer = setTimeout(() => {
+        autoPublishDispatchTimer = null;
+        runAutoPublishDispatch({ reason }).catch(async (error) => {
+            await Logger.error(`自动发布调度失败: ${error.message}`, { reason });
+        });
+    }, Math.max(200, Number(delayMs || 0)));
+}
+
+async function runAutoPublishDispatch(options = {}) {
+    if (autoPublishDispatchRunning) {
+        return { success: false, code: 'auto_dispatch_running', message: '自动调度已在执行中。' };
+    }
+
+    autoPublishDispatchRunning = true;
+    try {
+        await ensurePublishSessionsLoaded();
+        await ensurePublishBatchStateLoaded();
+        if (isPublishBatchRunning()) {
+            return { success: false, code: 'publish_batch_busy', message: '批量发布进行中，自动调度暂不接管。' };
+        }
+        const sessionView = getPublishStateView();
+        if (sessionView.isPublishing) {
+            return { success: false, code: 'publish_session_busy', message: '当前已有发布任务在运行。' };
+        }
+
+        const [tasks, resources, policies, siteTemplates] = await Promise.all([
+            TaskStore.getTasks(),
+            getStoredResources(),
+            getAllDomainPublishPolicies(),
+            self.PublishMemory?.getSiteTemplates?.() || {}
+        ]);
+
+        const candidates = (tasks || [])
+            .map((task) => summarizeAutoPublishTask(task, resources, policies, siteTemplates))
+            .filter(Boolean)
+            .sort((left, right) => right.dispatchScore - left.dispatchScore);
+
+        const nextTask = candidates[0];
+        if (!nextTask) {
+            return { success: false, code: 'no_auto_publish_task', message: '当前没有可自动接力的全自动发布任务。' };
+        }
+
+        await Logger.publish('自动调度命中下一条发布任务', {
+            reason: options.reason || '',
+            taskId: nextTask.task.id || '',
+            taskName: nextTask.task.name || nextTask.task.website || '',
+            readyCount: nextTask.readyCount,
+            topResourceUrl: nextTask.topResourceUrl
+        });
+
+        return await startPublish(nextTask.task);
+    } finally {
+        autoPublishDispatchRunning = false;
+    }
+}
+
 async function getSettings() {
+    if (typeof LocalDB !== 'undefined' && typeof LocalDB.getSettings === 'function') {
+        try {
+            if (typeof LocalDB.migrateFromChromeStorage === 'function') {
+                await LocalDB.migrateFromChromeStorage({ clearLegacy: true });
+            }
+            const settings = await LocalDB.getSettings();
+            if (settings && typeof settings === 'object' && Object.keys(settings).length > 0) {
+                return settings;
+            }
+        } catch {}
+    }
     return new Promise((resolve) => {
         chrome.storage.local.get('settings', (data) => {
             resolve(data.settings || {});
@@ -2947,11 +6134,34 @@ async function getDomainPublishPolicy(url) {
     const domain = getDomainBg(url);
     if (!domain) return {};
 
+    if (typeof LocalDB !== 'undefined' && typeof LocalDB.getDomainPublishPolicies === 'function') {
+        try {
+            if (typeof LocalDB.migrateFromChromeStorage === 'function') {
+                await LocalDB.migrateFromChromeStorage({ clearLegacy: true });
+            }
+            const policies = await LocalDB.getDomainPublishPolicies();
+            if (policies && Object.keys(policies).length > 0) {
+                return policies?.[domain] || {};
+            }
+        } catch {}
+    }
+
     const data = await chrome.storage.local.get('domainPublishPolicies');
     return data.domainPublishPolicies?.[domain] || {};
 }
 
 async function getAllDomainPublishPolicies() {
+    if (typeof LocalDB !== 'undefined' && typeof LocalDB.getDomainPublishPolicies === 'function') {
+        try {
+            if (typeof LocalDB.migrateFromChromeStorage === 'function') {
+                await LocalDB.migrateFromChromeStorage({ clearLegacy: true });
+            }
+            const policies = await LocalDB.getDomainPublishPolicies();
+            if (policies && Object.keys(policies).length > 0) {
+                return policies;
+            }
+        } catch {}
+    }
     const data = await chrome.storage.local.get('domainPublishPolicies');
     return data.domainPublishPolicies || {};
 }
@@ -2960,12 +6170,28 @@ async function setDomainPublishPolicy(url, patch = {}) {
     const domain = getDomainBg(url);
     if (!domain) return;
 
-    const data = await chrome.storage.local.get('domainPublishPolicies');
-    const policies = data.domainPublishPolicies || {};
+    let policies = {};
+    if (typeof LocalDB !== 'undefined' && typeof LocalDB.getDomainPublishPolicies === 'function') {
+        try {
+            policies = await LocalDB.getDomainPublishPolicies();
+        } catch {
+            policies = {};
+        }
+    } else {
+        const data = await chrome.storage.local.get('domainPublishPolicies');
+        policies = data.domainPublishPolicies || {};
+    }
     policies[domain] = {
         ...(policies[domain] || {}),
         ...patch
     };
+    if (typeof LocalDB !== 'undefined' && typeof LocalDB.setDomainPublishPolicies === 'function') {
+        try {
+            await LocalDB.setDomainPublishPolicies(policies);
+            await chrome.storage.local.remove('domainPublishPolicies');
+            return;
+        } catch {}
+    }
     await chrome.storage.local.set({ domainPublishPolicies: policies });
 }
 
@@ -2993,8 +6219,9 @@ function isResourceCoolingDown(resource, policies = {}, now = Date.now()) {
     return getDomainCooldownState(policies?.[domain] || {}, now).active;
 }
 
-async function rebalanceCooldownQueue() {
-    if (!publishState.isPublishing || publishState.currentIndex >= publishState.queue.length) {
+async function rebalanceCooldownQueue(taskId) {
+    const session = getPublishSessionState(taskId);
+    if (!session.isPublishing || session.currentIndex >= session.queue.length) {
         return { moved: 0, blocked: false, cooldownUntil: '' };
     }
 
@@ -3003,10 +6230,12 @@ async function rebalanceCooldownQueue() {
     let moved = 0;
     let scanned = 0;
     let earliestCooldownUntil = '';
-    const remaining = publishState.queue.length - publishState.currentIndex;
+    const queue = [...session.queue];
+    const currentIndex = session.currentIndex;
+    const remaining = queue.length - currentIndex;
 
-    while (publishState.currentIndex < publishState.queue.length && scanned < remaining) {
-        const resource = publishState.queue[publishState.currentIndex];
+    while (currentIndex < queue.length && scanned < remaining) {
+        const resource = queue[currentIndex];
         const domain = getDomainBg(resource?.url || '');
         const policy = policies?.[domain] || {};
         const cooldownState = getDomainCooldownState(policy, now);
@@ -3018,12 +6247,16 @@ async function rebalanceCooldownQueue() {
             earliestCooldownUntil = cooldownState.cooldownUntil;
         }
 
-        const [current] = publishState.queue.splice(publishState.currentIndex, 1);
+        const [current] = queue.splice(currentIndex, 1);
         if (current) {
-            publishState.queue.push(current);
+            queue.push(current);
             moved++;
         }
         scanned++;
+    }
+
+    if (moved > 0) {
+        updatePublishSessionState(taskId, { queue });
     }
 
     return {
@@ -3033,16 +6266,19 @@ async function rebalanceCooldownQueue() {
     };
 }
 
-function moveCurrentResourceToQueueTail() {
-    if (!publishState.queue?.length || publishState.currentIndex >= publishState.queue.length) return;
-    const [current] = publishState.queue.splice(publishState.currentIndex, 1);
+function moveCurrentResourceToQueueTail(taskId) {
+    const session = getPublishSessionState(taskId);
+    if (!session.queue?.length || session.currentIndex >= session.queue.length) return;
+    const queue = [...session.queue];
+    const [current] = queue.splice(session.currentIndex, 1);
     if (current) {
-        publishState.queue.push(current);
+        queue.push(current);
+        updatePublishSessionState(taskId, { queue });
     }
 }
 
 async function persistCollectSnapshot() {
-    await chrome.storage.local.set({
+    await StateStore.saveCollectSnapshot({
         collectState: {
             isCollecting: collectState.isCollecting,
             domain: collectState.domain,
@@ -3054,11 +6290,7 @@ async function persistCollectSnapshot() {
 }
 
 async function getPersistedCollectView() {
-    const data = await chrome.storage.local.get(['collectState', 'collectStats']);
-    return {
-        stats: data.collectStats || collectState.stats,
-        isCollecting: data.collectState?.isCollecting || collectState.isCollecting
-    };
+    return await StateStore.loadCollectView(collectState.stats, collectState.isCollecting);
 }
 
 function broadcastStats() {
@@ -3071,18 +6303,56 @@ function broadcastToPopup(msg) {
 }
 
 function waitForTabLoad(tabId) {
-    return new Promise((resolve) => {
-        function listener(id, changeInfo) {
-            if (id === tabId && changeInfo.status === 'complete') {
-                chrome.tabs.onUpdated.removeListener(listener);
-                resolve();
-            }
-        }
-        chrome.tabs.onUpdated.addListener(listener);
-        setTimeout(() => {
+    return new Promise(async (resolve) => {
+        let settled = false;
+        let intervalId = null;
+        let timeoutId = null;
+        const settle = () => {
+            if (settled) return;
+            settled = true;
+            if (intervalId) clearInterval(intervalId);
+            if (timeoutId) clearTimeout(timeoutId);
             chrome.tabs.onUpdated.removeListener(listener);
             resolve();
-        }, 30000);
+        };
+
+        try {
+            const existingTab = await chrome.tabs.get(tabId);
+            if (existingTab?.status === 'complete') {
+                setTimeout(settle, 350);
+                return;
+            }
+        } catch {}
+
+        async function probeReadyState() {
+            try {
+                const results = await chrome.scripting.executeScript({
+                    target: { tabId },
+                    func: () => ({
+                        readyState: document.readyState,
+                        hasBody: !!document.body,
+                        hasMain: !!document.querySelector('main, article, form, body *')
+                    })
+                });
+                const state = results?.[0]?.result || {};
+                if (state.hasBody && state.hasMain && state.readyState && state.readyState !== 'loading') {
+                    settle();
+                }
+            } catch {}
+        }
+
+        function listener(id, changeInfo) {
+            if (id === tabId && changeInfo.status === 'complete') {
+                setTimeout(settle, 350);
+            }
+        }
+
+        chrome.tabs.onUpdated.addListener(listener);
+        intervalId = setInterval(() => {
+            probeReadyState().catch(() => {});
+        }, 450);
+        probeReadyState().catch(() => {});
+        timeoutId = setTimeout(settle, 25000);
     });
 }
 

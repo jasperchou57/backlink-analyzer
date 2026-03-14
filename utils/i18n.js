@@ -3,7 +3,7 @@
  */
 const TRANSLATIONS = {
     zh: {
-        'tab.collect': '收集', 'tab.publish': '发布', 'tab.resources': '资源库', 'tab.logs': '日志',
+        'tab.collect': '收集', 'tab.publish': '发布', 'tab.publishBacklink': '外链发布', 'tab.marketing': '营销任务', 'tab.resources': '资源库', 'tab.logs': '日志',
         'collect.targetDomain': '目标域名', 'collect.myDomain': '我的域名',
         'collect.domainPlaceholder': '例如 competitor.com',
         'collect.myDomainPlaceholder': '例如 mysite.com',
@@ -20,8 +20,9 @@ const TRANSLATIONS = {
         'collect.processedDomains': '已处理网站',
         'collect.analyzing': '正在分析外链页面...',
         'collect.idle': '等待开始...', 'collect.done': '收集完成',
-        'collect.backlinksFound': '待分析目标', 'collect.analyzed': '已分析页面',
-        'collect.blogResources': '外链机会', 'collect.inQueue': '剩余队列',
+        'collect.waveCaption': '本轮分析波次',
+        'collect.backlinksFound': '本轮待分析', 'collect.analyzed': '本轮已分析',
+        'collect.blogResources': '本轮机会', 'collect.inQueue': '本轮剩余',
         'collect.source': '数据源',
         'collect.domainFrontier': '持续发现域名',
         'collect.domainProfiled': '已建档',
@@ -61,7 +62,7 @@ const TRANSLATIONS = {
         'dialog.submit': 'Submit', 'dialog.skip': 'Skip',
     },
     en: {
-        'tab.collect': 'Collect', 'tab.publish': 'Publish', 'tab.resources': 'Resources', 'tab.logs': 'Logs',
+        'tab.collect': 'Collect', 'tab.publish': 'Publish', 'tab.publishBacklink': 'Backlink Publish', 'tab.marketing': 'Marketing', 'tab.resources': 'Resources', 'tab.logs': 'Logs',
         'collect.targetDomain': 'Target Domain', 'collect.myDomain': 'My Domain',
         'collect.domainPlaceholder': 'e.g. competitor.com',
         'collect.myDomainPlaceholder': 'e.g. mysite.com',
@@ -78,8 +79,9 @@ const TRANSLATIONS = {
         'collect.processedDomains': 'Processed Domains',
         'collect.analyzing': 'Analyzing backlink pages...',
         'collect.idle': 'Waiting to start...', 'collect.done': 'Collection complete',
-        'collect.backlinksFound': 'Targets', 'collect.analyzed': 'Pages Analyzed',
-        'collect.blogResources': 'Link Opportunities', 'collect.inQueue': 'Queue Left',
+        'collect.waveCaption': 'Current analysis wave',
+        'collect.backlinksFound': 'Wave Targets', 'collect.analyzed': 'Wave Analyzed',
+        'collect.blogResources': 'Wave Opportunities', 'collect.inQueue': 'Wave Remaining',
         'collect.source': 'Source',
         'collect.domainFrontier': 'Continuous Domains',
         'collect.domainProfiled': 'Profiled',
