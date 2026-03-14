@@ -15,6 +15,8 @@ let publishStateView = {
         isPaused: true,
         currentTaskId: '',
         queueTaskIds: [],
+        activeTaskIds: [],
+        activeCount: 0,
         totalTasks: 0,
         completedTaskIds: [],
         skippedTaskIds: [],
@@ -698,29 +700,35 @@ async function refreshPublishStats() {
 function updatePublishProgress(msg) {
     if (msg?.taskId) {
         const existing = publishStateView.sessions?.[msg.taskId] || {};
+        const nextSessions = {
+            ...(publishStateView.sessions || {}),
+            [msg.taskId]: {
+                ...existing,
+                isPublishing: !!msg.isPublishing,
+                currentIndex: Math.max(0, Number(msg.current || 1) - 1),
+                total: Number(msg.total || existing.total || 0),
+                currentUrl: msg.currentUrl || existing.currentUrl || '',
+                taskId: msg.taskId,
+                awaitingManualContinue: !!msg.awaitingManualContinue,
+                currentLimitCount: Number(msg.currentLimitCount ?? existing.currentLimitCount ?? 0),
+                targetLimitCount: Number(msg.targetLimitCount ?? existing.targetLimitCount ?? 0),
+                limitType: msg.limitType || existing.limitType || '',
+                sessionPublishedCount: Number(msg.sessionPublishedCount ?? existing.sessionPublishedCount ?? 0),
+                sessionAnchorSuccessCount: Number(msg.sessionAnchorSuccessCount ?? existing.sessionAnchorSuccessCount ?? 0),
+                currentStage: msg.currentStage || existing.currentStage || '',
+                currentStageLabel: msg.currentStageLabel || existing.currentStageLabel || '',
+                currentStageAt: msg.currentStageAt || existing.currentStageAt || ''
+            }
+        };
+        const activeTaskIds = Object.entries(nextSessions)
+            .filter(([, state]) => !!state?.isPublishing || !!state?.awaitingManualContinue)
+            .map(([taskId]) => taskId);
         publishStateView = {
             ...(publishStateView || {}),
-            isPublishing: true,
-            sessions: {
-                ...(publishStateView.sessions || {}),
-                [msg.taskId]: {
-                    ...existing,
-                    isPublishing: !!msg.isPublishing,
-                    currentIndex: Math.max(0, Number(msg.current || 1) - 1),
-                    total: Number(msg.total || existing.total || 0),
-                    currentUrl: msg.currentUrl || existing.currentUrl || '',
-                    taskId: msg.taskId,
-                    awaitingManualContinue: !!msg.awaitingManualContinue,
-                    currentLimitCount: Number(msg.currentLimitCount ?? existing.currentLimitCount ?? 0),
-                    targetLimitCount: Number(msg.targetLimitCount ?? existing.targetLimitCount ?? 0),
-                    limitType: msg.limitType || existing.limitType || '',
-                    sessionPublishedCount: Number(msg.sessionPublishedCount ?? existing.sessionPublishedCount ?? 0),
-                    sessionAnchorSuccessCount: Number(msg.sessionAnchorSuccessCount ?? existing.sessionAnchorSuccessCount ?? 0),
-                    currentStage: msg.currentStage || existing.currentStage || '',
-                    currentStageLabel: msg.currentStageLabel || existing.currentStageLabel || '',
-                    currentStageAt: msg.currentStageAt || existing.currentStageAt || ''
-                }
-            }
+            isPublishing: activeTaskIds.length > 0,
+            activeCount: activeTaskIds.length,
+            activeTaskIds,
+            sessions: nextSessions
         };
     }
     if (currentWorkspace === 'backlink' && currentTab === 'publish') {
@@ -740,6 +748,8 @@ async function refreshPublishState() {
             isPaused: true,
             currentTaskId: '',
             queueTaskIds: [],
+            activeTaskIds: [],
+            activeCount: 0,
             totalTasks: 0,
             completedTaskIds: [],
             skippedTaskIds: [],
@@ -1131,6 +1141,8 @@ async function refreshTasks() {
             isPaused: true,
             currentTaskId: '',
             queueTaskIds: [],
+            activeTaskIds: [],
+            activeCount: 0,
             totalTasks: 0,
             completedTaskIds: [],
             skippedTaskIds: [],
@@ -1287,11 +1299,14 @@ async function refreshTasks() {
             const sessionAttemptCount = sessionState?.total
                 ? Math.min((sessionState.currentIndex || 0) + (isActivePublish ? 1 : 0), sessionState.total)
                 : 0;
+            const taskQueueTotalCount = Math.max(0, Number(publishOverview.directTotal || 0));
+            const taskQueuePendingCount = Math.max(0, Number(publishOverview.direct || 0));
+            const taskQueueProcessedCount = Math.max(0, taskQueueTotalCount - taskQueuePendingCount);
             const sessionStatusText = hasSessionLimit
                 ? `${sessionLimitLabel} ${Number(sessionState?.currentLimitCount || 0)} / ${Number(sessionState?.targetLimitCount || 0)}`
-                : (sessionState?.total ? `${sessionAttemptCount} / ${sessionState.total}` : '未启动');
-            const sessionSecondaryText = hasSessionLimit && sessionState?.total
-                ? `队列进度 ${sessionAttemptCount} / ${sessionState.total}`
+                : (taskQueueTotalCount > 0 ? `待发布进度 ${taskQueueProcessedCount} / ${taskQueueTotalCount}` : (sessionState?.total ? `${sessionAttemptCount} / ${sessionState.total}` : '未启动'));
+            const sessionSecondaryText = hasSessionLimit
+                ? (taskQueueTotalCount > 0 ? `待发布进度 ${taskQueueProcessedCount} / ${taskQueueTotalCount}` : (sessionState?.total ? `当前轮队列 ${sessionAttemptCount} / ${sessionState.total}` : ''))
                 : '';
             const sessionStageText = compactText(sessionState?.currentStageLabel || sessionState?.currentStage || '');
             const publishOverviewHtml = taskType === 'publish'
@@ -1322,7 +1337,7 @@ async function refreshTasks() {
                             <span class="task-overview-bar-value">${publishOverview.direct}</span>
                         </div>
                         <div class="task-overview-bar">
-                            <span class="task-overview-bar-label">🧭 当前任务累计免登录直发 / 队列进度</span>
+                            <span class="task-overview-bar-label">🧭 当前任务累计免登录直发候选</span>
                             <span class="task-overview-bar-value">${publishOverview.directTotal}</span>
                         </div>
                         <div class="task-overview-bar anchor">
@@ -1635,6 +1650,7 @@ function renderWorkflowLibrary(containerId, workspace) {
             : [];
         const batchState = publishStateView.batch || {};
         const queuedBatchTaskIds = Array.isArray(batchState.queueTaskIds) ? batchState.queueTaskIds : [];
+        const activeBatchTaskIds = Array.isArray(batchState.activeTaskIds) ? batchState.activeTaskIds : [];
         const isWorkflowBatchRunning = workspace === 'backlink'
             && !!batchState.isRunning
             && workflowTaskIds.some((taskId) => queuedBatchTaskIds.includes(taskId));
@@ -1644,10 +1660,13 @@ function renderWorkflowLibrary(containerId, workspace) {
             || (batchState.skippedTaskIds || []).includes(taskId)
             || (batchState.failedTaskIds || []).includes(taskId)
         ).length;
+        const workflowActiveCount = workflowTaskIds.filter((taskId) =>
+            activeBatchTaskIds.includes(taskId)
+        ).length;
         const workflowBatchSummary = workspace === 'backlink' && workflowTaskIds.length
             ? `${workflowDoneCount}/${workflowTaskIds.length} · ${isWorkflowBatchRunning
-                ? `执行中 ${escapeHtml(batchState.lastMessage || '')}`
-                : '按当前任务列表顺序逐一执行'}`
+                ? `并发中 ${workflowActiveCount} 个 · ${escapeHtml(batchState.lastMessage || '')}`
+                : '按当前任务批量并发执行'}`
             : '';
         const typeLabel = workflow.id === 'product-promote-campaign'
             ? '宣传'
@@ -1669,7 +1688,7 @@ function renderWorkflowLibrary(containerId, workspace) {
                 ? '另一批任务正在执行中'
                 : (isWorkflowBatchRunning
                     ? '停止当前批量发布'
-                    : '按当前任务顺序批量发布');
+                    : '按当前任务批量并发发布');
 
         return `
             <div class="workflow-card">

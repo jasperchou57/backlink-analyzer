@@ -20,10 +20,13 @@
         let advanceTimer = null;
 
         function normalizeState(nextState = {}) {
+            const activeTaskIds = uniqueIds(nextState.activeTaskIds);
             return {
                 ...taskManager.createDefaultPublishBatchState(),
                 ...(nextState || {}),
                 queueTaskIds: uniqueIds(nextState.queueTaskIds),
+                activeTaskIds,
+                currentTaskId: activeTaskIds[0] || nextState.currentTaskId || '',
                 completedTaskIds: uniqueIds(nextState.completedTaskIds),
                 skippedTaskIds: uniqueIds(nextState.skippedTaskIds),
                 failedTaskIds: uniqueIds(nextState.failedTaskIds)
@@ -126,6 +129,7 @@
                     ...state,
                     isRunning: false,
                     isPaused: true,
+                    activeTaskIds: [],
                     currentTaskId: '',
                     updatedAt: new Date().toISOString(),
                     lastCompletedAt: new Date().toISOString(),
@@ -154,9 +158,11 @@
             const nextSkipped = normalizedOutcome === 'skipped' ? uniqueIds([...removeTaskId(skippedTaskIds), taskId]) : removeTaskId(skippedTaskIds);
             const nextFailed = normalizedOutcome === 'failed' ? uniqueIds([...removeTaskId(failedTaskIds), taskId]) : removeTaskId(failedTaskIds);
             const task = taskMap.get(taskId) || {};
+            const nextActiveTaskIds = removeTaskId(state.activeTaskIds || []);
 
             updateState({
-                currentTaskId: '',
+                activeTaskIds: nextActiveTaskIds,
+                currentTaskId: nextActiveTaskIds[0] || '',
                 completedTaskIds: nextCompleted,
                 skippedTaskIds: nextSkipped,
                 failedTaskIds: nextFailed,
@@ -173,22 +179,46 @@
             }
 
             const sessionView = await config.getPublishStateView();
-            if (sessionView.isPublishing) {
-                return { success: false, code: 'publish_session_busy', message: '当前仍有发布任务在执行中。' };
-            }
-
             const tasks = await taskStore.getTasks();
             const taskMap = new Map((tasks || []).map((task) => [task.id, task]));
-            const currentTaskId = state.currentTaskId || '';
-            if (currentTaskId && !getDoneTaskIds(state).includes(currentTaskId)) {
-                await markTask(currentTaskId, 'completed', '', taskMap);
+            const queueTaskIdSet = new Set(state.queueTaskIds || []);
+            const sessionActiveTaskIds = uniqueIds((sessionView.activeTaskIds || []).filter((taskId) => queueTaskIdSet.has(taskId)));
+            const trackedActiveTaskIds = uniqueIds((state.activeTaskIds || []).filter((taskId) => queueTaskIdSet.has(taskId)));
+
+            for (const taskId of trackedActiveTaskIds) {
+                if (!sessionActiveTaskIds.includes(taskId) && !getDoneTaskIds(state).includes(taskId)) {
+                    await markTask(taskId, 'completed', '', taskMap);
+                }
             }
 
-            const remainingTaskIds = getRemainingTaskIds(state);
+            const activeTaskIds = uniqueIds((await config.getPublishStateView())?.activeTaskIds?.filter((taskId) => queueTaskIdSet.has(taskId)) || []);
+            if (
+                activeTaskIds.join('::') !== (state.activeTaskIds || []).join('::')
+                || (activeTaskIds[0] || '') !== (state.currentTaskId || '')
+            ) {
+                updateState({
+                    activeTaskIds,
+                    currentTaskId: activeTaskIds[0] || '',
+                    lastMessage: activeTaskIds.length > 0
+                        ? `并发执行中 ${activeTaskIds.length} 个发布任务`
+                        : (state.lastMessage || '等待批量发布结果')
+                });
+            }
+
+            const remainingTaskIds = getRemainingTaskIds(state).filter((taskId) => !activeTaskIds.includes(taskId));
             if (remainingTaskIds.length === 0) {
-                return await finalize('批量发布已全部完成');
+                if (activeTaskIds.length === 0) {
+                    return await finalize('批量发布已全部完成');
+                }
+                return {
+                    success: true,
+                    waiting: true,
+                    activeTaskIds,
+                    message: `并发执行中 ${activeTaskIds.length} 个发布任务`
+                };
             }
 
+            const startedTaskIds = [];
             for (const taskId of remainingTaskIds) {
                 const task = taskMap.get(taskId);
                 if (!task || config.getTaskType(task) !== 'publish') {
@@ -196,23 +226,10 @@
                     continue;
                 }
 
-                updateState({
-                    currentTaskId: taskId,
-                    lastMessage: `准备执行 ${task.name || task.website || task.id || '任务'}`
-                });
-
                 const result = await config.startPublish(task, { fromBatch: true, batchReason: reason });
                 if (result?.success) {
-                    updateState({
-                        currentTaskId: taskId,
-                        lastMessage: `正在执行 ${task.name || task.website || task.id || '任务'}`
-                    });
-                    return {
-                        success: true,
-                        started: true,
-                        taskId,
-                        message: result.message || '已启动下一条任务'
-                    };
+                    startedTaskIds.push(taskId);
+                    continue;
                 }
 
                 if (shouldSkipTask(result)) {
@@ -220,22 +237,32 @@
                     continue;
                 }
 
-                if (result?.code === 'publish_session_busy' || result?.code === 'publish_batch_busy') {
-                    updateState({
-                        currentTaskId: taskId,
-                        lastMessage: result?.message || '批量发布等待当前会话空闲'
-                    });
-                    return {
-                        success: false,
-                        code: result?.code || 'publish_session_busy',
-                        message: result?.message || '当前已有发布任务在运行'
-                    };
-                }
-
                 await markTask(taskId, 'failed', result?.message || '启动失败', taskMap);
             }
 
-            return await finalize('批量发布已完成，剩余任务均已跳过或失败');
+            const refreshedSessionView = await config.getPublishStateView();
+            const nextActiveTaskIds = uniqueIds((refreshedSessionView.activeTaskIds || []).filter((taskId) => queueTaskIdSet.has(taskId)));
+            updateState({
+                activeTaskIds: nextActiveTaskIds,
+                currentTaskId: nextActiveTaskIds[0] || '',
+                lastMessage: nextActiveTaskIds.length > 0
+                    ? `并发执行中 ${nextActiveTaskIds.length} 个发布任务`
+                    : (startedTaskIds.length > 0 ? '批量发布已启动，等待任务完成' : state.lastMessage || '')
+            });
+
+            if (getRemainingTaskIds(state).length === 0 && nextActiveTaskIds.length === 0) {
+                return await finalize('批量发布已完成，剩余任务均已跳过或失败');
+            }
+
+            return {
+                success: true,
+                started: startedTaskIds.length > 0,
+                startedTaskIds,
+                activeTaskIds: nextActiveTaskIds,
+                message: nextActiveTaskIds.length > 0
+                    ? `批量并发执行中 ${nextActiveTaskIds.length} 个任务`
+                    : '批量发布没有新的可启动任务'
+            };
         }
 
         async function start(taskIds = []) {
@@ -247,15 +274,6 @@
                     success: false,
                     code: 'publish_batch_running',
                     message: '当前已有批量发布在运行，请先停止后再启动新的批量任务。'
-                };
-            }
-
-            const hasActivePublish = await config.hasActivePublishSession?.();
-            if (hasActivePublish) {
-                return {
-                    success: false,
-                    code: 'publish_session_busy',
-                    message: '当前已有发布任务在运行，请先停止或完成后再启动批量发布。'
                 };
             }
 
@@ -276,6 +294,8 @@
 
             config.clearAutoPublishDispatchTimer?.();
             clearAdvanceTimer();
+            const sessionView = await config.getPublishStateView();
+            const activeTaskIds = uniqueIds((sessionView.activeTaskIds || []).filter((taskId) => queueTaskIds.includes(taskId)));
 
             const now = new Date().toISOString();
             setState({
@@ -283,14 +303,18 @@
                 isRunning: true,
                 isPaused: false,
                 queueTaskIds,
-                currentTaskId: '',
+                activeTaskIds,
+                currentTaskId: activeTaskIds[0] || '',
                 startedAt: now,
                 updatedAt: now,
-                lastMessage: `准备顺序执行 ${queueTaskIds.length} 个发布任务`
+                lastMessage: activeTaskIds.length > 0
+                    ? `准备并发接管 ${queueTaskIds.length} 个发布任务`
+                    : `准备并发执行 ${queueTaskIds.length} 个发布任务`
             });
 
             await logger.publish('启动批量发布', {
                 totalTasks: queueTaskIds.length,
+                activeTaskIds,
                 taskIds: queueTaskIds
             });
 
@@ -302,27 +326,31 @@
             await ensureLoaded();
 
             const wasRunning = isRunning();
-            const activeTaskId = state.currentTaskId || '';
+            const activeTaskIds = uniqueIds(state.activeTaskIds || []);
             const message = options.message || '已停止批量发布';
             updateState({
                 isRunning: false,
                 isPaused: true,
+                activeTaskIds: [],
                 currentTaskId: '',
                 lastMessage: message
             });
 
             clearAdvanceTimer();
 
-            if (options.stopActiveTask !== false && activeTaskId) {
-                await config.stopPublish(activeTaskId, {
-                    skipBatchStop: true,
-                    skipAutoDispatchPause: true
-                });
+            if (options.stopActiveTask !== false && activeTaskIds.length > 0) {
+                for (const activeTaskId of activeTaskIds) {
+                    await config.stopPublish(activeTaskId, {
+                        skipBatchStop: true,
+                        skipAutoDispatchPause: true
+                    });
+                }
             }
 
             if (wasRunning) {
                 await logger.publish(message, {
                     totalTasks: state.queueTaskIds?.length || 0,
+                    activeCount: activeTaskIds.length,
                     completed: state.completedTaskIds?.length || 0,
                     skipped: state.skippedTaskIds?.length || 0,
                     failed: state.failedTaskIds?.length || 0

@@ -2,6 +2,7 @@ const TaskManager = {
     createDefaultPublishState() {
         return {
             isPublishing: false,
+            sessionId: '',
             currentTask: null,
             currentIndex: 0,
             queue: [],
@@ -19,7 +20,10 @@ const TaskManager = {
             currentStage: '',
             currentStageLabel: '',
             currentStageAt: '',
-            resultLock: null
+            resultLock: null,
+            currentLease: null,
+            nextRetryAt: '',
+            waitingReason: ''
         };
     },
 
@@ -32,6 +36,7 @@ const TaskManager = {
             isRunning: false,
             isPaused: true,
             queueTaskIds: [],
+            activeTaskIds: [],
             currentTaskId: '',
             completedTaskIds: [],
             skippedTaskIds: [],
@@ -51,6 +56,7 @@ const TaskManager = {
             currentUrl: state.currentUrl || '',
             taskId: state.currentTask?.id || '',
             taskName: state.currentTask?.name || state.currentTask?.website || '',
+            sessionId: state.sessionId || '',
             stopRequested: !!state.stopRequested,
             awaitingManualContinue: !!state.awaitingManualContinue,
             limitType: state.limitType || 'published',
@@ -60,12 +66,15 @@ const TaskManager = {
             sessionAnchorSuccessCount: Number(state.sessionAnchorSuccessCount || 0),
             currentStage: state.currentStage || '',
             currentStageLabel: state.currentStageLabel || '',
-            currentStageAt: state.currentStageAt || ''
+            currentStageAt: state.currentStageAt || '',
+            nextRetryAt: state.nextRetryAt || '',
+            waitingReason: state.waitingReason || ''
         };
     },
 
     buildPublishBatchView(state = {}) {
         const queueTaskIds = Array.isArray(state.queueTaskIds) ? state.queueTaskIds : [];
+        const activeTaskIds = Array.isArray(state.activeTaskIds) ? state.activeTaskIds : [];
         const completedTaskIds = Array.isArray(state.completedTaskIds) ? state.completedTaskIds : [];
         const skippedTaskIds = Array.isArray(state.skippedTaskIds) ? state.skippedTaskIds : [];
         const failedTaskIds = Array.isArray(state.failedTaskIds) ? state.failedTaskIds : [];
@@ -74,8 +83,10 @@ const TaskManager = {
         return {
             isRunning: !!state.isRunning,
             isPaused: !!state.isPaused,
-            currentTaskId: state.currentTaskId || '',
+            currentTaskId: activeTaskIds[0] || state.currentTaskId || '',
             queueTaskIds,
+            activeTaskIds,
+            activeCount: activeTaskIds.length,
             totalTasks: queueTaskIds.length,
             completedTaskIds,
             skippedTaskIds,
@@ -96,7 +107,7 @@ const TaskManager = {
             return map;
         }, {});
         const activeTaskIds = entries
-            .filter(([, state]) => !!state?.isPublishing || !!state?.awaitingManualContinue)
+            .filter(([, state]) => !!state?.isPublishing || !!state?.awaitingManualContinue || !!state?.pendingSubmission)
             .map(([taskId]) => taskId);
 
         return {

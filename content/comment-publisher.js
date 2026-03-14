@@ -9,6 +9,7 @@
 
     let currentResourceId = null;
     let currentTaskId = null;
+    let currentSessionId = null;
     let currentDebugMode = false;
     let currentDebugInfo = null;
     let publishStopped = false;
@@ -127,13 +128,16 @@
             fillCommentForm(msg.data);
         }
         if (msg.action === 'stopPublishSession') {
+            if (msg.sessionId && currentSessionId && msg.sessionId !== currentSessionId) {
+                return;
+            }
             cancelCurrentPublish();
         }
     });
 
     async function fillCommentForm(data) {
-        const incomingRunKey = `${data?.taskId || ''}:${data?.resourceId || ''}`;
-        const activeRunKey = `${currentTaskId || ''}:${currentResourceId || ''}`;
+        const incomingRunKey = `${data?.taskId || ''}:${data?.sessionId || ''}:${data?.resourceId || ''}`;
+        const activeRunKey = `${currentTaskId || ''}:${currentSessionId || ''}:${currentResourceId || ''}`;
         if (fillCommentInProgress) {
             if (incomingRunKey === activeRunKey) {
                 return;
@@ -145,6 +149,7 @@
         fillCommentInProgress = true;
         currentResourceId = data.resourceId;
         currentTaskId = data.taskId;
+        currentSessionId = data.sessionId || null;
         currentDebugMode = !!data.debugMode;
         currentDebugInfo = { mode: data.mode || 'semi-auto', actions: [] };
         publishStopped = false;
@@ -1228,6 +1233,7 @@
             action: 'commentSubmitting',
             resourceId: currentResourceId,
             taskId: currentTaskId,
+            sessionId: currentSessionId,
             meta: currentPublishMeta || {}
         }).catch(() => {});
 
@@ -1260,6 +1266,7 @@
             action: 'commentAction',
             resourceId: currentResourceId,
             taskId: currentTaskId,
+            sessionId: currentSessionId,
             result,
             meta: { ...(currentPublishMeta || {}), durationMs, ...(extraMeta || {}) }
         });
@@ -1450,6 +1457,7 @@
             action: 'commentProgress',
             resourceId: currentResourceId,
             taskId: currentTaskId,
+            sessionId: currentSessionId,
             stage: normalizedStage,
             stageLabel: normalizedLabel,
             stageTimeoutMs: timeoutMs

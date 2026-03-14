@@ -137,8 +137,11 @@ const PUBLISH_TASK_SCHEMA_VERSION = 2;
 let publishSessions = TaskManager.createDefaultPublishSessions();
 let publishSessionsLoaded = false;
 const publishWatchdogs = new Map();
+const publishRetryTimers = new Map();
 let autoPublishDispatchTimer = null;
 let autoPublishDispatchRunning = false;
+let autoPublishControlState = createDefaultAutoPublishControlState();
+let autoPublishControlLoaded = false;
 let resourceSignalNormalizationTimer = null;
 let resourceSignalNormalizationRunning = false;
 
@@ -313,7 +316,7 @@ function handleWindowRemoved(windowId) {
     if (windowId === panelWindowId) panelWindowId = null;
 }
 
-function handleTabRemoved(tabId) {
+async function handleTabRemoved(tabId) {
     if (tabId === collectTabId) {
         collectTabId = null;
     }
@@ -321,9 +324,16 @@ function handleTabRemoved(tabId) {
         marketingExecutionTabId = null;
     }
     let changed = false;
+    const interruptedTaskIds = [];
     for (const [taskId, session] of Object.entries(publishSessions || {})) {
         if (tabId === session.currentTabId) {
-            publishSessions[taskId] = { ...session, currentTabId: null };
+            clearPublishWatchdog(taskId);
+            clearPublishRetry(taskId);
+            publishSessions[taskId] = {
+                ...TaskManager.createDefaultPublishState(),
+                stopRequested: true
+            };
+            interruptedTaskIds.push(taskId);
             changed = true;
         }
         if (tabId === session.pendingSubmission?.tabId) {
@@ -332,7 +342,16 @@ function handleTabRemoved(tabId) {
         }
     }
     if (changed) {
-        flushPublishSessions().catch(() => {});
+        try {
+            await flushPublishSessions();
+        } catch {}
+    }
+    if (interruptedTaskIds.length > 0) {
+        interruptedTaskIds.forEach((taskId) => {
+            broadcastToPopup({ action: 'publishDone', taskId });
+        });
+        schedulePublishBatchAdvance('publish-tab-closed', 400);
+        scheduleAutoPublishDispatch('publish-tab-closed', 700);
     }
 }
 
@@ -364,8 +383,30 @@ function createDefaultPublishBatchState() {
     return TaskManager.createDefaultPublishBatchState();
 }
 
+function createDefaultAutoPublishControlState() {
+    return {
+        manualFocusTaskId: '',
+        updatedAt: '',
+        reason: ''
+    };
+}
+
 function getPublishStateView() {
     return TaskManager.buildPublishSessionsView(publishSessions, publishBatchRuntime.getState());
+}
+
+function isPublishSessionActive(state = {}) {
+    return !!(
+        state?.isPublishing
+        || state?.awaitingManualContinue
+        || state?.pendingSubmission
+    );
+}
+
+function getActivePublishTaskIds() {
+    return Object.entries(publishSessions || {})
+        .filter(([, state]) => isPublishSessionActive(state))
+        .map(([taskId]) => taskId);
 }
 
 function shouldPersistPublishSession(state = {}) {
@@ -376,6 +417,8 @@ function shouldPersistPublishSession(state = {}) {
         || state?.pendingSubmission
         || state?.currentTabId
         || state?.currentUrl
+        || state?.sessionId
+        || state?.currentLease
         || (Array.isArray(state?.queue) && state.queue.length > 0)
         || state?.currentIndex
     );
@@ -390,8 +433,10 @@ function normalizeInterruptedPublishSession(state = {}) {
         isPublishing: false,
         awaitingManualContinue: false,
         pendingSubmission: null,
-        currentTabId: null,
-        stopRequested: false
+        stopRequested: false,
+        currentLease: null,
+        nextRetryAt: '',
+        waitingReason: ''
     };
 }
 
@@ -471,6 +516,34 @@ async function flushPublishBatchState() {
     await publishBatchRuntime.flush();
 }
 
+async function ensureAutoPublishControlLoaded() {
+    if (autoPublishControlLoaded) return;
+    autoPublishControlState = await StateStore.loadAutoPublishControlState(createDefaultAutoPublishControlState());
+    autoPublishControlLoaded = true;
+}
+
+async function flushAutoPublishControlState() {
+    await ensureAutoPublishControlLoaded();
+    await StateStore.saveAutoPublishControlState(autoPublishControlState);
+}
+
+function getAutoPublishControlState() {
+    return {
+        ...createDefaultAutoPublishControlState(),
+        ...(autoPublishControlState || {})
+    };
+}
+
+async function setManualPublishFocusTask(taskId = '', reason = '') {
+    await ensureAutoPublishControlLoaded();
+    autoPublishControlState = {
+        manualFocusTaskId: compactText(taskId || ''),
+        updatedAt: new Date().toISOString(),
+        reason: compactText(reason || (taskId ? 'manual-start' : 'cleared'))
+    };
+    await flushAutoPublishControlState();
+}
+
 function setPublishBatchState(nextState = {}) {
     publishBatchRuntime.setState(nextState);
 }
@@ -512,11 +585,147 @@ async function advancePublishBatch(reason = 'task-finished') {
 }
 
 async function startPublishBatch(taskIds = []) {
+    await setManualPublishFocusTask('', 'batch-start');
     return await publishBatchRuntime.start(taskIds);
 }
 
 async function stopPublishBatch(options = {}) {
     return await publishBatchRuntime.stop(options);
+}
+
+function clearPublishRetry(taskId) {
+    const timer = publishRetryTimers.get(taskId);
+    if (timer) {
+        clearTimeout(timer);
+        publishRetryTimers.delete(taskId);
+    }
+}
+
+function schedulePublishRetry(taskId, delayMs = 1500, reason = 'lease-blocked') {
+    if (!taskId) return;
+    clearPublishRetry(taskId);
+    const timeoutMs = Math.max(400, Number(delayMs || 0));
+    const timer = setTimeout(async () => {
+        publishRetryTimers.delete(taskId);
+        try {
+            await ensurePublishSessionsLoaded();
+            const session = getPublishSessionState(taskId);
+            if (!session.isPublishing || session.awaitingManualContinue) return;
+            await PublishRuntime.dispatchQueue(getPublishRuntimeContext(taskId));
+        } catch (error) {
+            await Logger.error(`发布重试调度失败: ${error.message}`, {
+                taskId,
+                reason
+            });
+        }
+    }, timeoutMs);
+    publishRetryTimers.set(taskId, timer);
+}
+
+function isPublishSessionMatch(taskId, sessionId = '') {
+    if (!taskId) return false;
+    const session = getPublishSessionState(taskId);
+    if (!sessionId) return true;
+    return compactText(session.sessionId || '') === compactText(sessionId || '');
+}
+
+function getPublishLeaseConflict(taskId, sessionId = '', resource = {}) {
+    const normalizedResourceId = compactText(resource?.id || '');
+    const normalizedDomain = getDomainBg(resource?.url || '');
+    if (!normalizedResourceId && !normalizedDomain) return null;
+
+    for (const [activeTaskId, session] of Object.entries(publishSessions || {})) {
+        if (!isPublishSessionActive(session)) continue;
+        const lease = session?.currentLease || null;
+        if (!lease) continue;
+        const sameSession = activeTaskId === taskId
+            && compactText(lease.sessionId || '') === compactText(sessionId || '');
+        if (sameSession) continue;
+
+        if (normalizedResourceId && compactText(lease.resourceId || '') === normalizedResourceId) {
+            return {
+                type: 'resource',
+                taskId: activeTaskId,
+                resourceId: normalizedResourceId,
+                domain: compactText(lease.domain || normalizedDomain),
+                url: compactText(lease.url || '')
+            };
+        }
+
+        if (normalizedDomain && compactText(lease.domain || '') === normalizedDomain) {
+            return {
+                type: 'domain',
+                taskId: activeTaskId,
+                resourceId: compactText(lease.resourceId || ''),
+                domain: normalizedDomain,
+                url: compactText(lease.url || '')
+            };
+        }
+    }
+
+    return null;
+}
+
+function acquirePublishLease(taskId, resource = {}, options = {}) {
+    if (!taskId || !resource?.id) {
+        return { success: false, code: 'invalid_publish_lease' };
+    }
+
+    const session = getPublishSessionState(taskId);
+    const sessionId = compactText(options.sessionId || session.sessionId || '');
+    const currentLease = session.currentLease || null;
+    if (
+        currentLease
+        && compactText(currentLease.sessionId || '') === sessionId
+        && compactText(currentLease.resourceId || '') === compactText(resource.id || '')
+    ) {
+        return { success: true, lease: currentLease };
+    }
+
+    const conflict = getPublishLeaseConflict(taskId, sessionId, resource);
+    if (conflict) {
+        return { success: false, code: 'publish_lease_conflict', conflict };
+    }
+
+    const lease = {
+        taskId,
+        sessionId,
+        resourceId: compactText(resource.id || ''),
+        url: compactText(resource.url || ''),
+        domain: getDomainBg(resource.url || ''),
+        acquiredAt: new Date().toISOString()
+    };
+
+    updatePublishSessionState(taskId, {
+        currentLease: lease,
+        nextRetryAt: '',
+        waitingReason: ''
+    });
+
+    return { success: true, lease };
+}
+
+function releasePublishLease(taskId, options = {}) {
+    if (!taskId) return false;
+    const session = getPublishSessionState(taskId);
+    const lease = session.currentLease || null;
+    if (!lease) return false;
+
+    const sessionId = compactText(options.sessionId || '');
+    const resourceId = compactText(options.resourceId || '');
+    if (sessionId && compactText(lease.sessionId || '') !== sessionId) {
+        return false;
+    }
+    if (resourceId && compactText(lease.resourceId || '') !== resourceId) {
+        return false;
+    }
+
+    updatePublishSessionState(taskId, {
+        currentLease: null,
+        nextRetryAt: '',
+        waitingReason: ''
+    });
+    return true;
 }
 
 function clearPublishWatchdog(taskId) {
@@ -536,6 +745,7 @@ function schedulePublishWatchdog(taskId, options = {}) {
     const timeoutMs = Number(options.timeoutMs || 0) || (stage === 'submission' ? PUBLISH_WATCHDOG.SUBMISSION_MS : PUBLISH_WATCHDOG.DISPATCH_MS);
     const resourceId = options.resourceId;
     const currentUrl = options.currentUrl || '';
+    const sessionId = compactText(options.sessionId || '');
 
     const timer = setTimeout(async () => {
         publishWatchdogs.delete(taskId);
@@ -545,8 +755,10 @@ function schedulePublishWatchdog(taskId, options = {}) {
             const session = getPublishSessionState(taskId);
             const activeResourceId = session.queue?.[session.currentIndex]?.id || '';
             const pendingResourceId = session.pendingSubmission?.resourceId || '';
+            const activeSessionId = compactText(session.sessionId || '');
 
             if (!session.isPublishing || session.awaitingManualContinue) return;
+            if (sessionId && activeSessionId && sessionId !== activeSessionId) return;
             if (stage === 'dispatch' && activeResourceId !== resourceId) return;
             if (stage === 'submission' && pendingResourceId !== resourceId) return;
 
@@ -564,7 +776,7 @@ function schedulePublishWatchdog(taskId, options = {}) {
                 submissionBlockReason: stage === 'submission'
                     ? 'submit-confirm-timeout'
                     : 'publish-runtime-timeout'
-            });
+            }, sessionId);
         } catch {}
     }, timeoutMs);
 
@@ -827,6 +1039,7 @@ async function handleCommentSubmittingMessage(msg = {}, sender = {}) {
     await ensurePublishSessionsLoaded();
     const taskId = msg.taskId || findPublishSessionTaskIdByCurrentTab(sender.tab?.id) || '';
     if (!taskId) return;
+    if (!isPublishSessionMatch(taskId, msg.sessionId || '')) return;
 
     clearPublishWatchdog(taskId);
     const session = getPublishSessionState(taskId);
@@ -835,6 +1048,7 @@ async function handleCommentSubmittingMessage(msg = {}, sender = {}) {
         pendingSubmission: {
             resourceId: msg.resourceId,
             taskId,
+            sessionId: session.sessionId || '',
             tabId: sender.tab?.id || session.currentTabId || null,
             meta: msg.meta || {},
             createdAt: Date.now()
@@ -843,7 +1057,8 @@ async function handleCommentSubmittingMessage(msg = {}, sender = {}) {
     schedulePublishWatchdog(taskId, {
         stage: 'submission',
         resourceId: msg.resourceId,
-        currentUrl: session.currentUrl
+        currentUrl: session.currentUrl,
+        sessionId: session.sessionId || ''
     });
 }
 
@@ -851,6 +1066,7 @@ async function handleCommentProgressMessage(msg = {}, sender = {}) {
     await ensurePublishSessionsLoaded();
     const taskId = msg.taskId || findPublishSessionTaskIdByCurrentTab(sender.tab?.id) || '';
     if (!taskId) return;
+    if (!isPublishSessionMatch(taskId, msg.sessionId || '')) return;
 
     const session = getPublishSessionState(taskId);
     const activeResourceId = session.queue?.[session.currentIndex]?.id || '';
@@ -876,7 +1092,8 @@ async function handleCommentProgressMessage(msg = {}, sender = {}) {
         stage: 'dispatch',
         resourceId: msg.resourceId || activeResourceId,
         currentUrl: session.currentUrl,
-        timeoutMs
+        timeoutMs,
+        sessionId: session.sessionId || ''
     });
 
     const nextState = getPublishSessionState(taskId);
@@ -908,7 +1125,7 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
         continuePublish: (msg) => continuePublish(msg.taskId),
         openFloatingPanel: () => openPanelWindow(),
         backlinkData: (msg) => handleBacklinkData(msg.source, msg.urls, msg.items || []),
-        commentAction: (msg) => handleCommentAction(msg.resourceId, msg.result, msg.taskId, msg.meta || {}),
+        commentAction: (msg) => handleCommentAction(msg.resourceId, msg.result, msg.taskId, msg.meta || {}, msg.sessionId || ''),
         commentSubmitting: (msg, sender) => handleCommentSubmittingMessage(msg, sender),
         commentProgress: (msg, sender) => handleCommentProgressMessage(msg, sender),
         republish: (msg) => republishResource(msg.resourceId, msg.taskId)
@@ -1764,6 +1981,7 @@ async function clearResourceWorkspace() {
             'publishSessions',
             'publishState',
             'publishBatchState',
+            'autoPublishControlState',
             'continuousDiscoveryState'
         ]);
     } catch {}
@@ -1783,6 +2001,9 @@ async function clearResourceWorkspace() {
         autoPublishDispatchTimer = null;
     }
     autoPublishDispatchRunning = false;
+    for (const taskId of publishRetryTimers.keys()) {
+        clearPublishRetry(taskId);
+    }
     if (resourceSignalNormalizationTimer) {
         clearTimeout(resourceSignalNormalizationTimer);
         resourceSignalNormalizationTimer = null;
@@ -1812,6 +2033,7 @@ async function clearResourceWorkspace() {
     publishSessionsLoaded = true;
     await flushPublishSessions();
     await publishBatchRuntime.reset({ loaded: true });
+    await setManualPublishFocusTask('', 'resource-workspace-cleared');
     domainIntelCache = { frontier: [], profiles: {} };
     domainIntelLoaded = false;
     continuousDiscoveryState = createDefaultContinuousDiscoveryState();
@@ -1834,7 +2056,7 @@ async function clearResourceWorkspace() {
     }));
 
     broadcastStats();
-    broadcastContinuousState();
+    await broadcastContinuousDiscoveryState();
     await Logger.publish('已清空资源池，模板记忆、发布经验、任务配置与设置已保留', {
         clearedResources,
         poolCounts,
@@ -4090,7 +4312,11 @@ async function setTaskAutoDispatchPaused(taskId, paused = true, reason = 'manual
 }
 
 async function deletePublishTask(taskId) {
+    await ensureAutoPublishControlLoaded();
     await TaskStore.removeTask(taskId);
+    if ((getAutoPublishControlState().manualFocusTaskId || '') === taskId) {
+        await setManualPublishFocusTask('', 'task-deleted');
+    }
     try { await chrome.alarms.clear(getNurtureAlarmName(taskId)); } catch {}
     try { await chrome.alarms.clear(getPromotionRefreshAlarmName(taskId)); } catch {}
 }
@@ -4346,7 +4572,11 @@ function getPublishRuntimeContext(taskId) {
         getPublishCandidatePriority: (resource, task) => self.ResourceRules?.getPublishCandidatePriority?.(resource, task) || 0,
         getResourcePublishRankingScore: (resource, task, siteTemplates = {}) => getResourcePublishRankingScore(resource, task, siteTemplates),
         getTaskPublishTarget,
-        rebalanceCooldownQueue: () => rebalanceCooldownQueue(taskId),
+        rebalanceDispatchQueue: () => rebalanceDispatchQueue(taskId),
+        acquirePublishLease: (resource, options = {}) => acquirePublishLease(taskId, resource, options),
+        releasePublishLease: (options = {}) => releasePublishLease(taskId, options),
+        scheduleDispatchRetry: (delayMs = 1500, reason = 'lease-blocked') => schedulePublishRetry(taskId, delayMs, reason),
+        clearDispatchRetry: () => clearPublishRetry(taskId),
         shouldPreferCommentViewport,
         openOrReusePublishTab: (url, options = {}) => openOrReusePublishTab(taskId, url, options),
         sendPublishToTab,
@@ -4370,11 +4600,15 @@ function getPublishRuntimeContext(taskId) {
         updateTaskStats: updateTaskPublishStats,
         syncPublishLog,
         sendStopMessage: async (tabId) => {
-            await chrome.tabs.sendMessage(tabId, { action: 'stopPublishSession' });
+            await chrome.tabs.sendMessage(tabId, {
+                action: 'stopPublishSession',
+                sessionId: getPublishSessionState(taskId).sessionId || ''
+            });
         },
         broadcastDone: () => {
             broadcastToPopup({ action: 'publishDone', taskId });
             schedulePublishBatchAdvance('publish-done', 700);
+            scheduleAutoPublishDispatch('publish-done', 900);
         },
         broadcastProgress: (payload = {}) => {
             broadcastToPopup({
@@ -4389,6 +4623,7 @@ function getPublishRuntimeContext(taskId) {
 async function startPublish(task, options = {}) {
     await ensurePublishSessionsLoaded();
     await ensurePublishBatchStateLoaded();
+    await ensureAutoPublishControlLoaded();
     let runtimeTask = task?.id
         ? await TaskStore.getTask(task.id) || task
         : task;
@@ -4399,24 +4634,6 @@ async function startPublish(task, options = {}) {
             message: '该任务已手动暂停自动接力，请手动点击发布后再恢复。'
         };
     }
-    if (!options.fromBatch && isPublishBatchRunning()) {
-        return {
-            success: false,
-            code: 'publish_batch_busy',
-            message: '当前批量发布进行中，请先停止批量发布后再单独启动任务。'
-        };
-    }
-    const hasOtherActivePublish = Object.entries(publishSessions || {}).some(([activeTaskId, session]) => {
-        if (activeTaskId === runtimeTask?.id) return false;
-        return !!session?.isPublishing || !!session?.awaitingManualContinue || !!session?.pendingSubmission;
-    });
-    if (hasOtherActivePublish) {
-        return {
-            success: false,
-            code: 'publish_session_busy',
-            message: '当前已有其他发布任务在运行，请先停止或完成后再启动新的任务。'
-        };
-    }
     if (!options.autoDispatch && runtimeTask?.id && runtimeTask.autoDispatchPaused) {
         await setTaskAutoDispatchPaused(runtimeTask.id, false);
         runtimeTask = {
@@ -4424,7 +4641,15 @@ async function startPublish(task, options = {}) {
             autoDispatchPaused: false
         };
     }
-    return await PublishRuntime.start(getPublishRuntimeContext(runtimeTask.id), runtimeTask);
+    const startResult = await PublishRuntime.start(getPublishRuntimeContext(runtimeTask.id), runtimeTask, options);
+    if (startResult?.success && runtimeTask?.id) {
+        if (!options.autoDispatch && !options.fromBatch) {
+            await setManualPublishFocusTask(runtimeTask.id, 'manual-start');
+        } else if (options.autoDispatch || options.fromBatch) {
+            await setManualPublishFocusTask('', options.autoDispatch ? 'auto-dispatch' : 'batch-start');
+        }
+    }
+    return startResult;
 }
 
 async function publishNext(taskId) {
@@ -4432,12 +4657,14 @@ async function publishNext(taskId) {
     return await PublishRuntime.dispatchQueue(getPublishRuntimeContext(taskId));
 }
 
-async function handleCommentAction(resourceId, result, taskId, meta = {}) {
+async function handleCommentAction(resourceId, result, taskId, meta = {}, sessionId = '') {
     await ensurePublishSessionsLoaded();
     await ensurePublishBatchStateLoaded();
     const runtimeTaskId = taskId || findPublishSessionTaskIdByResource(resourceId);
     if (!runtimeTaskId) return;
+    if (!isPublishSessionMatch(runtimeTaskId, sessionId || '')) return;
     clearPublishWatchdog(runtimeTaskId);
+    clearPublishRetry(runtimeTaskId);
     const actionResult = await PublishRuntime.handleAction(
         getPublishRuntimeContext(runtimeTaskId),
         resourceId,
@@ -4446,7 +4673,7 @@ async function handleCommentAction(resourceId, result, taskId, meta = {}) {
         meta
     );
     const session = getPublishSessionState(runtimeTaskId);
-    if (!session.isPublishing && !session.awaitingManualContinue && !session.pendingSubmission) {
+    if (!isPublishSessionActive(session)) {
         schedulePublishBatchAdvance('publish-session-idle', 500);
         scheduleAutoPublishDispatch('publish-session-idle', 700);
     }
@@ -4619,23 +4846,27 @@ function stopCollect() {
 async function stopPublish(taskId, options = {}) {
     await ensurePublishSessionsLoaded();
     await ensurePublishBatchStateLoaded();
-    const batchCurrentTaskId = publishBatchRuntime.getState().currentTaskId || '';
     const shouldStopBatch = !options.skipBatchStop
         && isPublishBatchRunning()
-        && (!taskId || !batchCurrentTaskId || batchCurrentTaskId === taskId);
+        && !taskId;
     if (shouldStopBatch) {
         await stopPublishBatch({ stopActiveTask: false, message: '已停止批量发布' });
     }
     const activeTaskIds = taskId
         ? [taskId]
         : Object.entries(publishSessions || {})
-            .filter(([, session]) => session.isPublishing || session.awaitingManualContinue)
+            .filter(([, session]) => isPublishSessionActive(session))
             .map(([activeTaskId]) => activeTaskId);
-    for (const taskId of activeTaskIds) {
-        clearPublishWatchdog(taskId);
-        await PublishRuntime.stop(getPublishRuntimeContext(taskId));
+    for (const activeTaskId of activeTaskIds) {
+        clearPublishWatchdog(activeTaskId);
+        clearPublishRetry(activeTaskId);
+        await PublishRuntime.stop(getPublishRuntimeContext(activeTaskId));
         if (!options.skipAutoDispatchPause) {
-            await setTaskAutoDispatchPaused(taskId, true, options.pauseReason || 'manual-stop');
+            await setTaskAutoDispatchPaused(activeTaskId, true, options.pauseReason || 'manual-stop');
+        }
+        if (taskId && isPublishBatchRunning()) {
+            await publishBatchRuntime.markTask(activeTaskId, 'failed', '已手动停止');
+            schedulePublishBatchAdvance('publish-manual-stop', 300);
         }
     }
 
@@ -4763,6 +4994,7 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
     const domainPolicy = await getDomainPublishPolicy(resource?.url || '');
     const templateHint = await self.PublishMemory?.getTemplateHint?.(resource?.url || '');
     const shouldOmitWebsiteField = !!domainPolicy.omitWebsiteField || !!templateHint?.avoidWebsiteField;
+    const session = getPublishSessionState(task.id);
     const websiteValue = Object.prototype.hasOwnProperty.call(overrides, 'website')
         ? overrides.website
         : (shouldOmitWebsiteField ? '' : (task.website || settings.website || ''));
@@ -4796,6 +5028,7 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
             mode: task.mode || 'semi-auto',
             resourceId: resource.id,
             taskId: task.id,
+            sessionId: session.sessionId || '',
             useAI: workflow?.defaults?.useAI !== false,
             pageTitle: resource.pageTitle || '',
             debugMode: !!settings.publishDebugMode,
@@ -4820,7 +5053,8 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
     schedulePublishWatchdog(task.id, {
         stage: 'dispatch',
         resourceId: resource.id,
-        currentUrl: resource.url
+        currentUrl: resource.url,
+        sessionId: session.sessionId || ''
     });
 }
 
@@ -4860,7 +5094,8 @@ async function finalizePendingSubmissionFromNavigation(taskId, tabId) {
         {
             ...(pending.meta || {}),
             reportedVia: 'navigation-confirm'
-        }
+        },
+        pending.sessionId || ''
     );
 }
 
@@ -5570,13 +5805,14 @@ async function runAutoPublishDispatch(options = {}) {
     try {
         await ensurePublishSessionsLoaded();
         await ensurePublishBatchStateLoaded();
+        await ensureAutoPublishControlLoaded();
         if (isPublishBatchRunning()) {
             return { success: false, code: 'publish_batch_busy', message: '批量发布进行中，自动调度暂不接管。' };
         }
         const sessionView = getPublishStateView();
-        if (sessionView.isPublishing) {
-            return { success: false, code: 'publish_session_busy', message: '当前已有发布任务在运行。' };
-        }
+        const activeTaskIdSet = new Set(sessionView.activeTaskIds || []);
+        const controlState = getAutoPublishControlState();
+        const manualFocusTaskId = controlState.manualFocusTaskId || '';
 
         const [tasks, resources, policies, siteTemplates] = await Promise.all([
             TaskStore.getTasks(),
@@ -5584,26 +5820,70 @@ async function runAutoPublishDispatch(options = {}) {
             getAllDomainPublishPolicies(),
             self.PublishMemory?.getSiteTemplates?.() || {}
         ]);
+        if (
+            manualFocusTaskId
+            && !(tasks || []).some((task) => task?.id === manualFocusTaskId && isAutoPublishTask(task))
+        ) {
+            await setManualPublishFocusTask('', 'focus-task-inactive');
+        }
+        const effectiveManualFocusTaskId = getAutoPublishControlState().manualFocusTaskId || '';
 
         const candidates = (tasks || [])
             .map((task) => summarizeAutoPublishTask(task, resources, policies, siteTemplates))
             .filter(Boolean)
+            .filter((item) => !activeTaskIdSet.has(item.task.id))
+            .filter((item) => !effectiveManualFocusTaskId || options.reason === 'manual-trigger' || item.task.id === effectiveManualFocusTaskId)
             .sort((left, right) => right.dispatchScore - left.dispatchScore);
 
-        const nextTask = candidates[0];
-        if (!nextTask) {
+        if (candidates.length === 0) {
+            if (effectiveManualFocusTaskId && options.reason !== 'manual-trigger') {
+                return {
+                    success: false,
+                    code: 'manual_focus_locked',
+                    message: '当前处于手动单任务模式，不会自动切换到其他发布任务。',
+                    taskId: effectiveManualFocusTaskId
+                };
+            }
             return { success: false, code: 'no_auto_publish_task', message: '当前没有可自动接力的全自动发布任务。' };
         }
 
-        await Logger.publish('自动调度命中下一条发布任务', {
+        await Logger.publish('自动调度开始补齐可发任务', {
             reason: options.reason || '',
-            taskId: nextTask.task.id || '',
-            taskName: nextTask.task.name || nextTask.task.website || '',
-            readyCount: nextTask.readyCount,
-            topResourceUrl: nextTask.topResourceUrl
+            candidateTaskIds: candidates.map((item) => item.task.id || ''),
+            activeTaskIds: [...activeTaskIdSet],
+            manualFocusTaskId: effectiveManualFocusTaskId
         });
 
-        return await startPublish(nextTask.task, { autoDispatch: true });
+        const startedTaskIds = [];
+        const failedResults = [];
+        for (const candidate of candidates) {
+            const result = await startPublish(candidate.task, { autoDispatch: true });
+            if (result?.success) {
+                startedTaskIds.push(candidate.task.id || '');
+                continue;
+            }
+            failedResults.push({
+                taskId: candidate.task.id || '',
+                code: result?.code || '',
+                message: result?.message || ''
+            });
+        }
+
+        if (startedTaskIds.length === 0) {
+            return {
+                success: false,
+                code: failedResults[0]?.code || 'auto_dispatch_noop',
+                message: failedResults[0]?.message || '自动调度没有启动新的发布任务。',
+                failures: failedResults
+            };
+        }
+
+        return {
+            success: true,
+            startedCount: startedTaskIds.length,
+            taskIds: startedTaskIds,
+            failures: failedResults
+        };
     } finally {
         autoPublishDispatchRunning = false;
     }
@@ -5717,10 +5997,18 @@ function isResourceCoolingDown(resource, policies = {}, now = Date.now()) {
     return getDomainCooldownState(policies?.[domain] || {}, now).active;
 }
 
-async function rebalanceCooldownQueue(taskId) {
+async function rebalanceDispatchQueue(taskId) {
     const session = getPublishSessionState(taskId);
     if (!session.isPublishing || session.currentIndex >= session.queue.length) {
-        return { moved: 0, blocked: false, cooldownUntil: '' };
+        return {
+            moved: 0,
+            blocked: false,
+            cooldownUntil: '',
+            cooldownBlockedCount: 0,
+            leaseBlockedCount: 0,
+            retryDelayMs: 0,
+            waitingReason: ''
+        };
     }
 
     const policies = await getAllDomainPublishPolicies();
@@ -5728,6 +6016,8 @@ async function rebalanceCooldownQueue(taskId) {
     let moved = 0;
     let scanned = 0;
     let earliestCooldownUntil = '';
+    let cooldownBlockedCount = 0;
+    let leaseBlockedCount = 0;
     const queue = [...session.queue];
     const currentIndex = session.currentIndex;
     const remaining = queue.length - currentIndex;
@@ -5737,11 +6027,18 @@ async function rebalanceCooldownQueue(taskId) {
         const domain = getDomainBg(resource?.url || '');
         const policy = policies?.[domain] || {};
         const cooldownState = getDomainCooldownState(policy, now);
-        if (!cooldownState.active) {
+        const leaseConflict = getPublishLeaseConflict(taskId, session.sessionId || '', resource);
+        if (!cooldownState.active && !leaseConflict) {
             break;
         }
 
-        if (!earliestCooldownUntil || new Date(cooldownState.cooldownUntil).getTime() < new Date(earliestCooldownUntil).getTime()) {
+        if (cooldownState.active) {
+            cooldownBlockedCount++;
+        }
+        if (leaseConflict) {
+            leaseBlockedCount++;
+        }
+        if (cooldownState.active && (!earliestCooldownUntil || new Date(cooldownState.cooldownUntil).getTime() < new Date(earliestCooldownUntil).getTime())) {
             earliestCooldownUntil = cooldownState.cooldownUntil;
         }
 
@@ -5760,7 +6057,13 @@ async function rebalanceCooldownQueue(taskId) {
     return {
         moved,
         blocked: scanned >= remaining && remaining > 0,
-        cooldownUntil: earliestCooldownUntil
+        cooldownUntil: earliestCooldownUntil,
+        cooldownBlockedCount,
+        leaseBlockedCount,
+        retryDelayMs: leaseBlockedCount > 0 ? 1800 : 0,
+        waitingReason: leaseBlockedCount > 0
+            ? (cooldownBlockedCount > 0 ? 'lease-and-cooldown' : 'lease-blocked')
+            : (cooldownBlockedCount > 0 ? 'cooldown-only' : '')
     };
 }
 

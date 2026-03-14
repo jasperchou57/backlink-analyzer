@@ -278,6 +278,18 @@ const StateStore = {
         await this.set({ publishBatchState: state });
     },
 
+    async loadAutoPublishControlState(defaultState) {
+        const data = await this.get(['autoPublishControlState']);
+        return {
+            ...(defaultState || {}),
+            ...(data.autoPublishControlState || {})
+        };
+    },
+
+    async saveAutoPublishControlState(state) {
+        await this.set({ autoPublishControlState: state });
+    },
+
     async loadCollectView(fallbackStats, fallbackCollecting) {
         const localStore = await ensureLocalDomainIntelStore();
         if (localStore?.getCollectSnapshot) {

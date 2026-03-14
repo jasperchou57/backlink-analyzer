@@ -4,9 +4,17 @@ const PublishRuntime = {
     SUCCESS_REVIEW_DELAY_MS: 4200,
     PENDING_REVIEW_DELAY_MS: 6200,
 
+    createSessionId() {
+        if (globalThis.crypto?.randomUUID) {
+            return globalThis.crypto.randomUUID();
+        }
+        return `publish-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    },
+
     createInitialState(task, queue, workflowId, overrides = {}) {
         return {
             ...TaskManager.createDefaultPublishState(),
+            sessionId: overrides.sessionId || this.createSessionId(),
             currentTask: task || null,
             queue: queue || [],
             currentWorkflowId: workflowId || null,
@@ -27,14 +35,14 @@ const PublishRuntime = {
         };
     },
 
-    async start(ctx, task) {
+    async start(ctx, task, options = {}) {
         const runtimeTask = ctx.buildWorkflowTask(task);
         let startResult = null;
 
         await TaskRunner.run(runtimeTask, {
             handlers: {
                 prepare_queue: async () => {
-                    startResult = await this.prepareQueue(ctx, task);
+                    startResult = await this.prepareQueue(ctx, task, options);
                     return { stop: !startResult?.success };
                 },
                 dispatch_queue: async () => {
@@ -54,7 +62,7 @@ const PublishRuntime = {
         };
     },
 
-    async prepareQueue(ctx, task) {
+    async prepareQueue(ctx, task, options = {}) {
         if (ctx.getState().isPublishing) {
             await ctx.logger.publish('当前任务已有发布会话在运行，请先暂停当前任务后再启动新的任务');
             return {
@@ -78,7 +86,6 @@ const PublishRuntime = {
             resources: pendingReadyBase
         };
         const maxPublishes = Number(task?.maxPublishes) > 0 ? Number(task.maxPublishes) : 0;
-        const limitMetric = this.getPublishLimitMetric(task, TaskManager.createDefaultPublishState());
         const pendingBase = [...(dispatchSelection.resources || [])]
             .map((resource) => ({
                 resource,
@@ -138,32 +145,66 @@ const PublishRuntime = {
             };
         }
 
+        const previousState = ctx.getState();
+        const shouldCarryRunCounts = (
+            !!(options.autoDispatch || options.fromBatch)
+            && previousState?.currentTask?.id === task?.id
+            && !previousState?.stopRequested
+        );
+        const carriedPublishedCount = shouldCarryRunCounts
+            ? Number(previousState.sessionPublishedCount || 0)
+            : 0;
+        const carriedAnchorSuccessCount = shouldCarryRunCounts
+            ? Number(previousState.sessionAnchorSuccessCount || 0)
+            : 0;
+        const carriedLimitMetric = this.getPublishLimitMetric(task, {
+            sessionPublishedCount: carriedPublishedCount,
+            sessionAnchorSuccessCount: carriedAnchorSuccessCount
+        });
+
+        if (
+            shouldCarryRunCounts
+            && maxPublishes > 0
+            && Number(carriedLimitMetric.count || 0) >= maxPublishes
+        ) {
+            return {
+                success: false,
+                code: 'publish_limit_reached',
+                message: carriedLimitMetric.isAnchorLimit
+                    ? `当前连续运行已达到成功锚文本外链上限 ${maxPublishes}`
+                    : `当前连续运行已达到成功发布上限 ${maxPublishes}`
+            };
+        }
+
         ctx.setState(this.createInitialState(
             task,
             pending,
             workflow?.id || ctx.defaultWorkflowId,
             {
-                limitType: limitMetric.isAnchorLimit ? 'anchor-success' : 'published',
-                currentLimitCount: 0,
+                currentTabId: previousState.currentTabId || null,
+                limitType: carriedLimitMetric.isAnchorLimit ? 'anchor-success' : 'published',
+                currentLimitCount: carriedLimitMetric.count,
                 targetLimitCount: maxPublishes > 0 ? maxPublishes : 0,
-                sessionPublishedCount: 0,
-                sessionAnchorSuccessCount: 0
+                sessionPublishedCount: carriedPublishedCount,
+                sessionAnchorSuccessCount: carriedAnchorSuccessCount
             }
         ));
 
-        await ctx.logger.publish(`开始发布: ${task.name || task.website}`, {
+        await ctx.logger.publish(`${shouldCarryRunCounts ? '继续发布' : '开始发布'}: ${task.name || task.website}`, {
             total: pending.length,
             workflowId: workflow?.id || ctx.defaultWorkflowId,
             maxPublishes,
             activePool: dispatchSelection.activePool || 'mixed',
             poolCounts: dispatchSelection.counts,
-            limitType: limitMetric.isAnchorLimit ? 'anchor-success' : 'published',
-            currentLimitCount: 0
+            limitType: carriedLimitMetric.isAnchorLimit ? 'anchor-success' : 'published',
+            currentLimitCount: carriedLimitMetric.count
         });
 
         return {
             success: true,
-            queued: pending.length
+            queued: pending.length,
+            resumed: shouldCarryRunCounts,
+            currentLimitCount: carriedLimitMetric.count
         };
     },
 
@@ -172,6 +213,7 @@ const PublishRuntime = {
         if (!state.isPublishing || state.awaitingManualContinue) return;
 
         if (Number(state.targetLimitCount || 0) > 0 && Number(state.currentLimitCount || 0) >= Number(state.targetLimitCount || 0)) {
+            ctx.releasePublishLease?.({ sessionId: state.sessionId || '' });
             ctx.updateState({ isPublishing: false });
             ctx.broadcastDone();
             await ctx.logger.publish(
@@ -182,24 +224,71 @@ const PublishRuntime = {
             return;
         }
 
-        const cooldownState = await ctx.rebalanceCooldownQueue();
-        if (cooldownState.moved > 0) {
-            await ctx.logger.publish(`已重排 ${cooldownState.moved} 个处于域名冷却中的资源`, {
-                taskId: ctx.getState().currentTask?.id || ''
+        const dispatchState = await ctx.rebalanceDispatchQueue();
+        if (dispatchState.moved > 0) {
+            const movedHints = [];
+            if (dispatchState.cooldownBlockedCount > 0) {
+                movedHints.push(`${dispatchState.cooldownBlockedCount} 个域名冷却`);
+            }
+            if (dispatchState.leaseBlockedCount > 0) {
+                movedHints.push(`${dispatchState.leaseBlockedCount} 个并发锁占用`);
+            }
+            await ctx.logger.publish(`已重排 ${dispatchState.moved} 个暂不可发资源`, {
+                taskId: ctx.getState().currentTask?.id || '',
+                reasons: movedHints
             });
         }
 
-        if (cooldownState.blocked) {
-            ctx.updateState({ isPublishing: false });
+        if (dispatchState.blocked) {
+            const hasLeaseBlock = Number(dispatchState.leaseBlockedCount || 0) > 0;
+            if (hasLeaseBlock) {
+                const retryDelayMs = Number(dispatchState.retryDelayMs || 0) || 1800;
+                ctx.updateState({
+                    currentStage: 'waiting_lease',
+                    currentStageLabel: '等待资源锁释放',
+                    currentStageAt: new Date().toISOString(),
+                    nextRetryAt: new Date(Date.now() + retryDelayMs).toISOString(),
+                    waitingReason: dispatchState.waitingReason || 'lease-blocked'
+                });
+                ctx.broadcastProgress({
+                    currentUrl: ctx.getState().currentUrl,
+                    current: ctx.getState().currentIndex + 1,
+                    total: ctx.getState().queue.length,
+                    taskId: ctx.getState().currentTask?.id,
+                    isPublishing: true,
+                    awaitingManualContinue: !!ctx.getState().awaitingManualContinue,
+                    currentStage: 'waiting_lease',
+                    currentStageLabel: '等待资源锁释放',
+                    currentStageAt: ctx.getState().currentStageAt || '',
+                    currentLimitCount: Number(ctx.getState().currentLimitCount || 0),
+                    targetLimitCount: Number(ctx.getState().targetLimitCount || 0),
+                    limitType: ctx.getState().limitType || '',
+                    sessionPublishedCount: Number(ctx.getState().sessionPublishedCount || 0),
+                    sessionAnchorSuccessCount: Number(ctx.getState().sessionAnchorSuccessCount || 0)
+                });
+                ctx.scheduleDispatchRetry?.(retryDelayMs, dispatchState.waitingReason || 'lease-blocked');
+                return;
+            }
+
+            ctx.releasePublishLease?.({ sessionId: ctx.getState().sessionId || '' });
+            ctx.updateState({
+                isPublishing: false,
+                currentStage: 'cooldown_wait',
+                currentStageLabel: '当前轮剩余资源全部进入域名冷却',
+                currentStageAt: new Date().toISOString(),
+                nextRetryAt: dispatchState.cooldownUntil || '',
+                waitingReason: dispatchState.waitingReason || 'cooldown-only'
+            });
             ctx.broadcastDone();
             await ctx.logger.publish('剩余资源全部处于域名冷却中，已暂停本轮发布', {
                 taskId: ctx.getState().currentTask?.id || '',
-                cooldownUntil: cooldownState.cooldownUntil || ''
+                cooldownUntil: dispatchState.cooldownUntil || ''
             });
             return;
         }
 
         if (ctx.getState().currentIndex >= ctx.getState().queue.length) {
+            ctx.releasePublishLease?.({ sessionId: ctx.getState().sessionId || '' });
             ctx.updateState({ isPublishing: false });
             ctx.broadcastDone();
             await ctx.logger.publish('发布完成');
@@ -220,7 +309,9 @@ const PublishRuntime = {
             currentStage: '',
             currentStageLabel: '',
             currentStageAt: '',
-            resultLock: null
+            resultLock: null,
+            nextRetryAt: '',
+            waitingReason: ''
         });
         ctx.broadcastProgress({
             currentUrl: resource.url,
@@ -239,6 +330,14 @@ const PublishRuntime = {
         });
 
         try {
+            const leaseResult = ctx.acquirePublishLease?.(resource, {
+                sessionId: currentState.sessionId || ''
+            }) || { success: true };
+            if (!leaseResult.success) {
+                ctx.moveCurrentResourceToQueueTail();
+                return await this.dispatchQueue(ctx);
+            }
+
             const preferCommentViewport = !!ctx.shouldPreferCommentViewport?.(resource, task, workflow);
             const tab = await ctx.openOrReusePublishTab(url, {
                 active: shouldFocus,
@@ -248,11 +347,19 @@ const PublishRuntime = {
             await ctx.delay(this.TAB_PRIME_DELAY_MS);
 
             if (!ctx.getState().isPublishing) {
+                ctx.releasePublishLease?.({
+                    sessionId: currentState.sessionId || '',
+                    resourceId: resource.id
+                });
                 return;
             }
 
             await ctx.sendPublishToTab(tab.id, resource, task, workflow, settings);
         } catch (error) {
+            ctx.releasePublishLease?.({
+                sessionId: currentState.sessionId || '',
+                resourceId: resource.id
+            });
             await ctx.logger.error(`发布失败: ${resource.url}`, { error: error.message });
             await ctx.updateResourceStatus(resource.id, 'failed');
             ctx.updateState({ currentIndex: ctx.getState().currentIndex + 1 });
@@ -521,9 +628,16 @@ const PublishRuntime = {
 
         const limitState = ctx.getState();
         if (Number(limitState.targetLimitCount || 0) > 0 && Number(limitState.currentLimitCount || 0) >= Number(limitState.targetLimitCount || 0)) {
+            ctx.releasePublishLease?.({
+                sessionId: ctx.getState().sessionId || '',
+                resourceId
+            });
             ctx.updateState({
                 isPublishing: false,
-                awaitingManualContinue: false
+                awaitingManualContinue: false,
+                resultLock: null,
+                nextRetryAt: '',
+                waitingReason: ''
             });
             ctx.broadcastDone();
             await ctx.logger.publish(
@@ -534,33 +648,41 @@ const PublishRuntime = {
             return;
         }
 
-        if (result === 'submitted' && (status === 'published' || status === 'pending')) {
-            const settings = await ctx.getSettings();
-            const shouldHoldForReview = ctx.getState().currentTask?.mode !== 'full-auto' || !!settings.publishDebugMode;
+        const isSubmittedOutcome = result === 'submitted' && (status === 'published' || status === 'pending');
+        const settings = isSubmittedOutcome ? await ctx.getSettings() : null;
+        const shouldHoldForReview = isSubmittedOutcome
+            ? (ctx.getState().currentTask?.mode !== 'full-auto' || !!settings?.publishDebugMode)
+            : false;
 
-            if (shouldHoldForReview) {
-                await ctx.focusPublishTab();
-                ctx.updateState({ awaitingManualContinue: true });
-                ctx.broadcastProgress({
-                    currentUrl: ctx.getState().currentUrl,
-                    current: ctx.getState().currentIndex + 1,
-                    total: ctx.getState().queue.length,
-                    taskId: ctx.getState().currentTask?.id,
-                    isPublishing: true,
-                    awaitingManualContinue: true,
-                    currentStage: '',
-                    currentStageLabel: '',
-                    currentStageAt: '',
-                    currentLimitCount: Number(ctx.getState().currentLimitCount || 0),
-                    targetLimitCount: Number(ctx.getState().targetLimitCount || 0),
-                    limitType: ctx.getState().limitType || '',
-                    sessionPublishedCount: Number(ctx.getState().sessionPublishedCount || 0),
-                    sessionAnchorSuccessCount: Number(ctx.getState().sessionAnchorSuccessCount || 0)
-                });
-                await ctx.logger.publish('当前资源已提交，等待手动继续到下一个页面');
-                return;
-            }
+        if (shouldHoldForReview) {
+            await ctx.focusPublishTab();
+            ctx.updateState({
+                awaitingManualContinue: true,
+                resultLock: null,
+                nextRetryAt: '',
+                waitingReason: ''
+            });
+            ctx.broadcastProgress({
+                currentUrl: ctx.getState().currentUrl,
+                current: ctx.getState().currentIndex + 1,
+                total: ctx.getState().queue.length,
+                taskId: ctx.getState().currentTask?.id,
+                isPublishing: true,
+                awaitingManualContinue: true,
+                currentStage: '',
+                currentStageLabel: '',
+                currentStageAt: '',
+                currentLimitCount: Number(ctx.getState().currentLimitCount || 0),
+                targetLimitCount: Number(ctx.getState().targetLimitCount || 0),
+                limitType: ctx.getState().limitType || '',
+                sessionPublishedCount: Number(ctx.getState().sessionPublishedCount || 0),
+                sessionAnchorSuccessCount: Number(ctx.getState().sessionAnchorSuccessCount || 0)
+            });
+            await ctx.logger.publish('当前资源已提交，等待手动继续到下一个页面');
+            return;
+        }
 
+        if (isSubmittedOutcome) {
             const reviewDelayMs = status === 'pending'
                 ? this.PENDING_REVIEW_DELAY_MS
                 : this.SUCCESS_REVIEW_DELAY_MS;
@@ -572,13 +694,24 @@ const PublishRuntime = {
             await ctx.delay(reviewDelayMs);
         }
 
+        ctx.releasePublishLease?.({
+            sessionId: ctx.getState().sessionId || '',
+            resourceId
+        });
+
         if (status === 'pending' && publishMeta.cooldownDeferred) {
             ctx.moveCurrentResourceToQueueTail();
-            ctx.updateState({ resultLock: null });
+            ctx.updateState({
+                resultLock: null,
+                nextRetryAt: '',
+                waitingReason: ''
+            });
         } else {
             ctx.updateState({
                 currentIndex: ctx.getState().currentIndex + 1,
-                resultLock: null
+                resultLock: null,
+                nextRetryAt: '',
+                waitingReason: ''
             });
         }
         await this.dispatchQueue(ctx);
@@ -586,8 +719,16 @@ const PublishRuntime = {
 
     async stop(ctx) {
         const currentTabId = ctx.getState().currentTabId;
+        const currentSessionId = ctx.getState().sessionId || '';
+        const currentResourceId = ctx.getState().queue?.[ctx.getState().currentIndex]?.id || '';
+        ctx.releasePublishLease?.({
+            sessionId: currentSessionId,
+            resourceId: currentResourceId
+        });
+        ctx.clearDispatchRetry?.();
         ctx.setState({
             ...TaskManager.createDefaultPublishState(),
+            currentTabId,
             stopRequested: true
         });
 
@@ -604,10 +745,16 @@ const PublishRuntime = {
     async continue(ctx) {
         const state = ctx.getState();
         if (!state.isPublishing || !state.awaitingManualContinue) return;
+        ctx.releasePublishLease?.({
+            sessionId: state.sessionId || '',
+            resourceId: state.queue?.[state.currentIndex]?.id || ''
+        });
         ctx.updateState({
             awaitingManualContinue: false,
             currentIndex: state.currentIndex + 1,
-            resultLock: null
+            resultLock: null,
+            nextRetryAt: '',
+            waitingReason: ''
         });
         await this.dispatchQueue(ctx);
     },
@@ -624,10 +771,15 @@ const PublishRuntime = {
         const task = taskId ? tasks.find((item) => item.id === taskId) : tasks[0];
         if (!task) return;
 
+        const previousState = ctx.getState();
+
         ctx.setState(this.createInitialState(
             task,
             [resource],
-            ctx.getPublishWorkflow(task)?.id || ctx.defaultWorkflowId
+            ctx.getPublishWorkflow(task)?.id || ctx.defaultWorkflowId,
+            {
+                currentTabId: previousState.currentTabId || null
+            }
         ));
         await this.dispatchQueue(ctx);
     }
