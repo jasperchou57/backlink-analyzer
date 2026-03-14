@@ -383,11 +383,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     // === 清空数据 ===
     document.getElementById('btn-clear').addEventListener('click', async () => {
         if (confirm(i18n.t('footer.clearConfirm'))) {
-            await chrome.runtime.sendMessage({ action: 'clearAllData' });
+            const result = await chrome.runtime.sendMessage({ action: 'clearAllData' });
+            if (!result?.success) {
+                alert(result?.error || result?.message || '清空资源池失败');
+                return;
+            }
             updateStats({ backlinksFound: 0, targetsFound: 0, analyzed: 0, blogResources: 0, inQueue: 0 });
             await refreshDomainIntel();
-            resourcePanel?.refresh();
-            refreshPublishStats();
+            await refreshPublishState();
+            await resourcePanel?.refresh();
+            await refreshPublishStats();
+            await refreshTasks();
+            alert(`已清空 ${result.clearedResources || 0} 条资源。\n保留：模板记忆 ${result.preservedTemplates || 0} 条、发布经验 ${result.preservedAttempts || 0} 条、任务配置与设置。`);
         }
     });
 
@@ -866,6 +873,9 @@ function getCurrentHistoryCounts(entry) {
 }
 
 function isPublishCandidateForTaskUi(resource, task = {}) {
+    if (String(resource?.resourcePool || '').trim().toLowerCase() === 'quarantine') {
+        return false;
+    }
     return !!window.ResourceRules?.isPublishCandidateForTask?.(resource, task);
 }
 
@@ -1259,8 +1269,11 @@ async function refreshTasks() {
                         : taskType === 'research'
                             ? '打开调研入口'
                             : '打开发帖入口')
-                : (isActivePublish ? '停止发布' : '开始发布');
+                : (isActivePublish ? '停止发布' : (task.autoDispatchPaused ? '手动启动并恢复自动接力' : '开始发布'));
             const runIcon = taskType !== 'publish' ? '↗' : (isActivePublish ? '■' : '▶');
+            const autoDispatchPausedHint = taskType === 'publish' && task.autoDispatchPaused
+                ? `<div class="task-stats-mini">自动接力已暂停</div>`
+                : '';
             const queueProgressPercent = sessionState?.total
                 ? Math.min(100, Math.round((((sessionState.currentIndex || 0) + (isActivePublish ? 1 : 0)) / sessionState.total) * 100))
                 : 0;
@@ -1466,6 +1479,7 @@ async function refreshTasks() {
                     <div class="task-stats-mini">
                         ✓${stats.success} · ✗${stats.failed} · Σ${stats.total}
                     </div>
+                    ${autoDispatchPausedHint}
                     ${marketingPreview}
                 </div>
                 <div class="task-actions">
@@ -1488,16 +1502,19 @@ async function refreshTasks() {
             card.querySelector('.task-run').addEventListener('click', () => {
                 if (taskType !== 'publish') {
                     chrome.runtime.sendMessage({ action: 'runMarketingTask', task }).then(async (result) => {
-                        if (!result?.success) {
-                            alert(result?.message || '任务启动失败');
-                            return;
-                        }
-                        alert(result?.message || '任务已启动');
+                if (!result?.success) {
+                    alert(result?.message || '任务启动失败');
+                    return;
+                }
+                alert(result?.message || '任务已启动');
                         await refreshMarketingWorkspace();
                         await refreshTasks();
                     });
                 } else if (isActivePublish) {
-                    chrome.runtime.sendMessage({ action: 'stopPublish', taskId: task.id }).then(() => refreshTasks());
+                    chrome.runtime.sendMessage({ action: 'stopPublish', taskId: task.id }).then(async () => {
+                        await refreshPublishState();
+                        await refreshTasks();
+                    });
                 } else {
                     chrome.runtime.sendMessage({ action: 'startPublish', task }).then(async (result) => {
                         if (!result?.success) {

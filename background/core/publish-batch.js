@@ -314,7 +314,10 @@
             clearAdvanceTimer();
 
             if (options.stopActiveTask !== false && activeTaskId) {
-                await config.stopPublish(activeTaskId, { skipBatchStop: true });
+                await config.stopPublish(activeTaskId, {
+                    skipBatchStop: true,
+                    skipAutoDispatchPause: true
+                });
             }
 
             if (wasRunning) {

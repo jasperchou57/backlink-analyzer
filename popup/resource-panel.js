@@ -11,6 +11,11 @@
         disqus: 'Disqus',
         form: '表单'
     };
+    const RESOURCE_POOL_ORDER = {
+        main: 0,
+        legacy: 1,
+        quarantine: 2
+    };
 
     function create(config = {}) {
         const storageHelper = config.storageHelper;
@@ -26,6 +31,11 @@
         let headerSyncTimer = null;
         let listObserver = null;
         let refreshRequestId = 0;
+
+        function getResourcePool(resource = {}) {
+            const normalized = String(resource?.resourcePool || '').trim().toLowerCase();
+            return RESOURCE_POOL_ORDER[normalized] !== undefined ? normalized : 'legacy';
+        }
 
         function updateHeaderCount(countValue = 0) {
             const header = document.querySelector('#panel-resources .panel-header h3');
@@ -113,11 +123,29 @@
             } else {
                 resources = allResources;
             }
+            resources = [...resources].sort((left, right) => {
+                const poolDelta = (RESOURCE_POOL_ORDER[getResourcePool(left)] ?? 9) - (RESOURCE_POOL_ORDER[getResourcePool(right)] ?? 9);
+                if (poolDelta !== 0) return poolDelta;
+                const statusPriority = {
+                    pending: 0,
+                    failed: 1,
+                    skipped: 2,
+                    published: 3
+                };
+                const statusDelta = (statusPriority[left?.status] ?? 9) - (statusPriority[right?.status] ?? 9);
+                if (statusDelta !== 0) return statusDelta;
+                return String(right?.discoveredAt || '').localeCompare(String(left?.discoveredAt || ''));
+            });
 
             if (requestId !== refreshRequestId) return;
             updateHeaderCount(resources.length);
             if (summary) {
-                summary.textContent = `当前筛选 ${resources.length} · 总资源 ${allResources.length}`;
+                const poolCounts = resources.reduce((counts, resource) => {
+                    const pool = getResourcePool(resource);
+                    counts[pool] = Number(counts[pool] || 0) + 1;
+                    return counts;
+                }, { main: 0, legacy: 0, quarantine: 0 });
+                summary.textContent = `当前筛选 ${resources.length} · ${i18n.t('resources.pool.main')} ${poolCounts.main} · ${i18n.t('resources.pool.legacy')} ${poolCounts.legacy} · ${i18n.t('resources.pool.quarantine')} ${poolCounts.quarantine}`;
             }
 
             if (resources.length === 0) {
@@ -151,6 +179,8 @@
                         : `<span class="res-tag scope-domain">域名级</span>`);
 
                 const statusCls = 'status-' + (resource.status || 'pending');
+                const pool = getResourcePool(resource);
+                const poolTag = `<span class="res-tag pool-${pool}" title="${escapeHtml(resource.resourcePoolReason || '')}">${i18n.t('resources.pool.' + pool)}</span>`;
                 const title = resource.pageTitle
                     ? `<div class="res-title" title="${escapeHtml(resource.pageTitle)}">${escapeHtml(resource.pageTitle)}</div>`
                     : '';
@@ -182,6 +212,7 @@
           ${candidateTag}
           ${typeTags}
           <span class="res-tag ${statusCls}">${i18n.t('status.' + (resource.status || 'pending'))}</span>
+          ${poolTag}
           ${historyTag}
           ${anchorTag}
         </div>

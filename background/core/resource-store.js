@@ -125,6 +125,8 @@
                 signalVersion: Number(resource.signalVersion || 0) || undefined,
                 resourceClass: trimStorageText(resource.resourceClass || '', 24),
                 frictionLevel: trimStorageText(resource.frictionLevel || '', 16),
+                resourcePool: trimStorageText(resource.resourcePool || '', 16),
+                resourcePoolReason: trimStorageText(resource.resourcePoolReason || '', 48),
                 directPublishReady: resource.directPublishReady ? true : undefined,
                 hasCaptcha: resource.hasCaptcha ? true : undefined,
                 hasUrlField: resource.hasUrlField ? true : undefined,
@@ -156,6 +158,9 @@
             const historySize = Object.keys(resource.publishHistory || {}).length;
             const recency = new Date(resource.publishedAt || resource.discoveredAt || 0).getTime() || 0;
             let score = recency;
+            if (resource.resourcePool === 'main') score += 2e15;
+            if (resource.resourcePool === 'legacy') score += 8e14;
+            if (resource.resourcePool === 'quarantine') score -= 4e14;
             if (resource.status === 'pending') score += 1e15;
             if (resource.status === 'failed') score += 5e14;
             score += Number(resource.sourceTierScore || 0) * 1e12;
@@ -259,8 +264,8 @@
                 await global.chrome.storage.local.remove('resources');
             } catch {}
             const localStore = await ensureLocalStore();
-            if (localStore?.clearAll) {
-                await localStore.clearAll();
+            if (localStore?.setResources) {
+                await localStore.setResources([]);
             }
         }
 

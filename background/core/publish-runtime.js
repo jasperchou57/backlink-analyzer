@@ -68,12 +68,18 @@ const PublishRuntime = {
         const workflow = ctx.getPublishWorkflow(task);
         const policies = await ctx.getAllDomainPublishPolicies();
         const siteTemplates = await ctx.getSiteTemplates?.() || {};
-        const workflowPending = resources.filter((resource) => ctx.workflowSupportsResource(workflow, resource, task));
-        const pendingAll = resources.filter((resource) => ctx.canPublishResourceForTask(resource, task) && ctx.workflowSupportsResource(workflow, resource, task));
-        const pendingReady = pendingAll.filter((resource) => !ctx.isResourceCoolingDown(resource, policies));
+        const workflowSupported = resources.filter((resource) => ctx.workflowSupportsResource(workflow, resource, task));
+        const workflowPending = workflowSupported.filter((resource) => (ctx.getResourcePool?.(resource) || '') !== 'quarantine');
+        const pendingAll = workflowPending.filter((resource) => ctx.canPublishResourceForTask(resource, task));
+        const pendingReadyBase = pendingAll.filter((resource) => !ctx.isResourceCoolingDown(resource, policies));
+        const dispatchSelection = ctx.selectDispatchResources?.(pendingReadyBase) || {
+            activePool: '',
+            counts: {},
+            resources: pendingReadyBase
+        };
         const maxPublishes = Number(task?.maxPublishes) > 0 ? Number(task.maxPublishes) : 0;
         const limitMetric = this.getPublishLimitMetric(task, TaskManager.createDefaultPublishState());
-        const pendingBase = [...pendingReady]
+        const pendingBase = [...(dispatchSelection.resources || [])]
             .map((resource) => ({
                 resource,
                 priority: Number(ctx.getPublishCandidatePriority(resource, task) || 0),
@@ -96,9 +102,12 @@ const PublishRuntime = {
         if (pending.length === 0) {
             const hasWorkflowPending = workflowPending.length > 0;
             const targetUrl = ctx.getTaskPublishTarget(task).url || task.website || '';
-            const hasOnlyCooldownBlocked = pendingAll.length > 0 && pendingReady.length === 0;
+            const hasOnlyCooldownBlocked = pendingAll.length > 0 && pendingReadyBase.length === 0;
+            const hasOnlyQuarantine = workflowSupported.length > 0 && workflowPending.length === 0;
             const message = hasOnlyCooldownBlocked
                 ? '当前可发资源都处于域名冷却中，请稍后再试。'
+                : hasOnlyQuarantine
+                    ? '当前资源都已进入隔离池，请先重建主池或人工复核旧池资源。'
                 : hasWorkflowPending
                     ? '当前网站之前已经发过这些资源了，没有新的可发资源。'
                     : '当前没有可直接发布的外链页面资源。';
@@ -107,20 +116,24 @@ const PublishRuntime = {
                 workflowId: workflow?.id || ctx.defaultWorkflowId,
                 target: targetUrl,
                 workflowPending: workflowPending.length,
-                cooldownBlocked: pendingAll.length - pendingReady.length
+                cooldownBlocked: pendingAll.length - pendingReadyBase.length,
+                poolCounts: dispatchSelection.counts
             });
 
             return {
                 success: false,
                 code: hasOnlyCooldownBlocked
                     ? 'domain_cooldown_active'
+                    : hasOnlyQuarantine
+                        ? 'resource_pool_quarantined'
                     : hasWorkflowPending
                         ? 'site_history_exhausted'
                         : 'no_pending_resources',
                 message,
                 workflowPending: workflowPending.length,
                 eligiblePending: pendingAll.length,
-                readyPending: pendingReady.length,
+                readyPending: pendingReadyBase.length,
+                poolCounts: dispatchSelection.counts,
                 target: targetUrl
             };
         }
@@ -142,6 +155,8 @@ const PublishRuntime = {
             total: pending.length,
             workflowId: workflow?.id || ctx.defaultWorkflowId,
             maxPublishes,
+            activePool: dispatchSelection.activePool || 'mixed',
+            poolCounts: dispatchSelection.counts,
             limitType: limitMetric.isAnchorLimit ? 'anchor-success' : 'published',
             currentLimitCount: 0
         });

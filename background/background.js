@@ -12,6 +12,7 @@ importScripts(
     'core/state-store.js',
     'core/task-store.js',
     'core/resource-store.js',
+    'core/resource-pools.js',
     'core/runtime-message-router.js',
     'core/publish-memory.js',
     'core/frontier-scheduler.js',
@@ -125,7 +126,12 @@ const PUBLISH_STAGE_WATCHDOG_MS = {
     submitting: 12000
 };
 
-const RESOURCE_SIGNAL_VERSION = 2;
+const RESOURCE_POOLS = self.ResourcePoolUtils?.DEFAULT_POOLS || {
+    MAIN: 'main',
+    LEGACY: 'legacy',
+    QUARANTINE: 'quarantine'
+};
+const RESOURCE_SIGNAL_VERSION = 3;
 const PUBLISH_TASK_SCHEMA_VERSION = 2;
 
 let publishSessions = TaskManager.createDefaultPublishSessions();
@@ -164,6 +170,20 @@ const {
     calculateDomainQualityScore,
     buildDomainProfileFromHtml
 } = domainProfileUtils;
+
+const resourcePoolUtils = self.ResourcePoolUtils.create({
+    resourceRules: self.ResourceRules,
+    getSourceTierScore,
+    getResourcePublishedSuccessCount,
+    getResourceAnchorVerifiedCount
+});
+
+const {
+    apply: applyResourcePool,
+    getResourcePool,
+    countByPool: countResourcesByPool,
+    selectDispatchResources
+} = resourcePoolUtils;
 
 const publishBatchRuntime = self.PublishBatchRuntime.create({
     taskManager: TaskManager,
@@ -928,10 +948,7 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
             await Logger.clear();
             return { success: true };
         },
-        clearAllData: async () => {
-            await resetAllLocalData();
-            return { success: true };
-        },
+        clearAllData: async () => await clearResourceWorkspace(),
         testAiConnection: () => AIEngine.testConnection(),
         getAIUsageStats: async () => ({ success: true, stats: await AIEngine.getUsageStats() }),
         resetAIUsageStats: async () => {
@@ -1711,13 +1728,66 @@ async function runMarketingAutomationLoop() {
     }
 }
 
-async function resetAllLocalData() {
-    await chrome.storage.local.clear();
+function hasActiveResourceWorkspaceJob() {
+    const hasActivePublish = Object.values(publishSessions || {}).some((session) =>
+        session.isPublishing || session.awaitingManualContinue || session.pendingSubmission
+    );
+    const discoveryRunning = !!collectState.isCollecting || (!!continuousDiscoveryState.isRunning && !continuousDiscoveryState.isPaused);
+    return hasActivePublish || isPublishBatchRunning() || discoveryRunning;
+}
+
+async function clearResourceWorkspace() {
+    await ensurePublishSessionsLoaded();
+    await ensurePublishBatchStateLoaded();
+
+    if (hasActiveResourceWorkspaceJob()) {
+        return {
+            success: false,
+            error: '请先停止正在运行的持续发现或发布任务，再清空资源池。'
+        };
+    }
+
+    const existingResources = await getStoredResources();
+    const clearedResources = existingResources.length;
+    const poolCounts = countResourcesByPool(existingResources);
+    const preservedTemplates = Object.keys(await self.PublishMemory?.getSiteTemplates?.() || {}).length;
+    const preservedAttempts = (await self.PublishMemory?.getPublishAttempts?.() || []).length;
+
     await resourceStore.clearAll();
+    try {
+        await chrome.storage.local.remove([
+            'resources',
+            'domainFrontier',
+            'domainProfiles',
+            'collectState',
+            'collectStats',
+            'publishSessions',
+            'publishState',
+            'publishBatchState',
+            'continuousDiscoveryState'
+        ]);
+    } catch {}
+
+    try {
+        await LocalDB?.saveDomainIntel?.([], {});
+    } catch {}
+    try {
+        await LocalDB?.setCollectSnapshot?.(null, null);
+    } catch {}
+    try {
+        await LocalDB?.setPublishSessions?.({});
+    } catch {}
+
     if (autoPublishDispatchTimer) {
         clearTimeout(autoPublishDispatchTimer);
         autoPublishDispatchTimer = null;
     }
+    autoPublishDispatchRunning = false;
+    if (resourceSignalNormalizationTimer) {
+        clearTimeout(resourceSignalNormalizationTimer);
+        resourceSignalNormalizationTimer = null;
+    }
+    resourceSignalNormalizationRunning = false;
     publishBatchRuntime.clearAdvanceTimer();
     collectState = {
         isCollecting: false,
@@ -1737,17 +1807,48 @@ async function resetAllLocalData() {
         recursiveDomainsProcessed: 0,
         sourceRequest: null
     };
+    syncResourceOpportunityStats([]);
     publishSessions = createDefaultPublishSessions();
-    publishSessionsLoaded = false;
-    await publishBatchRuntime.reset({ loaded: false });
+    publishSessionsLoaded = true;
+    await flushPublishSessions();
+    await publishBatchRuntime.reset({ loaded: true });
     domainIntelCache = { frontier: [], profiles: {} };
     domainIntelLoaded = false;
     continuousDiscoveryState = createDefaultContinuousDiscoveryState();
     continuousDiscoveryLoaded = false;
     continuousDiscoveryLoopRunning = false;
-    marketingAutomationState = TaskManager.createDefaultMarketingAutomationState();
-    marketingAutomationLoaded = false;
-    marketingAutomationLoopRunning = false;
+    await TaskStore.updateTasks((tasks) => tasks.map((task) => {
+        if (getTaskType(task) !== 'publish') {
+            return task;
+        }
+        return {
+            ...task,
+            stats: {
+                total: 0,
+                success: 0,
+                skipped: 0,
+                pending: 0,
+                failed: 0
+            }
+        };
+    }));
+
+    broadcastStats();
+    broadcastContinuousState();
+    await Logger.publish('已清空资源池，模板记忆、发布经验、任务配置与设置已保留', {
+        clearedResources,
+        poolCounts,
+        preservedTemplates,
+        preservedAttempts
+    });
+
+    return {
+        success: true,
+        clearedResources,
+        poolCounts,
+        preservedTemplates,
+        preservedAttempts
+    };
 }
 
 // ============================================================
@@ -2433,6 +2534,42 @@ function sanitizeResourceSignals(resource = {}) {
     return nextResource;
 }
 
+function finalizeResourceSignals(resource = {}) {
+    let nextResource = sanitizeResourceSignals(resource);
+    const recomputedClass = self.ResourceRules?.getResourceClass?.({
+        ...nextResource,
+        resourceClass: ''
+    }) || nextResource.resourceClass || '';
+    const recomputedFriction = self.ResourceRules?.getResourceFrictionLevel?.({
+        ...nextResource,
+        frictionLevel: ''
+    }) || nextResource.frictionLevel || '';
+    const recomputedDirectReady = !!self.ResourceRules?.isDirectPublishReady?.(nextResource);
+
+    nextResource = {
+        ...nextResource,
+        resourceClass: recomputedClass,
+        frictionLevel: recomputedFriction,
+        directPublishReady: recomputedDirectReady
+    };
+    nextResource = sanitizeResourceSignals(nextResource);
+    nextResource.sourceTier = getEffectiveResourceSourceTier(nextResource) || nextResource.discoverySourceTier || nextResource.sourceTier || '';
+    nextResource.sourceTierScore = getSourceTierScore(nextResource.sourceTier);
+    nextResource.sourceEvidence = summarizeSourceEvidenceFromEdges(nextResource.discoveryEdges || []);
+    nextResource = applyResourcePool(nextResource);
+    return nextResource;
+}
+
+function countPendingOperationalResources(resources = []) {
+    return (resources || []).filter((resource) =>
+        resource?.status === 'pending' && getResourcePool(resource) !== RESOURCE_POOLS.QUARANTINE
+    ).length;
+}
+
+function syncResourceOpportunityStats(resources = []) {
+    collectState.stats.blogResources = countPendingOperationalResources(resources);
+}
+
 function needsResourceSignalNormalization(resource = {}) {
     return Number(resource?.signalVersion || 0) !== RESOURCE_SIGNAL_VERSION;
 }
@@ -2446,7 +2583,9 @@ function getResourceSignalSnapshot(resource = {}) {
         directPublishReady: !!resource.directPublishReady,
         resourceClass: String(resource.resourceClass || ''),
         frictionLevel: String(resource.frictionLevel || ''),
-        linkMethod: String(resource.linkMethod || '')
+        linkMethod: String(resource.linkMethod || ''),
+        resourcePool: String(resource.resourcePool || ''),
+        resourcePoolReason: String(resource.resourcePoolReason || '')
     });
 }
 
@@ -2465,27 +2604,7 @@ async function normalizeStoredResourceSignals() {
             }
 
             const beforeSnapshot = getResourceSignalSnapshot(resource);
-            let nextResource = sanitizeResourceSignals(resource);
-            const recomputedClass = self.ResourceRules?.getResourceClass?.({
-                ...nextResource,
-                resourceClass: ''
-            }) || nextResource.resourceClass || '';
-            const recomputedFriction = self.ResourceRules?.getResourceFrictionLevel?.({
-                ...nextResource,
-                frictionLevel: ''
-            }) || nextResource.frictionLevel || '';
-            const recomputedDirectReady = !!self.ResourceRules?.isDirectPublishReady?.(nextResource);
-
-            nextResource = {
-                ...nextResource,
-                resourceClass: recomputedClass,
-                frictionLevel: recomputedFriction,
-                directPublishReady: recomputedDirectReady
-            };
-            nextResource = sanitizeResourceSignals(nextResource);
-            if (!nextResource.signalVersion) {
-                nextResource.signalVersion = RESOURCE_SIGNAL_VERSION;
-            }
+            const nextResource = finalizeResourceSignals(resource);
 
             const afterSnapshot = getResourceSignalSnapshot(nextResource);
             if (beforeSnapshot !== afterSnapshot) {
@@ -2499,6 +2618,8 @@ async function normalizeStoredResourceSignals() {
 
         if (changed) {
             await writeResourcesToStorage(nextResources);
+            syncResourceOpportunityStats(nextResources);
+            broadcastStats();
         }
         return changed;
     } finally {
@@ -2562,21 +2683,7 @@ async function saveResource(result) {
                 ? result.directPublishReady
                 : !!existing.directPublishReady
         };
-        nextResource = sanitizeResourceSignals(nextResource);
-        nextResource.resourceClass = self.ResourceRules?.getResourceClass?.({
-            ...nextResource,
-            resourceClass: ''
-        }) || result.resourceClass || existing.resourceClass || '';
-        nextResource.frictionLevel = self.ResourceRules?.getResourceFrictionLevel?.({
-            ...nextResource,
-            frictionLevel: ''
-        }) || result.frictionLevel || existing.frictionLevel || '';
-        nextResource.directPublishReady = !!self.ResourceRules?.isDirectPublishReady?.(nextResource);
-        nextResource = sanitizeResourceSignals(nextResource);
-        nextResource.sourceTier = getEffectiveResourceSourceTier(nextResource) || mergedDiscoverySourceTier;
-        nextResource.sourceTierScore = getSourceTierScore(nextResource.sourceTier);
-        nextResource.sourceEvidence = summarizeSourceEvidenceFromEdges(nextResource.discoveryEdges || []);
-        resources[existingIndex] = nextResource;
+        resources[existingIndex] = finalizeResourceSignals(nextResource);
     } else {
         let nextResource = {
             id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
@@ -2602,25 +2709,11 @@ async function saveResource(result) {
             frictionLevel: result.frictionLevel || '',
             directPublishReady: !!result.directPublishReady
         };
-        nextResource = sanitizeResourceSignals(nextResource);
-        nextResource.resourceClass = self.ResourceRules?.getResourceClass?.({
-            ...nextResource,
-            resourceClass: ''
-        }) || nextResource.resourceClass || '';
-        nextResource.frictionLevel = self.ResourceRules?.getResourceFrictionLevel?.({
-            ...nextResource,
-            frictionLevel: ''
-        }) || nextResource.frictionLevel || '';
-        nextResource.directPublishReady = !!self.ResourceRules?.isDirectPublishReady?.(nextResource);
-        nextResource = sanitizeResourceSignals(nextResource);
-        nextResource.sourceTier = getEffectiveResourceSourceTier(nextResource) || nextResource.discoverySourceTier;
-        nextResource.sourceTierScore = getSourceTierScore(nextResource.sourceTier);
-        nextResource.sourceEvidence = summarizeSourceEvidenceFromEdges(nextResource.discoveryEdges || []);
-        resources.push(nextResource);
+        resources.push(finalizeResourceSignals(nextResource));
     }
 
     const storedResources = await writeResourcesToStorage(resources);
-    collectState.stats.blogResources = storedResources.filter(r => r.status === 'pending').length;
+    syncResourceOpportunityStats(storedResources);
     scheduleAutoPublishDispatch('resource-discovered');
     broadcastStats();
 }
@@ -3959,6 +4052,7 @@ async function savePublishTask(task) {
             nextTask.stats = { total: 0, success: 0, skipped: 0, pending: 0, failed: 0 };
             nextTask.runCount = Number(nextTask.runCount || 0);
             nextTask.lastRunAt = nextTask.lastRunAt || '';
+            nextTask.autoDispatchPaused = !!nextTask.autoDispatchPaused;
             if (getTaskType(nextTask) === 'nurture') {
                 nextTask.nextRunAt = computeNextNurtureRunAt(nextTask.frequency || 'daily');
             }
@@ -3973,6 +4067,26 @@ async function savePublishTask(task) {
     if (isAutoPublishTask(savedTask)) {
         scheduleAutoPublishDispatch('task-saved', 600);
     }
+}
+
+async function setTaskAutoDispatchPaused(taskId, paused = true, reason = 'manual') {
+    if (!taskId) return null;
+    return await TaskStore.updateTask(taskId, (task) => {
+        const nextTask = {
+            ...task,
+            autoDispatchPaused: !!paused
+        };
+
+        if (paused) {
+            nextTask.autoDispatchPausedAt = new Date().toISOString();
+            nextTask.autoDispatchPauseReason = compactText(reason || 'manual');
+        } else {
+            delete nextTask.autoDispatchPausedAt;
+            delete nextTask.autoDispatchPauseReason;
+        }
+
+        return nextTask;
+    });
 }
 
 async function deletePublishTask(taskId) {
@@ -4010,6 +4124,9 @@ function getResourcePublishHistoryEntry(resource, taskOrTarget) {
 
 function canPublishResourceForTask(resource, task) {
     if (!isPublishCandidateForTask(resource, task)) {
+        return false;
+    }
+    if (getResourcePool(resource) === RESOURCE_POOLS.QUARANTINE) {
         return false;
     }
 
@@ -4221,6 +4338,8 @@ function getPublishRuntimeContext(taskId) {
         getPublishWorkflow,
         workflowSupportsResource: (workflow, resource, task) => WorkflowRegistry.supportsResource(workflow, resource, task),
         canPublishResourceForTask,
+        getResourcePool,
+        selectDispatchResources,
         getAllDomainPublishPolicies,
         isResourceCoolingDown,
         interleaveResourcesByDomain,
@@ -4270,6 +4389,16 @@ function getPublishRuntimeContext(taskId) {
 async function startPublish(task, options = {}) {
     await ensurePublishSessionsLoaded();
     await ensurePublishBatchStateLoaded();
+    let runtimeTask = task?.id
+        ? await TaskStore.getTask(task.id) || task
+        : task;
+    if (options.autoDispatch && runtimeTask?.autoDispatchPaused) {
+        return {
+            success: false,
+            code: 'task_auto_dispatch_paused',
+            message: '该任务已手动暂停自动接力，请手动点击发布后再恢复。'
+        };
+    }
     if (!options.fromBatch && isPublishBatchRunning()) {
         return {
             success: false,
@@ -4278,7 +4407,7 @@ async function startPublish(task, options = {}) {
         };
     }
     const hasOtherActivePublish = Object.entries(publishSessions || {}).some(([activeTaskId, session]) => {
-        if (activeTaskId === task?.id) return false;
+        if (activeTaskId === runtimeTask?.id) return false;
         return !!session?.isPublishing || !!session?.awaitingManualContinue || !!session?.pendingSubmission;
     });
     if (hasOtherActivePublish) {
@@ -4288,7 +4417,14 @@ async function startPublish(task, options = {}) {
             message: '当前已有其他发布任务在运行，请先停止或完成后再启动新的任务。'
         };
     }
-    return await PublishRuntime.start(getPublishRuntimeContext(task.id), task);
+    if (!options.autoDispatch && runtimeTask?.id && runtimeTask.autoDispatchPaused) {
+        await setTaskAutoDispatchPaused(runtimeTask.id, false);
+        runtimeTask = {
+            ...runtimeTask,
+            autoDispatchPaused: false
+        };
+    }
+    return await PublishRuntime.start(getPublishRuntimeContext(runtimeTask.id), runtimeTask);
 }
 
 async function publishNext(taskId) {
@@ -4373,13 +4509,10 @@ async function updateResourceStatus(id, status, patch = {}) {
             : []);
         next.sourceTiers = nextSourceTiers;
         next.discoveryEdges = nextDiscoveryEdges;
-        Object.assign(next, sanitizeResourceSignals(next));
-        next.sourceTier = getEffectiveResourceSourceTier(next) || next.discoverySourceTier || next.sourceTier || '';
-        next.sourceTierScore = getSourceTierScore(next.sourceTier);
-        next.sourceEvidence = summarizeSourceEvidenceFromEdges(next.discoveryEdges || []);
-
-        resources[idx] = next;
-        await writeResourcesToStorage(resources);
+        resources[idx] = finalizeResourceSignals(next);
+        const storedResources = await writeResourcesToStorage(resources);
+        syncResourceOpportunityStats(storedResources);
+        broadcastStats();
         scheduleAutoPublishDispatch(`resource-status:${status}`, 900);
     }
 }
@@ -4396,8 +4529,10 @@ async function resetResourcePublishState(resourceId, options = {}) {
     if (!preserveHistory) {
         delete nextResource.publishHistory;
     }
-    resources[idx] = nextResource;
-    await writeResourcesToStorage(resources);
+    resources[idx] = finalizeResourceSignals(nextResource);
+    const storedResources = await writeResourcesToStorage(resources);
+    syncResourceOpportunityStats(storedResources);
+    broadcastStats();
     return true;
 }
 
@@ -4430,10 +4565,12 @@ async function resetAllPublishStatuses() {
         delete nextResource.publishedAt;
         delete nextResource.publishMeta;
         delete nextResource.publishHistory;
-        return nextResource;
+        return finalizeResourceSignals(nextResource);
     });
 
-    await writeResourcesToStorage(nextResources);
+    const storedResources = await writeResourcesToStorage(nextResources);
+    syncResourceOpportunityStats(storedResources);
+    broadcastStats();
     await TaskStore.updateTasks((tasks) => tasks.map((task) => {
         if (getTaskType(task) !== 'publish') {
             return task;
@@ -4497,6 +4634,23 @@ async function stopPublish(taskId, options = {}) {
     for (const taskId of activeTaskIds) {
         clearPublishWatchdog(taskId);
         await PublishRuntime.stop(getPublishRuntimeContext(taskId));
+        if (!options.skipAutoDispatchPause) {
+            await setTaskAutoDispatchPaused(taskId, true, options.pauseReason || 'manual-stop');
+        }
+    }
+
+    if (!taskId && !options.skipAutoDispatchPause) {
+        await TaskStore.updateTasks((tasks) => tasks.map((task) => {
+            if (!isAutoPublishTask({ ...task, autoDispatchPaused: false })) {
+                return task;
+            }
+            return {
+                ...task,
+                autoDispatchPaused: true,
+                autoDispatchPausedAt: new Date().toISOString(),
+                autoDispatchPauseReason: compactText(options.pauseReason || 'manual-stop')
+            };
+        }));
     }
 }
 
@@ -5168,6 +5322,7 @@ function getBestTemplateHostScore(host = '', siteTemplates = {}) {
 
 function getResourcePublishRankingScore(resource = {}, task = {}, siteTemplates = {}) {
     const basePriority = self.ResourceRules?.getPublishCandidatePriority?.(resource, task) || 0;
+    const resourcePool = getResourcePool(resource);
     const resourceClass = self.ResourceRules?.getResourceClass?.(resource) || resource.resourceClass || 'weak';
     const frictionLevel = self.ResourceRules?.getResourceFrictionLevel?.(resource) || resource.frictionLevel || 'high';
     const hasWebsiteField = !!self.ResourceRules?.resourceSupportsWebsiteField?.(resource);
@@ -5203,6 +5358,9 @@ function getResourcePublishRankingScore(resource = {}, task = {}, siteTemplates 
     };
 
     let score = basePriority * 1e6;
+    if (resourcePool === RESOURCE_POOLS.MAIN) score += 5200;
+    if (resourcePool === RESOURCE_POOLS.LEGACY) score -= 1200;
+    if (resourcePool === RESOURCE_POOLS.QUARANTINE) score -= 18000;
     score += getSourceTierScore(effectiveTier) * 1e4;
     score += publishedSuccessCount * 3500;
     score += anchorVerifiedCount * 5200;
@@ -5302,6 +5460,7 @@ async function getPublishInsights() {
     }, {}))
         .sort((left, right) => right[1] - left[1])
         .map(([tier, count]) => ({ tier, count }));
+    const resourcePoolCounts = countResourcesByPool(resources);
 
     return {
         generatedAt: new Date().toISOString(),
@@ -5323,9 +5482,10 @@ async function getPublishInsights() {
         },
         resources: {
             total: resources.length,
-            pending: resources.filter((resource) => resource.status === 'pending').length,
+            pending: countPendingOperationalResources(resources),
             published: resources.filter((resource) => resource.status === 'published').length,
-            sourceTiers: sourceTierCounts
+            sourceTiers: sourceTierCounts,
+            pools: resourcePoolCounts
         },
         templates: {
             total: Object.keys(templates || {}).length,
@@ -5343,6 +5503,7 @@ function isAutoPublishTask(task = {}) {
     return getTaskType(task) === 'publish'
         && task.workflowId === 'blog-comment-backlink'
         && task.mode === 'full-auto'
+        && !task.autoDispatchPaused
         && !!compactText(task.website || task.anchorUrl || '');
 }
 
@@ -5355,21 +5516,25 @@ function summarizeAutoPublishTask(task = {}, resources = [], policies = {}, site
             canPublishResourceForTask(resource, task)
             && WorkflowRegistry.supportsResource(workflow, resource, task)
             && !isResourceCoolingDown(resource, policies)
-        )
+        );
+    const dispatchSelection = selectDispatchResources(readyResources);
+    const selectedResources = (dispatchSelection.resources || [])
         .map((resource) => ({
             resource,
             score: getResourcePublishRankingScore(resource, task, siteTemplates)
         }))
         .sort((left, right) => right.score - left.score);
 
-    if (readyResources.length === 0) return null;
+    if (selectedResources.length === 0) return null;
 
-    const top = readyResources[0];
+    const top = selectedResources[0];
     const topResource = top?.resource || {};
     const topSourceEvidence = topResource.sourceEvidence || {};
     const summary = {
         task,
-        readyCount: readyResources.length,
+        readyCount: selectedResources.length,
+        poolCounts: dispatchSelection.counts,
+        activePool: dispatchSelection.activePool || '',
         topScore: Number(top?.score || 0),
         topResourceId: topResource.id || '',
         topResourceUrl: topResource.url || '',
@@ -5438,7 +5603,7 @@ async function runAutoPublishDispatch(options = {}) {
             topResourceUrl: nextTask.topResourceUrl
         });
 
-        return await startPublish(nextTask.task);
+        return await startPublish(nextTask.task, { autoDispatch: true });
     } finally {
         autoPublishDispatchRunning = false;
     }

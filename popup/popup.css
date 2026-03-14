@@ -1087,6 +1087,21 @@ body {
   color: var(--green);
 }
 
+.res-tag.pool-main {
+  background: rgba(34, 197, 94, 0.14);
+  color: #86efac;
+}
+
+.res-tag.pool-legacy {
+  background: rgba(250, 204, 21, 0.14);
+  color: #fde68a;
+}
+
+.res-tag.pool-quarantine {
+  background: rgba(248, 113, 113, 0.14);
+  color: #fca5a5;
+}
+
 .res-tag.scope-domain {
   background: rgba(59, 130, 246, 0.14);
   color: #60a5fa;
