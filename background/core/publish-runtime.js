@@ -200,13 +200,22 @@ const PublishRuntime = {
         let url = resource.url;
         if (!url.startsWith('http')) url = 'https://' + url;
 
-        ctx.updateState({ currentUrl: resource.url });
+        ctx.updateState({
+            currentUrl: resource.url,
+            currentStage: '',
+            currentStageLabel: '',
+            currentStageAt: '',
+            resultLock: null
+        });
         ctx.broadcastProgress({
             currentUrl: resource.url,
             current: currentState.currentIndex + 1,
             total: currentState.queue.length,
             taskId: task.id,
             isPublishing: true,
+            currentStage: '',
+            currentStageLabel: '',
+            currentStageAt: '',
             currentLimitCount: Number(currentState.currentLimitCount || 0),
             targetLimitCount: Number(currentState.targetLimitCount || 0),
             limitType: currentState.limitType || '',
@@ -238,14 +247,46 @@ const PublishRuntime = {
 
     async handleAction(ctx, resourceId, result, taskId, meta = {}) {
         const state = ctx.getState();
-        const activeResourceId = state.queue?.[state.currentIndex]?.id || '';
+        const activeQueueIndex = Number(state.currentIndex || 0);
+        const activeResourceId = state.queue?.[activeQueueIndex]?.id || '';
         if (activeResourceId && activeResourceId !== resourceId) {
             return;
+        }
+
+        const existingLock = state.resultLock;
+        if (
+            existingLock
+            && existingLock.resourceId === resourceId
+            && Number(existingLock.queueIndex || 0) === activeQueueIndex
+        ) {
+            return;
+        }
+
+        ctx.updateState({
+            resultLock: {
+                resourceId,
+                queueIndex: activeQueueIndex,
+                acquiredAt: new Date().toISOString(),
+                result: String(result || '')
+            }
+        });
+
+        const currentTabId = state.currentTabId;
+        if (currentTabId) {
+            try {
+                await ctx.sendStopMessage(currentTabId);
+            } catch {}
         }
 
         if (state.pendingSubmission?.resourceId === resourceId) {
             ctx.updateState({ pendingSubmission: null });
         }
+
+        ctx.updateState({
+            currentStage: '',
+            currentStageLabel: '',
+            currentStageAt: ''
+        });
 
         const statusMap = { submitted: 'published', skipped: 'skipped', failed: 'failed' };
         let status = statusMap[result] || result;
@@ -492,6 +533,9 @@ const PublishRuntime = {
                     taskId: ctx.getState().currentTask?.id,
                     isPublishing: true,
                     awaitingManualContinue: true,
+                    currentStage: '',
+                    currentStageLabel: '',
+                    currentStageAt: '',
                     currentLimitCount: Number(ctx.getState().currentLimitCount || 0),
                     targetLimitCount: Number(ctx.getState().targetLimitCount || 0),
                     limitType: ctx.getState().limitType || '',
@@ -515,8 +559,12 @@ const PublishRuntime = {
 
         if (status === 'pending' && publishMeta.cooldownDeferred) {
             ctx.moveCurrentResourceToQueueTail();
+            ctx.updateState({ resultLock: null });
         } else {
-            ctx.updateState({ currentIndex: ctx.getState().currentIndex + 1 });
+            ctx.updateState({
+                currentIndex: ctx.getState().currentIndex + 1,
+                resultLock: null
+            });
         }
         await this.dispatchQueue(ctx);
     },
@@ -543,7 +591,8 @@ const PublishRuntime = {
         if (!state.isPublishing || !state.awaitingManualContinue) return;
         ctx.updateState({
             awaitingManualContinue: false,
-            currentIndex: state.currentIndex + 1
+            currentIndex: state.currentIndex + 1,
+            resultLock: null
         });
         await this.dispatchQueue(ctx);
     },

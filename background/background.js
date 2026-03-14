@@ -7,6 +7,8 @@
 importScripts(
     '../utils/local-db.js',
     '../utils/resource-rules.js',
+    '../utils/domain-profile.js',
+    '../utils/html-comment-detection.js',
     'core/state-store.js',
     'core/task-store.js',
     'core/resource-store.js',
@@ -17,6 +19,7 @@ importScripts(
     'core/task-runner.js',
     'core/continuous-discovery-engine.js',
     'core/collector-runtime.js',
+    'core/publish-batch.js',
     'core/publish-runtime.js',
     'tasks/discover-workflow.js',
     'tasks/publish-workflow.js',
@@ -105,8 +108,21 @@ const MARKETING_STRATEGY = {
 };
 
 const PUBLISH_WATCHDOG = {
-    DISPATCH_MS: 30000,
-    SUBMISSION_MS: 20000
+    DISPATCH_MS: 20000,
+    SUBMISSION_MS: 15000
+};
+
+const PUBLISH_STAGE_WATCHDOG_MS = {
+    bootstrap: 12000,
+    preflight: 9000,
+    finding_form: 9000,
+    form_detected: 7000,
+    generating_comment: 7000,
+    comment_ready: 5000,
+    filling_form: 6000,
+    form_filled: 5000,
+    pre_submit: 5000,
+    submitting: 12000
 };
 
 const RESOURCE_SIGNAL_VERSION = 2;
@@ -114,14 +130,67 @@ const PUBLISH_TASK_SCHEMA_VERSION = 2;
 
 let publishSessions = TaskManager.createDefaultPublishSessions();
 let publishSessionsLoaded = false;
-let publishBatchState = TaskManager.createDefaultPublishBatchState();
-let publishBatchLoaded = false;
 const publishWatchdogs = new Map();
 let autoPublishDispatchTimer = null;
 let autoPublishDispatchRunning = false;
-let publishBatchAdvanceTimer = null;
 let resourceSignalNormalizationTimer = null;
 let resourceSignalNormalizationRunning = false;
+
+const domainProfileUtils = self.DomainProfileUtils.create({
+    compactText,
+    getDomain: getDomainBg,
+    sourceTiers: SOURCE_TIERS,
+    sourceTierScores: SOURCE_TIER_SCORES
+});
+
+const {
+    pushUniqueValue,
+    mergeStringArrays,
+    inferLanguageFromHtml,
+    inferCountryFromDomain,
+    detectCmsFromHtml,
+    detectSiteTypeFromHtml,
+    detectTopicFromText,
+    normalizeSourceTier,
+    getSourceTierScore,
+    preferHigherSourceTier,
+    mergeSourceTierArrays,
+    buildDiscoveryEdge,
+    mergeDiscoveryEdges,
+    getResourcePublishedSuccessCount,
+    getResourceAnchorVerifiedCount,
+    getEffectiveResourceSourceTier,
+    summarizeSourceEvidenceFromEdges,
+    calculateDomainQualityScore,
+    buildDomainProfileFromHtml
+} = domainProfileUtils;
+
+const publishBatchRuntime = self.PublishBatchRuntime.create({
+    taskManager: TaskManager,
+    stateStore: StateStore,
+    taskStore: TaskStore,
+    logger: Logger,
+    broadcast: (state) => {
+        broadcastToPopup({
+            action: 'publishBatchUpdate',
+            state
+        });
+    },
+    ensurePublishSessionsLoaded: () => ensurePublishSessionsLoaded(),
+    getPublishStateView: () => TaskManager.buildPublishSessionsView(publishSessions, publishBatchRuntime.getState()),
+    getTaskType,
+    startPublish: (task, options = {}) => startPublish(task, options),
+    stopPublish: (taskId, options = {}) => stopPublish(taskId, options),
+    hasActivePublishSession: () => Object.values(publishSessions || {}).some((session) =>
+        session.isPublishing || session.awaitingManualContinue || session.pendingSubmission
+    ),
+    clearAutoPublishDispatchTimer: () => {
+        if (autoPublishDispatchTimer) {
+            clearTimeout(autoPublishDispatchTimer);
+            autoPublishDispatchTimer = null;
+        }
+    }
+});
 
 let domainIntelCache = {
     frontier: [],
@@ -276,7 +345,7 @@ function createDefaultPublishBatchState() {
 }
 
 function getPublishStateView() {
-    return TaskManager.buildPublishSessionsView(publishSessions, publishBatchState);
+    return TaskManager.buildPublishSessionsView(publishSessions, publishBatchRuntime.getState());
 }
 
 function shouldPersistPublishSession(state = {}) {
@@ -374,327 +443,60 @@ async function flushPublishSessions() {
     await StateStore.savePublishSessions(publishSessions);
 }
 
-function normalizePublishBatchState(state = {}) {
-    return {
-        ...createDefaultPublishBatchState(),
-        ...(state || {}),
-        queueTaskIds: Array.isArray(state.queueTaskIds) ? [...new Set(state.queueTaskIds.filter(Boolean))] : [],
-        completedTaskIds: Array.isArray(state.completedTaskIds) ? [...new Set(state.completedTaskIds.filter(Boolean))] : [],
-        skippedTaskIds: Array.isArray(state.skippedTaskIds) ? [...new Set(state.skippedTaskIds.filter(Boolean))] : [],
-        failedTaskIds: Array.isArray(state.failedTaskIds) ? [...new Set(state.failedTaskIds.filter(Boolean))] : []
-    };
-}
-
 async function ensurePublishBatchStateLoaded() {
-    if (publishBatchLoaded) return;
-    publishBatchState = normalizePublishBatchState(
-        await StateStore.loadPublishBatchState(createDefaultPublishBatchState())
-    );
-    publishBatchLoaded = true;
+    await publishBatchRuntime.ensureLoaded();
 }
 
 async function flushPublishBatchState() {
-    await StateStore.savePublishBatchState(publishBatchState);
+    await publishBatchRuntime.flush();
 }
 
 function setPublishBatchState(nextState = {}) {
-    publishBatchState = normalizePublishBatchState(nextState);
-    publishBatchLoaded = true;
-    flushPublishBatchState().catch(() => {});
-    broadcastPublishBatchState();
+    publishBatchRuntime.setState(nextState);
 }
 
 function updatePublishBatchState(patch = {}) {
-    setPublishBatchState({
-        ...publishBatchState,
-        ...(patch || {}),
-        updatedAt: new Date().toISOString()
-    });
+    publishBatchRuntime.updateState(patch);
 }
 
 function broadcastPublishBatchState() {
-    broadcastToPopup({
-        action: 'publishBatchUpdate',
-        state: TaskManager.buildPublishBatchView(publishBatchState)
-    });
+    publishBatchRuntime.broadcast();
 }
 
-function getPublishBatchDoneTaskIds(state = publishBatchState) {
-    return [...new Set([
-        ...(state.completedTaskIds || []),
-        ...(state.skippedTaskIds || []),
-        ...(state.failedTaskIds || [])
-    ])];
+function getPublishBatchDoneTaskIds(state = publishBatchRuntime.getState()) {
+    return publishBatchRuntime.getDoneTaskIds(state);
 }
 
-function getPublishBatchRemainingTaskIds(state = publishBatchState) {
-    const doneSet = new Set(getPublishBatchDoneTaskIds(state));
-    return (state.queueTaskIds || []).filter((taskId) => !doneSet.has(taskId));
+function getPublishBatchRemainingTaskIds(state = publishBatchRuntime.getState()) {
+    return publishBatchRuntime.getRemainingTaskIds(state);
 }
 
 function isPublishBatchRunning() {
-    return !!publishBatchState?.isRunning;
-}
-
-function shouldSkipPublishBatchTask(result = {}) {
-    return ['no_pending_resources', 'site_history_exhausted', 'domain_cooldown_active'].includes(result?.code || '');
+    return publishBatchRuntime.isRunning();
 }
 
 function schedulePublishBatchAdvance(reason = 'publish-done', delayMs = 700) {
-    if (publishBatchAdvanceTimer) {
-        clearTimeout(publishBatchAdvanceTimer);
-    }
-    publishBatchAdvanceTimer = setTimeout(() => {
-        publishBatchAdvanceTimer = null;
-        advancePublishBatch(reason).catch(async (error) => {
-            await Logger.error(`批量发布接力失败: ${error.message}`, { reason });
-        });
-    }, Math.max(200, Number(delayMs || 0)));
+    publishBatchRuntime.scheduleAdvance(reason, delayMs);
 }
 
 async function finalizePublishBatch(message = '批量发布已完成') {
-    await ensurePublishBatchStateLoaded();
-    if (!publishBatchState.queueTaskIds?.length) {
-        setPublishBatchState({
-            ...createDefaultPublishBatchState(),
-            isRunning: false,
-            isPaused: true,
-            updatedAt: new Date().toISOString(),
-            lastCompletedAt: new Date().toISOString(),
-            lastMessage: message
-        });
-    } else {
-        setPublishBatchState({
-            ...publishBatchState,
-            isRunning: false,
-            isPaused: true,
-            currentTaskId: '',
-            updatedAt: new Date().toISOString(),
-            lastCompletedAt: new Date().toISOString(),
-            lastMessage: message
-        });
-    }
-    await Logger.publish(message, {
-        totalTasks: publishBatchState.queueTaskIds?.length || 0,
-        completed: publishBatchState.completedTaskIds?.length || 0,
-        skipped: publishBatchState.skippedTaskIds?.length || 0,
-        failed: publishBatchState.failedTaskIds?.length || 0
-    });
-    return { success: true, completed: true, state: TaskManager.buildPublishBatchView(publishBatchState) };
-}
-
-function buildPublishBatchStatusMessage(task = {}, outcome = 'completed', detail = '') {
-    const name = task?.name || task?.website || task?.id || '任务';
-    if (outcome === 'skipped') {
-        return detail ? `已跳过 ${name} · ${detail}` : `已跳过 ${name}`;
-    }
-    if (outcome === 'failed') {
-        return detail ? `任务失败 ${name} · ${detail}` : `任务失败 ${name}`;
-    }
-    return detail ? `已完成 ${name} · ${detail}` : `已完成 ${name}`;
+    return await publishBatchRuntime.finalize(message);
 }
 
 async function markPublishBatchTask(taskId, outcome = 'completed', detail = '', taskMap = new Map()) {
-    await ensurePublishBatchStateLoaded();
-    if (!taskId) return;
-
-    const completedTaskIds = [...(publishBatchState.completedTaskIds || [])];
-    const skippedTaskIds = [...(publishBatchState.skippedTaskIds || [])];
-    const failedTaskIds = [...(publishBatchState.failedTaskIds || [])];
-    const removeTaskId = (list) => list.filter((id) => id !== taskId);
-    const normalizedOutcome = outcome === 'failed' ? 'failed' : outcome === 'skipped' ? 'skipped' : 'completed';
-    const nextCompleted = normalizedOutcome === 'completed' ? [...new Set([...removeTaskId(completedTaskIds), taskId])] : removeTaskId(completedTaskIds);
-    const nextSkipped = normalizedOutcome === 'skipped' ? [...new Set([...removeTaskId(skippedTaskIds), taskId])] : removeTaskId(skippedTaskIds);
-    const nextFailed = normalizedOutcome === 'failed' ? [...new Set([...removeTaskId(failedTaskIds), taskId])] : removeTaskId(failedTaskIds);
-    const task = taskMap.get(taskId) || {};
-
-    updatePublishBatchState({
-        currentTaskId: '',
-        completedTaskIds: nextCompleted,
-        skippedTaskIds: nextSkipped,
-        failedTaskIds: nextFailed,
-        lastCompletedAt: new Date().toISOString(),
-        lastMessage: buildPublishBatchStatusMessage(task, normalizedOutcome, detail)
-    });
+    await publishBatchRuntime.markTask(taskId, outcome, detail, taskMap);
 }
 
 async function advancePublishBatch(reason = 'task-finished') {
-    await ensurePublishSessionsLoaded();
-    await ensurePublishBatchStateLoaded();
-    if (!isPublishBatchRunning()) {
-        return { success: false, code: 'publish_batch_idle', message: '当前没有运行中的批量发布。' };
-    }
-
-    const sessionView = getPublishStateView();
-    if (sessionView.isPublishing) {
-        return { success: false, code: 'publish_session_busy', message: '当前仍有发布任务在执行中。' };
-    }
-
-    const tasks = await TaskStore.getTasks();
-    const taskMap = new Map((tasks || []).map((task) => [task.id, task]));
-    const currentTaskId = publishBatchState.currentTaskId || '';
-    if (currentTaskId && !getPublishBatchDoneTaskIds(publishBatchState).includes(currentTaskId)) {
-        await markPublishBatchTask(currentTaskId, 'completed', '', taskMap);
-    }
-
-    const remainingTaskIds = getPublishBatchRemainingTaskIds(publishBatchState);
-    if (remainingTaskIds.length === 0) {
-        return await finalizePublishBatch('批量发布已全部完成');
-    }
-
-    for (const taskId of remainingTaskIds) {
-        const task = taskMap.get(taskId);
-        if (!task || getTaskType(task) !== 'publish') {
-            await markPublishBatchTask(taskId, 'failed', '任务不存在或不是发布任务', taskMap);
-            continue;
-        }
-
-        updatePublishBatchState({
-            currentTaskId: taskId,
-            lastMessage: `准备执行 ${task.name || task.website || task.id || '任务'}`
-        });
-
-        const result = await startPublish(task, { fromBatch: true, batchReason: reason });
-        if (result?.success) {
-            updatePublishBatchState({
-                currentTaskId: taskId,
-                lastMessage: `正在执行 ${task.name || task.website || task.id || '任务'}`
-            });
-            return {
-                success: true,
-                started: true,
-                taskId,
-                message: result.message || '已启动下一条任务'
-            };
-        }
-
-        if (shouldSkipPublishBatchTask(result)) {
-            await markPublishBatchTask(taskId, 'skipped', result?.message || '', taskMap);
-            continue;
-        }
-
-        if (result?.code === 'publish_session_busy' || result?.code === 'publish_batch_busy') {
-            updatePublishBatchState({
-                currentTaskId: taskId,
-                lastMessage: result?.message || '批量发布等待当前会话空闲'
-            });
-            return {
-                success: false,
-                code: result?.code || 'publish_session_busy',
-                message: result?.message || '当前已有发布任务在运行'
-            };
-        }
-
-        await markPublishBatchTask(taskId, 'failed', result?.message || '启动失败', taskMap);
-    }
-
-    return await finalizePublishBatch('批量发布已完成，剩余任务均已跳过或失败');
+    return await publishBatchRuntime.advance(reason);
 }
 
 async function startPublishBatch(taskIds = []) {
-    await ensurePublishSessionsLoaded();
-    await ensurePublishBatchStateLoaded();
-
-    if (isPublishBatchRunning()) {
-        return {
-            success: false,
-            code: 'publish_batch_running',
-            message: '当前已有批量发布在运行，请先停止后再启动新的批量任务。'
-        };
-    }
-
-    const hasActivePublish = Object.values(publishSessions || {}).some((session) =>
-        session.isPublishing || session.awaitingManualContinue || session.pendingSubmission
-    );
-    if (hasActivePublish) {
-        return {
-            success: false,
-            code: 'publish_session_busy',
-            message: '当前已有发布任务在运行，请先停止或完成后再启动批量发布。'
-        };
-    }
-
-    const tasks = await TaskStore.getTasks();
-    const publishTasks = (tasks || []).filter((task) => getTaskType(task) === 'publish');
-    const publishTaskMap = new Map(publishTasks.map((task) => [task.id, task]));
-    const dedupedTaskIds = [...new Set((Array.isArray(taskIds) ? taskIds : []).filter(Boolean))];
-    const queueTaskIds = (dedupedTaskIds.length > 0 ? dedupedTaskIds : publishTasks.map((task) => task.id))
-        .filter((taskId) => publishTaskMap.has(taskId));
-
-    if (queueTaskIds.length === 0) {
-        return {
-            success: false,
-            code: 'no_publish_tasks',
-            message: '当前没有可执行的发布任务。'
-        };
-    }
-
-    if (autoPublishDispatchTimer) {
-        clearTimeout(autoPublishDispatchTimer);
-        autoPublishDispatchTimer = null;
-    }
-    if (publishBatchAdvanceTimer) {
-        clearTimeout(publishBatchAdvanceTimer);
-        publishBatchAdvanceTimer = null;
-    }
-
-    const now = new Date().toISOString();
-    setPublishBatchState({
-        ...createDefaultPublishBatchState(),
-        isRunning: true,
-        isPaused: false,
-        queueTaskIds,
-        currentTaskId: '',
-        startedAt: now,
-        updatedAt: now,
-        lastMessage: `准备顺序执行 ${queueTaskIds.length} 个发布任务`
-    });
-
-    await Logger.publish('启动批量发布', {
-        totalTasks: queueTaskIds.length,
-        taskIds: queueTaskIds
-    });
-
-    return await advancePublishBatch('manual-batch-start');
+    return await publishBatchRuntime.start(taskIds);
 }
 
 async function stopPublishBatch(options = {}) {
-    await ensurePublishSessionsLoaded();
-    await ensurePublishBatchStateLoaded();
-
-    const wasRunning = isPublishBatchRunning();
-    const activeTaskId = publishBatchState.currentTaskId || '';
-    const message = options.message || '已停止批量发布';
-    updatePublishBatchState({
-        isRunning: false,
-        isPaused: true,
-        currentTaskId: '',
-        lastMessage: message
-    });
-
-    if (publishBatchAdvanceTimer) {
-        clearTimeout(publishBatchAdvanceTimer);
-        publishBatchAdvanceTimer = null;
-    }
-
-    if (options.stopActiveTask !== false && activeTaskId) {
-        await stopPublish(activeTaskId, { skipBatchStop: true });
-    }
-
-    if (wasRunning) {
-        await Logger.publish(message, {
-            totalTasks: publishBatchState.queueTaskIds?.length || 0,
-            completed: publishBatchState.completedTaskIds?.length || 0,
-            skipped: publishBatchState.skippedTaskIds?.length || 0,
-            failed: publishBatchState.failedTaskIds?.length || 0
-        });
-    }
-
-    return {
-        success: true,
-        stopped: wasRunning,
-        state: TaskManager.buildPublishBatchView(publishBatchState)
-    };
+    return await publishBatchRuntime.stop(options);
 }
 
 function clearPublishWatchdog(taskId) {
@@ -1025,6 +827,58 @@ async function handleCommentSubmittingMessage(msg = {}, sender = {}) {
     });
 }
 
+async function handleCommentProgressMessage(msg = {}, sender = {}) {
+    await ensurePublishSessionsLoaded();
+    const taskId = msg.taskId || findPublishSessionTaskIdByCurrentTab(sender.tab?.id) || '';
+    if (!taskId) return;
+
+    const session = getPublishSessionState(taskId);
+    const activeResourceId = session.queue?.[session.currentIndex]?.id || '';
+    if (!session.isPublishing || session.awaitingManualContinue) return;
+    if (msg.resourceId && activeResourceId && msg.resourceId !== activeResourceId) return;
+
+    const nextStage = compactText(msg.stage || '');
+    const nextStageLabel = compactText(msg.stageLabel || '');
+    const nextStageAt = new Date().toISOString();
+
+    updatePublishSessionState(taskId, {
+        currentStage: nextStage,
+        currentStageLabel: nextStageLabel,
+        currentStageAt: nextStageAt
+    });
+
+    const timeoutMs = Number(msg.stageTimeoutMs || 0)
+        || PUBLISH_STAGE_WATCHDOG_MS[nextStage]
+        || PUBLISH_WATCHDOG.DISPATCH_MS;
+
+    clearPublishWatchdog(taskId);
+    schedulePublishWatchdog(taskId, {
+        stage: 'dispatch',
+        resourceId: msg.resourceId || activeResourceId,
+        currentUrl: session.currentUrl,
+        timeoutMs
+    });
+
+    const nextState = getPublishSessionState(taskId);
+    broadcastToPopup({
+        action: 'publishProgress',
+        currentUrl: nextState.currentUrl,
+        current: nextState.currentIndex + 1,
+        total: nextState.queue?.length || 0,
+        taskId,
+        isPublishing: !!nextState.isPublishing,
+        awaitingManualContinue: !!nextState.awaitingManualContinue,
+        currentLimitCount: Number(nextState.currentLimitCount || 0),
+        targetLimitCount: Number(nextState.targetLimitCount || 0),
+        limitType: nextState.limitType || '',
+        sessionPublishedCount: Number(nextState.sessionPublishedCount || 0),
+        sessionAnchorSuccessCount: Number(nextState.sessionAnchorSuccessCount || 0),
+        currentStage: nextState.currentStage || '',
+        currentStageLabel: nextState.currentStageLabel || '',
+        currentStageAt: nextState.currentStageAt || ''
+    });
+}
+
 // === 消息处理 ===
 const runtimeMessageRouter = RuntimeMessageRouter.create({
     fireAndForget: {
@@ -1036,6 +890,7 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
         backlinkData: (msg) => handleBacklinkData(msg.source, msg.urls, msg.items || []),
         commentAction: (msg) => handleCommentAction(msg.resourceId, msg.result, msg.taskId, msg.meta || {}),
         commentSubmitting: (msg, sender) => handleCommentSubmittingMessage(msg, sender),
+        commentProgress: (msg, sender) => handleCommentProgressMessage(msg, sender),
         republish: (msg) => republishResource(msg.resourceId, msg.taskId)
     },
     asyncActions: {
@@ -1325,295 +1180,7 @@ function getNextPendingFrontierDomain() {
     });
 }
 
-function pushUniqueValue(target, value, limit = 6) {
-    const normalized = String(value || '').trim();
-    if (!normalized) return;
-    if (!Array.isArray(target)) return;
-    if (target.includes(normalized)) return;
-    target.push(normalized);
-    if (target.length > limit) {
-        target.splice(0, target.length - limit);
-    }
-}
-
-function mergeStringArrays(values = [], nextValues = [], limit = 6) {
-    const merged = Array.isArray(values) ? [...values] : [];
-    for (const value of nextValues || []) {
-        pushUniqueValue(merged, value, limit);
-    }
-    return merged;
-}
-
-function inferLanguageFromHtml(html = '') {
-    const langMatch = html.match(/<html[^>]+lang=["']([^"']+)["']/i);
-    if (langMatch?.[1]) return langMatch[1].trim().toLowerCase();
-
-    const text = html.replace(/<script[\s\S]*?<\/script>/gi, ' ')
-        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .slice(0, 2500);
-
-    if (/[\u4e00-\u9fff]/.test(text)) return 'zh';
-    if (/[\u3040-\u30ff]/.test(text)) return 'ja';
-    if (/[\u0400-\u04ff]/.test(text)) return 'ru';
-    if (/[àèìòù]/i.test(text) || /\b(ciao|grazie|commenti|articolo)\b/i.test(text)) return 'it';
-    if (/[áéíóúñ]/i.test(text) || /\b(hola|articulo|comentarios)\b/i.test(text)) return 'es';
-    if (/[ãõç]/i.test(text) || /\b(voce|comentarios|comentario)\b/i.test(text)) return 'pt';
-    return 'en';
-}
-
-function inferCountryFromDomain(domain = '', language = '') {
-    const tld = domain.split('.').pop() || '';
-    const ccMap = {
-        br: 'BR', it: 'IT', fr: 'FR', de: 'DE', es: 'ES', pt: 'PT', ru: 'RU',
-        cn: 'CN', jp: 'JP', uk: 'GB', us: 'US', ca: 'CA', au: 'AU', in: 'IN',
-        nl: 'NL', pl: 'PL', ro: 'RO', tr: 'TR', mx: 'MX'
-    };
-    if (ccMap[tld]) return ccMap[tld];
-
-    if (language.startsWith('pt-br')) return 'BR';
-    if (language.startsWith('pt')) return 'PT';
-    if (language.startsWith('zh')) return 'CN';
-    if (language.startsWith('ja')) return 'JP';
-    if (language.startsWith('ru')) return 'RU';
-    if (language.startsWith('it')) return 'IT';
-    if (language.startsWith('es')) return 'ES';
-    return '';
-}
-
-function detectCmsFromHtml(html = '', url = '') {
-    const lower = html.toLowerCase();
-    const urlLower = String(url || '').toLowerCase();
-    if (lower.includes('powered by ownd') || lower.includes('ameba ownd') || /(?:^|\/\/|\.)(shopinfo\.jp|themedia\.jp)\b/.test(urlLower)) {
-        return 'ameba-ownd';
-    }
-    if (lower.includes('wp-content') || lower.includes('wp-includes') || lower.includes('wordpress')) return 'wordpress';
-    if (lower.includes('woocommerce')) return 'woocommerce';
-    if (lower.includes('shopify') || lower.includes('cdn.shopify.com')) return 'shopify';
-    if (lower.includes('ghost/')) return 'ghost';
-    if (lower.includes('webflow')) return 'webflow';
-    if (lower.includes('wix.com') || lower.includes('wixstatic.com')) return 'wix';
-    if (lower.includes('squarespace')) return 'squarespace';
-    if (lower.includes('drupal-settings-json') || lower.includes('drupal')) return 'drupal';
-    if (lower.includes('joomla')) return 'joomla';
-    if (lower.includes('mediawiki')) return 'mediawiki';
-    return '';
-}
-
-function detectSiteTypeFromHtml(html = '', url = '', sampleUrls = []) {
-    const lower = html.toLowerCase();
-    const joinedUrls = sampleUrls.join(' ').toLowerCase();
-    const pathHints = `${url} ${joinedUrls}`.toLowerCase();
-
-    if (lower.includes('commentform') || lower.includes('wp-comments-post') || lower.includes('leave a reply') || lower.includes('leave a comment')) {
-        return 'blog';
-    }
-    if (lower.includes('phpbb') || lower.includes('vbulletin') || lower.includes('xenforo') || lower.includes('discourse')) {
-        return 'forum';
-    }
-    if (lower.includes('mediawiki') || lower.includes('wiki')) {
-        return 'wiki';
-    }
-    if (lower.includes('directory') || lower.includes('submit your site') || lower.includes('listing')) {
-        return 'directory';
-    }
-    if (lower.includes('cart') || lower.includes('checkout') || lower.includes('product') || lower.includes('woocommerce') || lower.includes('shopify')) {
-        return 'store';
-    }
-    if (pathHints.includes('/blog') || pathHints.includes('/news') || pathHints.includes('/article') || pathHints.includes('/post')) {
-        return 'blog';
-    }
-    if (pathHints.includes('/tool') || pathHints.includes('/generator') || pathHints.includes('/calculator')) {
-        return 'tool';
-    }
-    return 'website';
-}
-
-function detectTopicFromText(text = '') {
-    const lower = text.toLowerCase();
-    const topicRules = [
-        ['gaming', /\b(game|gaming|roblox|minecraft|steam|xbox|playstation|wiki)\b/gi],
-        ['tech', /\b(ai|tech|software|saas|cloud|developer|chrome extension|app)\b/gi],
-        ['business', /\b(marketing|seo|business|startup|agency|analytics)\b/gi],
-        ['finance', /\b(finance|loan|credit|bank|insurance|investment)\b/gi],
-        ['health', /\b(health|clinic|doctor|fitness|medical|wellness)\b/gi],
-        ['education', /\b(course|school|student|essay|education|learn)\b/gi],
-        ['travel', /\b(travel|hotel|flight|destination|tour)\b/gi],
-        ['entertainment', /\b(movie|music|streaming|iptv|tv|anime|celebrity)\b/gi],
-        ['sports', /\b(football|soccer|nba|nfl|sport|tennis)\b/gi],
-        ['gambling', /\b(casino|slot|bet|betting|poker|jackpot)\b/gi],
-        ['adult', /\b(adult|porn|sex|escort)\b/gi]
-    ];
-
-    let bestTopic = 'general';
-    let bestScore = 0;
-    for (const [topic, pattern] of topicRules) {
-        const matches = lower.match(pattern);
-        const score = matches?.length || 0;
-        if (score > bestScore) {
-            bestScore = score;
-            bestTopic = topic;
-        }
-    }
-
-    return bestTopic;
-}
-
-function normalizeSourceTier(value = '') {
-    const normalized = compactText(value).toLowerCase();
-    return Object.values(SOURCE_TIERS).includes(normalized) ? normalized : '';
-}
-
-function getSourceTierScore(value = '') {
-    return SOURCE_TIER_SCORES[normalizeSourceTier(value)] || 0;
-}
-
-function preferHigherSourceTier(current = '', next = '') {
-    return getSourceTierScore(next) > getSourceTierScore(current) ? normalizeSourceTier(next) : normalizeSourceTier(current);
-}
-
-function mergeSourceTierArrays(values = [], nextValues = [], limit = 5) {
-    const merged = [];
-    for (const value of [...(values || []), ...(nextValues || [])]) {
-        const normalized = normalizeSourceTier(value);
-        if (!normalized || merged.includes(normalized)) continue;
-        merged.push(normalized);
-    }
-    return merged
-        .sort((left, right) => getSourceTierScore(right) - getSourceTierScore(left))
-        .slice(0, limit);
-}
-
-function buildDiscoveryEdge(tier = '', method = '', detail = '') {
-    return compactText([
-        normalizeSourceTier(tier),
-        compactText(method),
-        compactText(detail)
-    ].filter(Boolean).join('|')).slice(0, 180);
-}
-
-function mergeDiscoveryEdges(values = [], nextValues = [], limit = 8) {
-    const merged = [];
-    for (const value of [...(values || []), ...(nextValues || [])]) {
-        const normalized = compactText(value).slice(0, 180);
-        if (!normalized || merged.includes(normalized)) continue;
-        merged.push(normalized);
-    }
-    return merged.slice(0, limit);
-}
-
-function getResourcePublishedSuccessCount(resource = {}) {
-    return Object.values(resource.publishHistory || {}).reduce((total, entry) => {
-        return total + Number(entry?.attempts?.published || 0);
-    }, 0) + (resource.status === 'published' ? 1 : 0);
-}
-
-function getResourceAnchorVerifiedCount(resource = {}) {
-    let count = 0;
-    if (resource.publishMeta?.anchorVisible) count += 1;
-    for (const entry of Object.values(resource.publishHistory || {})) {
-        if (entry?.publishMeta?.anchorVisible) count += 1;
-    }
-    return count;
-}
-
-function getEffectiveResourceSourceTier(resource = {}) {
-    if (
-        getResourcePublishedSuccessCount(resource) > 0
-        || getResourceAnchorVerifiedCount(resource) > 0
-        || resource.publishMeta?.commentFieldVerified
-    ) {
-        return SOURCE_TIERS.HISTORICAL_SUCCESS;
-    }
-
-    const candidates = [
-        resource.sourceTier,
-        resource.discoverySourceTier,
-        ...(resource.sourceTiers || [])
-    ];
-    return mergeSourceTierArrays([], candidates, 1)[0] || '';
-}
-
-function summarizeSourceEvidenceFromEdges(edges = []) {
-    const evidence = {
-        historicalSuccess: 0,
-        commentObserved: 0,
-        competitorBacklink: 0,
-        ruleGuess: 0,
-        aiGuess: 0
-    };
-
-    for (const edge of edges || []) {
-        const tier = normalizeSourceTier(String(edge || '').split('|')[0] || '');
-        if (tier === SOURCE_TIERS.HISTORICAL_SUCCESS) evidence.historicalSuccess++;
-        if (tier === SOURCE_TIERS.COMMENT_OBSERVED) evidence.commentObserved++;
-        if (tier === SOURCE_TIERS.COMPETITOR_BACKLINK) evidence.competitorBacklink++;
-        if (tier === SOURCE_TIERS.RULE_GUESS) evidence.ruleGuess++;
-        if (tier === SOURCE_TIERS.AI_GUESS) evidence.aiGuess++;
-    }
-
-    return evidence;
-}
-
-function calculateDomainQualityScore(entry = {}, profile = {}) {
-    let score = 10;
-    const sources = new Set(entry.sources || []);
-
-    score += Math.min((sources.size || 0) * 8, 24);
-    score += Math.round(getSourceTierScore(entry.sourceTier || '') * 0.35);
-    score += Math.min((entry.commentMentions || 0) * 4, 16);
-    score += Math.min((entry.drilldownPages || 0) * 3, 15);
-    score += Math.min((entry.commentOpportunityCount || 0) * 6, 18);
-    score += Math.min((entry.publishSuccessCount || 0) * 10, 24);
-    score += Math.min((entry.verifiedAnchorCount || 0) * 12, 24);
-    score -= Math.min((entry.blockedPublishCount || 0) * 6, 18);
-
-    if (profile.siteType === 'blog') score += 22;
-    if (profile.siteType === 'forum') score += 16;
-    if (profile.siteType === 'wiki') score += 10;
-    if (profile.siteType === 'directory') score += 8;
-    if (profile.siteType === 'store') score -= 8;
-    if (profile.cms === 'wordpress') score += 6;
-    if (profile.cms === 'ameba-ownd') score -= 16;
-    if (profile.commentCapable) score += 12;
-    if (profile.topic === 'gambling' || profile.topic === 'adult') score -= 18;
-    if (sources.has('A')) score += 6;
-    if (sources.has('M')) score += 4;
-    if (sources.has('W')) score += 3;
-
-    return Math.max(0, Math.min(100, Math.round(score)));
-}
-
-function buildDomainProfileFromHtml(url, html, hints = {}) {
-    const title = html.match(/<title[^>]*>(.*?)<\/title>/i)?.[1]?.trim()?.slice(0, 140) || '';
-    const description = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i)?.[1]?.trim()?.slice(0, 220) || '';
-    const language = inferLanguageFromHtml(html);
-    const cms = detectCmsFromHtml(html, url);
-    const siteType = detectSiteTypeFromHtml(html, url, hints.sampleUrls || []);
-    const pageText = html
-        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .slice(0, 5000);
-    const topic = detectTopicFromText(`${title} ${description} ${pageText}`);
-    const country = inferCountryFromDomain(getDomainBg(url), language);
-
-    return {
-        homepageUrl: url,
-        title,
-        description,
-        language,
-        country,
-        cms,
-        siteType,
-        topic,
-        commentCapable: /commentform|wp-comments-post|leave a reply|leave a comment/i.test(html),
-        trafficLabel: hints.trafficLabel || '',
-        profiledAt: new Date().toISOString()
-    };
-}
+// Domain profiling helpers moved to utils/domain-profile.js
 
 async function recordDomainIntel(items = [], context = {}) {
     if (!items.length) return;
@@ -2151,10 +1718,7 @@ async function resetAllLocalData() {
         clearTimeout(autoPublishDispatchTimer);
         autoPublishDispatchTimer = null;
     }
-    if (publishBatchAdvanceTimer) {
-        clearTimeout(publishBatchAdvanceTimer);
-        publishBatchAdvanceTimer = null;
-    }
+    publishBatchRuntime.clearAdvanceTimer();
     collectState = {
         isCollecting: false,
         domain: '',
@@ -2175,8 +1739,7 @@ async function resetAllLocalData() {
     };
     publishSessions = createDefaultPublishSessions();
     publishSessionsLoaded = false;
-    publishBatchState = createDefaultPublishBatchState();
-    publishBatchLoaded = false;
+    await publishBatchRuntime.reset({ loaded: false });
     domainIntelCache = { frontier: [], profiles: {} };
     domainIntelLoaded = false;
     continuousDiscoveryState = createDefaultContinuousDiscoveryState();
@@ -2559,253 +2122,24 @@ async function fetchAnalyzePage(link) {
 }
 
 function analyzeHtml(html, url, link) {
-    const htmlLower = html.toLowerCase();
-    const normalizedUrl = String(url || '').toLowerCase();
-    const opportunities = [];
-    const details = [];
-    const linkModes = [];
-    const hasTextarea = htmlLower.includes('<textarea');
-    const hasSubmitControl = htmlLower.includes('type="submit"') || htmlLower.includes('<button');
-    const hasUrlField =
-        htmlLower.includes('type="url"') ||
-        htmlLower.includes('name="url"') ||
-        htmlLower.includes('id="url"') ||
-        htmlLower.includes('name="website"') ||
-        htmlLower.includes('id="website"') ||
-        htmlLower.includes('homepage');
-    const hasCommentKeywords =
-        htmlLower.includes('comment') ||
-        htmlLower.includes('reply') ||
-        htmlLower.includes('leave a reply') ||
-        htmlLower.includes('leave a comment') ||
-        htmlLower.includes('post comment') ||
-        htmlLower.includes('发表评论') ||
-        htmlLower.includes('留言');
-    const hasIdentityFields =
-        htmlLower.includes('name="author"') ||
-        htmlLower.includes('id="author"') ||
-        htmlLower.includes('comment-form-author') ||
-        htmlLower.includes('name="email"') ||
-        htmlLower.includes('id="email"') ||
-        htmlLower.includes('comment-form-email') ||
-        htmlLower.includes('name="comment"') ||
-        htmlLower.includes('id="comment"') ||
-        htmlLower.includes('comment-form-comment');
-    const requiresLoginToPost =
-        htmlLower.includes('must be logged in to post a comment') ||
-        htmlLower.includes('you must be logged in to post a comment') ||
-        htmlLower.includes('log in to leave a comment') ||
-        htmlLower.includes('login to leave a comment') ||
-        htmlLower.includes('sign in to leave a comment') ||
-        htmlLower.includes('sign in to comment') ||
-        htmlLower.includes('log in to comment') ||
-        htmlLower.includes('please log in to comment') ||
-        htmlLower.includes('register to reply');
-    const commentsClosed =
-        htmlLower.includes('comments are closed') ||
-        htmlLower.includes('commenting is closed') ||
-        htmlLower.includes('discussion closed');
-    const hasCaptcha =
-        htmlLower.includes('g-recaptcha') ||
-        htmlLower.includes('grecaptcha') ||
-        htmlLower.includes('hcaptcha') ||
-        htmlLower.includes('turnstile') ||
-        htmlLower.includes('cloudflare-turnstile') ||
-        htmlLower.includes('captcha');
-    const supportsMarkdownLinks =
-        hasTextarea &&
-        (
-            /markdown|commonmark|marked|supports markdown|markdown editor|use markdown|支持markdown|使用markdown/i.test(html)
-            || /\[[^\]]+\]\((https?:\/\/|\/)/i.test(html)
-        );
-    const supportsBbcodeLinks =
-        hasTextarea &&
-        (
-            /bbcode|ubb|bulletin board code|支持bbcode/i.test(html)
-            || /\[url(?:=|\])/i.test(html)
-        );
-    const supportsPlainUrlLinks =
-        hasTextarea &&
-        /autolink|linkify|plain url|bare url|paste a url|paste url|urls? will be linked|自动识别链接|自动转链接/i.test(html);
-    const hasExplicitHtmlAnchorHint =
-        /(allowed html tags|html tags allowed|you may use these html tags|allowed tags|comment html|html标签|允许使用html|可用标签)/i.test(html);
-    const hasInlineSubmitForm = hasSubmitControl && (hasTextarea || hasIdentityFields || hasUrlField);
-    const isAmebaOwnd =
-        /powered by ownd|ameba ownd/i.test(html)
-        || /(?:^|\/\/|\.)(shopinfo\.jp|themedia\.jp)\b/.test(normalizedUrl);
-
-    // 1. 博客评论表单
-    if (htmlLower.includes('commentform') ||
-        htmlLower.includes('comment-form') ||
-        htmlLower.includes('comment-respond') ||
-        htmlLower.includes('id="respond"') ||
-        htmlLower.includes('wp-comments-post') ||
-        htmlLower.includes('leave a reply') ||
-        htmlLower.includes('leave a comment') ||
-        htmlLower.includes('发表评论') ||
-        htmlLower.includes('留下评论') ||
-        (hasTextarea && hasSubmitControl && (hasCommentKeywords || hasIdentityFields))) {
-        opportunities.push('comment');
-        if (hasUrlField) {
-            details.push('website-field');
-            linkModes.push('website-field');
-        }
-        if (hasInlineSubmitForm) {
-            details.push('inline-submit-form');
-        }
-        if (isAmebaOwnd) {
-            details.push('ameba-ownd');
-        }
-        if (htmlLower.includes('wordpress') || htmlLower.includes('wp-content')) {
-            details.push('wordpress');
-        }
-        if (hasExplicitHtmlAnchorHint) {
-            details.push('allowed-html-anchor');
-            linkModes.push('raw-html-anchor');
-        }
-        if (supportsMarkdownLinks) {
-            details.push('markdown-link');
-            linkModes.push('markdown-link');
-        }
-        if (supportsBbcodeLinks) {
-            details.push('bbcode-link');
-            linkModes.push('bbcode-link');
-        }
-        if (supportsPlainUrlLinks) {
-            details.push('plain-url');
-            linkModes.push('plain-url');
-        }
-        if (
-            !hasUrlField
-            && !hasIdentityFields
-            && !hasExplicitHtmlAnchorHint
-            && !supportsMarkdownLinks
-            && !supportsBbcodeLinks
-            && !supportsPlainUrlLinks
-            && !htmlLower.includes('tinymce')
-            && !htmlLower.includes('ckeditor')
-            && !htmlLower.includes('quill')
-            && !htmlLower.includes('contenteditable="true"')
-        ) {
-            details.push('comment-only');
-        }
-    }
-
-    // 2. Disqus
-    if (htmlLower.includes('disqus_thread') || htmlLower.includes('disqus.com')) {
-        opportunities.push('disqus');
-    }
-
-    // 3. 论坛
-    if (htmlLower.includes('phpbb') || htmlLower.includes('vbulletin') ||
-        htmlLower.includes('discourse') || htmlLower.includes('xenforo') ||
-        htmlLower.includes('class="forum"') || htmlLower.includes('id="forum"') ||
-        htmlLower.includes('new-topic') || htmlLower.includes('create-topic') ||
-        htmlLower.includes('reply to thread') || htmlLower.includes('post reply')) {
-        opportunities.push('forum');
-    }
-
-    // 4. 注册/Profile
-    if ((htmlLower.includes('sign up') || htmlLower.includes('register') ||
-        htmlLower.includes('create account') || htmlLower.includes('注册')) &&
-        (htmlLower.includes('website') || htmlLower.includes('url') ||
-            htmlLower.includes('homepage') || htmlLower.includes('profile'))) {
-        opportunities.push('register');
-        details.push('profile-link');
-        linkModes.push('profile-link');
-    }
-
-    // 5. 提交网站
-    if (htmlLower.includes('submit your site') || htmlLower.includes('submit a site') ||
-        htmlLower.includes('add your site') || htmlLower.includes('submit website') ||
-        htmlLower.includes('submit url') || htmlLower.includes('提交网站') ||
-        htmlLower.includes('add your link') || htmlLower.includes('submit listing')) {
-        opportunities.push('submit-site');
-    }
-
-    // 6. Guest Post
-    if (htmlLower.includes('write for us') || htmlLower.includes('guest post') ||
-        htmlLower.includes('guest article') || htmlLower.includes('contribute') ||
-        htmlLower.includes('submit a post') || htmlLower.includes('投稿')) {
-        opportunities.push('guest-post');
-    }
-
-    // 7. Listing
-    if (htmlLower.includes('list your') || htmlLower.includes('submit your startup') ||
-        htmlLower.includes('submit your product') || htmlLower.includes('发布网站')) {
-        opportunities.push('listing');
-    }
-
-    // 8. 富文本编辑器
-    if (htmlLower.includes('tinymce') || htmlLower.includes('ckeditor') ||
-        htmlLower.includes('quill') || htmlLower.includes('contenteditable="true"')) {
-        opportunities.push('rich-editor');
-        details.push('可插入链接');
-        linkModes.push('rich-editor-anchor');
-        if (hasInlineSubmitForm) {
-            details.push('inline-submit-form');
-        }
-    }
-
-    // 9. Wiki
-    if (htmlLower.includes('mediawiki') || htmlLower.includes('action=edit')) {
-        opportunities.push('wiki');
-    }
-
-    // 10. 通用表单
-    if (opportunities.length === 0) {
-        const hasUrlInput = hasUrlField || htmlLower.includes('name="link"');
-        const hasSubmit = hasSubmitControl;
-
-        if (hasTextarea && hasUrlInput && hasSubmit) {
-            opportunities.push('form');
-            details.push('textarea+url+submit');
-            details.push('inline-submit-form');
-            details.push('website-field');
-            linkModes.push('website-field');
-        }
-    }
-
-    if (opportunities.length === 0) return null;
-
-    if (requiresLoginToPost) {
-        details.push('login-required');
-    }
-    if (commentsClosed) {
-        details.push('comment-closed');
-    }
-    if (hasCaptcha) {
-        details.push('captcha');
-    }
-
-    const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
-    const pageTitle = titleMatch ? titleMatch[1].trim().substring(0, 100) : '';
-    const resourceShape = {
-        url,
-        pageTitle,
-        opportunities,
-        details,
-        linkModes: Array.from(new Set(linkModes))
-    };
-    const resourceClass = self.ResourceRules?.getResourceClass?.(resourceShape) || '';
-    const frictionLevel = self.ResourceRules?.getResourceFrictionLevel?.(resourceShape) || '';
-    const directPublishReady = !!self.ResourceRules?.isDirectPublishReady?.(resourceShape);
+    const result = self.HtmlCommentDetection?.analyze?.(html, url, {
+        resourceRules: self.ResourceRules
+    });
+    if (!result) return null;
 
     return {
         url,
-        pageTitle,
-        opportunities,
-        details,
+        pageTitle: result.pageTitle || '',
+        opportunities: result.opportunities || [],
+        details: result.details || [],
         sources: link.sources || [],
-        linkModes: resourceShape.linkModes,
-        linkMethod: linkModes.includes('raw-html-anchor') || linkModes.includes('rich-editor-anchor')
-            ? 'html'
-            : (linkModes.includes('website-field') ? 'website-field' : 'text'),
-        hasCaptcha,
-        hasUrlField,
-        resourceClass,
-        frictionLevel,
-        directPublishReady
+        linkModes: result.linkModes || [],
+        linkMethod: result.linkMethod || 'text',
+        hasCaptcha: !!result.hasCaptcha,
+        hasUrlField: !!result.hasUrlField,
+        resourceClass: result.resourceClass || '',
+        frictionLevel: result.frictionLevel || '',
+        directPublishReady: !!result.directPublishReady
     };
 }
 
@@ -5120,10 +4454,7 @@ async function resetAllPublishStatuses() {
     publishSessions = createDefaultPublishSessions();
     publishSessionsLoaded = true;
     await flushPublishSessions();
-    publishBatchState = createDefaultPublishBatchState();
-    publishBatchLoaded = true;
-    await flushPublishBatchState();
-    broadcastPublishBatchState();
+    await publishBatchRuntime.reset({ loaded: true });
 
     await Logger.publish(`已将发布资源重置为待发布，并清空历史尝试记录`, {
         resetCount,
@@ -5151,7 +4482,7 @@ function stopCollect() {
 async function stopPublish(taskId, options = {}) {
     await ensurePublishSessionsLoaded();
     await ensurePublishBatchStateLoaded();
-    const batchCurrentTaskId = publishBatchState.currentTaskId || '';
+    const batchCurrentTaskId = publishBatchRuntime.getState().currentTaskId || '';
     const shouldStopBatch = !options.skipBatchStop
         && isPublishBatchRunning()
         && (!taskId || !batchCurrentTaskId || batchCurrentTaskId === taskId);
@@ -5282,6 +4613,7 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
         ? overrides.website
         : (shouldOmitWebsiteField ? '' : (task.website || settings.website || ''));
     const workflowScriptFiles = workflow?.scripts?.length ? [...workflow.scripts] : [
+        'content/comment-form-detection.js',
         'content/comment-standard-flow.js',
         'content/comment-executor.js',
         'content/comment-preflight.js',
@@ -5345,6 +4677,7 @@ function ensurePublishContentScripts(scriptFiles = []) {
     }
 
     const requiredFiles = [
+        'content/comment-form-detection.js',
         'content/comment-standard-flow.js',
         'content/comment-executor.js',
         'content/comment-preflight.js'

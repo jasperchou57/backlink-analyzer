@@ -15,7 +15,11 @@ const TaskManager = {
             currentLimitCount: 0,
             targetLimitCount: 0,
             sessionPublishedCount: 0,
-            sessionAnchorSuccessCount: 0
+            sessionAnchorSuccessCount: 0,
+            currentStage: '',
+            currentStageLabel: '',
+            currentStageAt: '',
+            resultLock: null
         };
     },
 
@@ -53,7 +57,10 @@ const TaskManager = {
             currentLimitCount: Number(state.currentLimitCount || 0),
             targetLimitCount: Number(state.targetLimitCount || 0),
             sessionPublishedCount: Number(state.sessionPublishedCount || 0),
-            sessionAnchorSuccessCount: Number(state.sessionAnchorSuccessCount || 0)
+            sessionAnchorSuccessCount: Number(state.sessionAnchorSuccessCount || 0),
+            currentStage: state.currentStage || '',
+            currentStageLabel: state.currentStageLabel || '',
+            currentStageAt: state.currentStageAt || ''
         };
     },
 

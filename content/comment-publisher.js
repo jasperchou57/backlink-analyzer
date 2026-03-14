@@ -12,7 +12,10 @@
     let currentDebugMode = false;
     let currentDebugInfo = null;
     let publishStopped = false;
+    let fillCommentInProgress = false;
+    let publishResultReported = false;
     let autoSubmitTimer = null;
+    let submissionFallbackTimer = null;
     let workflowStallTimer = null;
     let currentPublishMeta = null;
     const WORKFLOW_STALL_TIMEOUT_MS = 18000;
@@ -94,6 +97,19 @@
         }
     };
 
+    const WORKFLOW_STAGE_TIMEOUTS = {
+        bootstrap: { fast: 9000, hybrid: 12000, ai: 15000 },
+        preflight: { fast: 7000, hybrid: 10000, ai: 12000 },
+        finding_form: { fast: 7000, hybrid: 10000, ai: 14000 },
+        form_detected: { fast: 6000, hybrid: 8000, ai: 10000 },
+        generating_comment: { fast: 4000, hybrid: 5000, ai: 7000 },
+        comment_ready: { fast: 4000, hybrid: 5000, ai: 7000 },
+        filling_form: { fast: 12000, hybrid: 16000, ai: 22000 },
+        form_filled: { fast: 4500, hybrid: 6000, ai: 8000 },
+        pre_submit: { fast: 5000, hybrid: 7000, ai: 9000 },
+        submitting: { fast: 10000, hybrid: 12000, ai: 15000 }
+    };
+
     function isStrictAnchorCommentStyle(value) {
         return compactText(value || '') === 'anchor-html';
     }
@@ -116,12 +132,25 @@
     });
 
     async function fillCommentForm(data) {
+        const incomingRunKey = `${data?.taskId || ''}:${data?.resourceId || ''}`;
+        const activeRunKey = `${currentTaskId || ''}:${currentResourceId || ''}`;
+        if (fillCommentInProgress) {
+            if (incomingRunKey === activeRunKey) {
+                return;
+            }
+            cancelCurrentPublish();
+            await wait(120);
+        }
+
+        fillCommentInProgress = true;
         currentResourceId = data.resourceId;
         currentTaskId = data.taskId;
         currentDebugMode = !!data.debugMode;
         currentDebugInfo = { mode: data.mode || 'semi-auto', actions: [] };
         publishStopped = false;
+        publishResultReported = false;
         clearAutoSubmitTimer();
+        clearSubmissionFallbackTimer();
         clearWorkflowStallTimer();
         currentPublishMeta = {
             commentStyle: data.commentStyle || 'standard',
@@ -166,8 +195,9 @@
         };
         context.execution = resolveExecutionProfile(context);
 
+        updateWorkflowProgress(context, 'bootstrap', '初始化页面发布上下文');
         await primeCommentSectionSearch(context, { immediate: true, forceProgressiveScroll: true });
-        armWorkflowStallTimer(context);
+        updateWorkflowProgress(context, 'preflight', '定位评论区并预处理页面');
 
         addDebugEvent('field', `Workflow: ${workflow.name || workflow.id}`);
         addDebugEvent('field', `Publish mode: ${context.mode}${currentDebugMode ? ' (debug pause enabled)' : ''}`);
@@ -182,6 +212,8 @@
             console.log('[BLA] 工作流执行失败:', e);
             addDebugEvent('field', `Workflow failed: ${e.message}`);
             reportResult('failed');
+        } finally {
+            fillCommentInProgress = false;
         }
     }
 
@@ -233,6 +265,7 @@
         }
 
         context.form = form;
+        updateWorkflowProgress(context, 'form_detected', '识别到标准评论表单');
         prepareFormForInteraction(context.form);
         context.form.style.outline = '2px dashed #3ecfff';
         context.form.style.outlineOffset = '8px';
@@ -256,14 +289,17 @@
         if (context.workflowAborted) {
             return true;
         }
+        updateWorkflowProgress(context, 'form_filled', '标准评论表单已填写');
         executeSolveCaptchaStep(context);
         executeAntiSpamStep(context);
         executeUncheckNotificationsStep(context);
+        updateWorkflowProgress(context, 'pre_submit', '正在检查验证码和提交前状态');
         executeFinalizeStep(context);
         return true;
     }
 
     async function executeFindFormStep(step, context) {
+        updateWorkflowProgress(context, 'finding_form', '正在识别评论表单');
         await primeCommentSectionSearch(context, { immediate: true, forceProgressiveScroll: true });
         context.form = await waitForCommentForm(context, {
             useAI: context.useAI && step.useAI !== false && context.execution.useAIForForm,
@@ -277,6 +313,7 @@
             throw new Error('Comment form not found');
         }
 
+        updateWorkflowProgress(context, 'form_detected', '已识别评论表单');
         prepareFormForInteraction(context.form);
         context.form.style.outline = '2px dashed #3ecfff';
         context.form.style.outlineOffset = '8px';
@@ -293,6 +330,12 @@
             email: context?.values?.email || '',
             website: context?.values?.website || ''
         };
+        updateWorkflowProgress(
+            context,
+            'filling_form',
+            '正在填写标准评论表单',
+            { timeoutMs: estimateFormFillTimeoutMs(context, values) }
+        );
 
         const standardFlow = getStandardCommentFlow();
         const standardFill = standardFlow?.fillStandardCommentForm
@@ -387,6 +430,7 @@
     }
 
     async function executeGenerateCommentStep(step, context) {
+        updateWorkflowProgress(context, 'generating_comment', '正在准备评论内容');
         await prepareCommentContent(context, step);
     }
 
@@ -396,12 +440,17 @@
             return false;
         }
 
-        addDebugEvent('field', `Existing comment detected for ${context?.values?.name || 'current commenter'}; skipping`);
+        const matchedToken = compactText(existingComment.matchedToken || '');
+        addDebugEvent(
+            'field',
+            `Existing comment detected for ${context?.values?.name || 'current commenter'}; skipping${matchedToken ? ` (${matchedToken})` : ''}`
+        );
         currentPublishMeta = {
             ...(currentPublishMeta || {}),
             duplicateCommentDetected: true,
             duplicateCommentExcerpt: truncateText(compactText(existingComment.text || ''), 180),
-            duplicateCommentSelector: existingComment.selector || ''
+            duplicateCommentSelector: existingComment.selector || '',
+            duplicateCommentMatchedToken: matchedToken
         };
         context.workflowAborted = true;
         reportResult('skipped', {
@@ -500,6 +549,7 @@
             inlineLinkMode: context.anchorOptions.linkMode || '',
             commentPreview: truncateText(compactText(context.comment || ''), 180)
         };
+        updateWorkflowProgress(context, 'comment_ready', '评论内容已准备好');
 
         if (context.anchorOptions.useInlineLink) {
             addDebugEvent(
@@ -519,6 +569,12 @@
             email: context.values.email,
             website: context.values.website
         };
+        updateWorkflowProgress(
+            context,
+            'filling_form',
+            '正在填写评论表单',
+            { timeoutMs: estimateFormFillTimeoutMs(context, values) }
+        );
         const allowedFields = Array.isArray(step.fields) && step.fields.length > 0
             ? step.fields
             : ['comment', 'name', 'email', 'website'];
@@ -580,6 +636,7 @@
                 addDebugEvent('field', 'Comment field still empty after fill attempts');
             }
         }
+        updateWorkflowProgress(context, 'form_filled', '评论表单已填写完成');
     }
 
     function executeSolveCaptchaStep(context) {
@@ -605,6 +662,7 @@
 
     function executeFinalizeStep(context) {
         if (publishStopped) return;
+        updateWorkflowProgress(context, 'pre_submit', context.mode === 'full-auto' && !currentDebugMode ? '准备自动提交评论' : '等待人工确认提交');
 
         if (context.mode === 'full-auto' && !currentDebugMode) {
             autoSubmitTimer = setTimeout(() => {
@@ -620,49 +678,11 @@
 
     // === 表单查找（规则） ===
     function findFormByRules() {
-        const candidates = new Map();
-        const addCandidate = (form, bonus = 0) => {
-            if (!form) return;
-            const previous = candidates.get(form) || 0;
-            candidates.set(form, previous + scoreCommentForm(form) + bonus);
-        };
-
-        const selectors = [
-            '#commentform',
-            '#respond form',
-            '.comment-form',
-            'form[action*="wp-comments-post"]',
-            'form.comment-form',
-            '#comments form',
-            '.post-comments form',
-            '.comment-respond form'
-        ];
-        selectors.forEach((selector) => {
-            document.querySelectorAll(selector).forEach((form) => addCandidate(form, 30));
-        });
-
-        document.querySelectorAll('form').forEach((form) => addCandidate(form, 0));
-
-        // 通用：通过 textarea 反推 form
-        const textareas = document.querySelectorAll('textarea');
-        for (const ta of textareas) {
-            const nameAttr = (ta.name || ta.id || '').toLowerCase();
-            const placeholder = (ta.placeholder || '').toLowerCase();
-            if (nameAttr.includes('comment') || nameAttr.includes('message') ||
-                nameAttr.includes('reply') ||
-                placeholder.includes('coment') ||
-                placeholder.includes('comment') || placeholder.includes('leave') ||
-                placeholder.includes('reply')) {
-                const form = ta.closest('form');
-                addCandidate(form, 20);
-            }
+        const detection = getCommentFormDetection();
+        if (detection?.findRuleBasedCommentForm) {
+            return detection.findRuleBasedCommentForm(document);
         }
-
-        const rankedForms = Array.from(candidates.entries())
-            .filter(([form]) => formHasInteractiveFields(form))
-            .sort((left, right) => right[1] - left[1]);
-
-        return rankedForms[0]?.[0] || null;
+        return null;
     }
 
     function findStandardCommentForm() {
@@ -912,29 +932,6 @@
 
     function fieldValueMatches(el, expectedValue) {
         return compactText(readElementValue(el)) === compactText(expectedValue || '');
-    }
-
-    function scoreCommentForm(form) {
-        if (!form) return -Infinity;
-
-        const signature = compactText(
-            `${form.id || ''} ${form.className || ''} ${form.getAttribute('action') || ''}`
-        ).toLowerCase();
-        const text = compactText(form.textContent || '').toLowerCase();
-        let score = 0;
-
-        if (isVisible(form)) score += 20;
-        if (/comment|respond|reply/.test(signature)) score += 35;
-        if (/wp-comments-post/.test(signature)) score += 30;
-        if (/(deja un comentario|leave a comment|发表评论|发表回复|reply|comentario)/.test(text)) score += 25;
-        if (form.querySelector('textarea')) score += 10;
-        if (form.querySelector('textarea[name="comment"], textarea#comment, textarea[name*="comment" i], textarea[name*="message" i]')) score += 25;
-        if (form.querySelector('input[name="author"], input#author, input[name="name"], input[name*="name" i]')) score += 12;
-        if (form.querySelector('input[name="email"], input#email, input[type="email"], input[name*="mail" i]')) score += 12;
-        if (form.querySelector('input[name="url"], input#url, input[name="website"], input[type="url"], input[name*="web" i]')) score += 8;
-        if (findSubmitButton(form)) score += 10;
-
-        return score;
     }
 
     // === 取消通知勾选 ===
@@ -1201,6 +1198,7 @@
     async function submitForm(context) {
         const form = context.form;
         if (publishStopped) return;
+        updateWorkflowProgress(context, 'submitting', '正在提交评论');
 
         const fallbackComment = compactText(context.comment || '')
             || generateFallbackComment(context.pageTitle, {
@@ -1243,10 +1241,18 @@
             return;
         }
 
-        setTimeout(() => reportResult('submitted', { reportedVia: 'timeout-fallback' }), 8000);
+        clearSubmissionFallbackTimer();
+        submissionFallbackTimer = setTimeout(() => reportResult('submitted', { reportedVia: 'timeout-fallback' }), 8000);
     }
 
     function reportResult(result, extraMeta = {}) {
+        if (publishResultReported) {
+            return;
+        }
+        publishResultReported = true;
+        publishStopped = true;
+        clearAutoSubmitTimer();
+        clearSubmissionFallbackTimer();
         clearWorkflowStallTimer();
         const startedAt = currentPublishMeta?.publishStartedAt || '';
         const durationMs = startedAt ? Math.max(0, Date.now() - new Date(startedAt).getTime()) : 0;
@@ -1358,6 +1364,7 @@
     function cancelCurrentPublish() {
         publishStopped = true;
         clearAutoSubmitTimer();
+        clearSubmissionFallbackTimer();
         clearWorkflowStallTimer();
         addDebugEvent('field', 'Publish session stopped by user');
         removeDialog();
@@ -1370,6 +1377,13 @@
         }
     }
 
+    function clearSubmissionFallbackTimer() {
+        if (submissionFallbackTimer) {
+            clearTimeout(submissionFallbackTimer);
+            submissionFallbackTimer = null;
+        }
+    }
+
     function clearWorkflowStallTimer() {
         if (workflowStallTimer) {
             clearTimeout(workflowStallTimer);
@@ -1377,12 +1391,14 @@
         }
     }
 
-    function armWorkflowStallTimer(context) {
+    function armWorkflowStallTimer(context, overrideTimeoutMs = null) {
         if (!context || context.mode !== 'full-auto' || currentDebugMode) {
             return;
         }
         clearWorkflowStallTimer();
-        const timeoutMs = Number(context.execution?.workflowStallTimeoutMs || 0) || WORKFLOW_STALL_TIMEOUT_MS;
+        const timeoutMs = Number(overrideTimeoutMs || 0)
+            || Number(context.execution?.workflowStallTimeoutMs || 0)
+            || WORKFLOW_STALL_TIMEOUT_MS;
         workflowStallTimer = setTimeout(() => {
             workflowStallTimer = null;
             if (publishStopped) return;
@@ -1393,6 +1409,51 @@
                 submissionBlocked: true
             });
         }, timeoutMs);
+    }
+
+    function getStageTimeoutMs(context, stage = '') {
+        const profileId = compactText(context?.execution?.id || 'ai') || 'ai';
+        return Number(WORKFLOW_STAGE_TIMEOUTS[stage]?.[profileId] || 0)
+            || Number(context?.execution?.workflowStallTimeoutMs || 0)
+            || WORKFLOW_STALL_TIMEOUT_MS;
+    }
+
+    function estimateFormFillTimeoutMs(context, values = {}) {
+        const profileId = compactText(context?.execution?.id || 'ai') || 'ai';
+        const baseTimeoutMs = getStageTimeoutMs(context, 'filling_form');
+        const commentLength = compactText(values?.comment || '').length;
+        const activeFieldCount = ['name', 'email', 'website']
+            .reduce((count, field) => count + (compactText(values?.[field] || '') ? 1 : 0), 0);
+        const perCharMs = context?.execution?.preferHumanTypingForComment === false ? 8 : 24;
+        const typingCostMs = Math.min(16000, commentLength * perCharMs);
+        const fieldCostMs = activeFieldCount * 1200;
+        const minByProfile = profileId === 'fast' ? 12000 : profileId === 'hybrid' ? 16000 : 22000;
+        return Math.max(baseTimeoutMs, minByProfile, 3000 + typingCostMs + fieldCostMs);
+    }
+
+    function updateWorkflowProgress(context, stage = '', stageLabel = '', options = {}) {
+        const normalizedStage = compactText(stage || '');
+        const normalizedLabel = compactText(stageLabel || '');
+        if (!normalizedStage) return;
+
+        currentPublishMeta = {
+            ...(currentPublishMeta || {}),
+            workflowStage: normalizedStage,
+            workflowStageLabel: normalizedLabel,
+            workflowStageAt: new Date().toISOString()
+        };
+
+        const timeoutMs = Number(options.timeoutMs || 0) || getStageTimeoutMs(context, normalizedStage);
+        armWorkflowStallTimer(context, timeoutMs);
+
+        chrome.runtime.sendMessage({
+            action: 'commentProgress',
+            resourceId: currentResourceId,
+            taskId: currentTaskId,
+            stage: normalizedStage,
+            stageLabel: normalizedLabel,
+            stageTimeoutMs: timeoutMs
+        }).catch(() => {});
     }
 
     function resolveWorkflow(workflow) {
@@ -1892,6 +1953,10 @@
         return window.CommentStandardFlow || null;
     }
 
+    function getCommentFormDetection() {
+        return window.CommentFormDetection || null;
+    }
+
     async function primeCommentSectionSearch(context = {}, options = {}) {
         const preflight = getCommentPreflight();
         if (!preflight?.primeCommentSectionSearch) {
@@ -1913,11 +1978,11 @@
     }
 
     function formHasInteractiveFields(form) {
-        if (!form) return false;
-        const hasTextArea = !!form.querySelector('textarea');
-        const hasTextInput = !!form.querySelector('input[type="text"], input[type="email"], input[type="url"], input:not([type])');
-        const hasSubmit = !!findSubmitButton(form);
-        return (hasTextArea || hasTextInput) && hasSubmit;
+        const detection = getCommentFormDetection();
+        if (detection?.formHasInteractiveFields) {
+            return detection.formHasInteractiveFields(form);
+        }
+        return false;
     }
 
     function shouldUseClassicCommentFastPath(form) {

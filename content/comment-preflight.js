@@ -143,9 +143,49 @@
         return '';
     }
 
+    function buildDuplicateTargetTokens(context = {}) {
+        const tokens = new Set();
+        const anchorUrl = compactText(context?.data?.anchorUrl || context?.values?.website || '');
+        const anchorText = compactText(context?.data?.anchorKeyword || '');
+
+        if (anchorText && anchorText.length >= 3) {
+            tokens.add(normalizeComparableText(anchorText));
+        }
+
+        if (!anchorUrl) {
+            return Array.from(tokens);
+        }
+
+        try {
+            const parsed = new URL(anchorUrl);
+            const hostname = normalizeComparableText(parsed.hostname.replace(/^www\./i, ''));
+            const primaryLabel = normalizeComparableText((parsed.hostname.replace(/^www\./i, '').split('.')[0] || '').replace(/[-_]+/g, ' '));
+            const pathname = normalizeComparableText(parsed.pathname.replace(/\/+$/, ''));
+            const normalizedUrl = normalizeComparableText(anchorUrl)
+                .replace(/^https?:\/\//, '')
+                .replace(/^www\./, '')
+                .replace(/\/+$/, '');
+
+            if (hostname) tokens.add(hostname);
+            if (primaryLabel && primaryLabel.length >= 3) tokens.add(primaryLabel);
+            if (pathname && pathname.length >= 6) tokens.add(pathname);
+            if (normalizedUrl) tokens.add(normalizedUrl);
+        } catch {
+            const normalized = normalizeComparableText(anchorUrl)
+                .replace(/^https?:\/\//, '')
+                .replace(/^www\./, '')
+                .replace(/\/+$/, '');
+            if (normalized) tokens.add(normalized);
+        }
+
+        return Array.from(tokens).filter((token) => token.length >= 3);
+    }
+
     function findExistingCommentByCommenter(context = {}) {
         const commenterName = normalizeComparableText(context?.values?.name || context?.data?.name || '');
         if (!commenterName) return null;
+        const duplicateTokens = buildDuplicateTargetTokens(context);
+        if (duplicateTokens.length === 0) return null;
 
         const commentsRoot = globalScope.document.querySelector('#comments, .comments-area, .comment-list, .commentlist');
         if (!commentsRoot) return null;
@@ -163,11 +203,17 @@
                 if (!normalizedAuthor.includes(commenterName) && !commenterName.includes(normalizedAuthor)) {
                     return null;
                 }
+                const normalizedText = normalizeComparableText(node.textContent || '');
+                const matchedToken = duplicateTokens.find((token) => normalizedText.includes(token));
+                if (!matchedToken) {
+                    return null;
+                }
                 return {
                     node,
                     text: compactText(node.textContent || ''),
                     selector: describeElement(node),
-                    authorText
+                    authorText,
+                    matchedToken
                 };
             })
             .filter(Boolean);

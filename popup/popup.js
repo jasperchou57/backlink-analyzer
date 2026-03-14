@@ -41,6 +41,10 @@ let visiblePublishTaskIdsByWorkflow = {};
 let resourcePanel = null;
 let taskRenderDiagnostics = [];
 
+function compactText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
     const surface = await detectSurface();
     document.body.dataset.surface = surface;
@@ -704,7 +708,10 @@ function updatePublishProgress(msg) {
                     targetLimitCount: Number(msg.targetLimitCount ?? existing.targetLimitCount ?? 0),
                     limitType: msg.limitType || existing.limitType || '',
                     sessionPublishedCount: Number(msg.sessionPublishedCount ?? existing.sessionPublishedCount ?? 0),
-                    sessionAnchorSuccessCount: Number(msg.sessionAnchorSuccessCount ?? existing.sessionAnchorSuccessCount ?? 0)
+                    sessionAnchorSuccessCount: Number(msg.sessionAnchorSuccessCount ?? existing.sessionAnchorSuccessCount ?? 0),
+                    currentStage: msg.currentStage || existing.currentStage || '',
+                    currentStageLabel: msg.currentStageLabel || existing.currentStageLabel || '',
+                    currentStageAt: msg.currentStageAt || existing.currentStageAt || ''
                 }
             }
         };
@@ -1271,8 +1278,9 @@ async function refreshTasks() {
                 ? `${sessionLimitLabel} ${Number(sessionState?.currentLimitCount || 0)} / ${Number(sessionState?.targetLimitCount || 0)}`
                 : (sessionState?.total ? `${sessionAttemptCount} / ${sessionState.total}` : '未启动');
             const sessionSecondaryText = hasSessionLimit && sessionState?.total
-                ? `已尝试 ${sessionAttemptCount} / ${sessionState.total}`
+                ? `队列进度 ${sessionAttemptCount} / ${sessionState.total}`
                 : '';
+            const sessionStageText = compactText(sessionState?.currentStageLabel || sessionState?.currentStage || '');
             const publishOverviewHtml = taskType === 'publish'
             ? `
                 <div class="task-overview-toggle">${isExpanded ? '收起发布概览' : '展开发布概览'}</div>
@@ -1301,7 +1309,7 @@ async function refreshTasks() {
                             <span class="task-overview-bar-value">${publishOverview.direct}</span>
                         </div>
                         <div class="task-overview-bar">
-                            <span class="task-overview-bar-label">🧭 当前任务累计免登录直发 / 已尝试</span>
+                            <span class="task-overview-bar-label">🧭 当前任务累计免登录直发 / 队列进度</span>
                             <span class="task-overview-bar-value">${publishOverview.directTotal}</span>
                         </div>
                         <div class="task-overview-bar anchor">
@@ -1319,6 +1327,7 @@ async function refreshTasks() {
                         <div class="task-session-progress">
                             <div class="task-session-progress-fill" style="width:${sessionLimitProgressPercent}%"></div>
                         </div>
+                        ${sessionStageText ? `<div class="task-session-subtext">当前阶段：${escapeHtml(sessionStageText)}</div>` : ''}
                         <div class="task-session-foot">
                             <span class="task-session-text">${sessionStatusText}</span>
                             <div class="task-session-actions">
