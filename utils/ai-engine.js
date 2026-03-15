@@ -91,44 +91,202 @@ Respond in JSON format:
         }
     },
 
+    // ============================================================
+    // Agent 模式 — 带工具调用的 AI 步骤
+    // ============================================================
+
     /**
-     * 表单提取 - 识别页面评论表单结构
+     * Agent 步骤调用 — 发送页面状态给 AI，返回工具调用指令
+     * @param {object} params
+     * @param {string} params.elements - 页面元素列表（[index]<type>text 格式）
+     * @param {string} params.url - 当前页面 URL
+     * @param {string} params.title - 当前页面标题
+     * @param {string} params.task - 用户任务描述
+     * @param {Array} params.history - 之前步骤的历史记录
+     * @param {number} params.step - 当前步骤号
+     * @param {number} params.maxSteps - 最大步骤数
+     * @returns {object} { action, params, evaluation, memory, nextGoal, done, success }
      */
-    async extractFormStructure(htmlSnippet) {
-        const prompt = `Analyze this HTML and identify the comment form structure.
-For each form field, provide:
-- field type (comment/name/email/website/captcha/checkbox)
-- CSS selector to target it
-- For captcha: the question and answer
+    async agentStep(params) {
+        const settings = await this._getSettings();
+        const apiKey = settings.openrouterApiKey;
+        if (!apiKey) throw new Error('OpenRouter API Key 未配置');
 
-HTML:
-${htmlSnippet.substring(0, 3000)}
+        const model = settings.modelCommentGen || settings.modelFormExtract;
+        if (!model) throw new Error('AI 模型未配置');
 
-Respond in JSON format:
-{
-  "hasForm": true/false,
-  "formSelector": "CSS selector for the form",
-  "fields": [
-    {"type": "comment", "selector": "textarea#comment", "required": true},
-    {"type": "name", "selector": "input#author", "required": true},
-    {"type": "email", "selector": "input#email", "required": true},
-    {"type": "website", "selector": "input#url", "required": false},
-    {"type": "captcha", "selector": "input#captcha", "question": "1+10=?", "answer": "11"},
-    {"type": "checkbox", "selector": "input#not-spam", "label": "Confirm you are NOT a spammer", "shouldCheck": true}
-  ],
-  "submitSelector": "CSS selector for submit button"
-}`;
+        const systemPrompt = this._buildAgentSystemPrompt();
+        const userPrompt = this._buildAgentUserPrompt(params);
 
-        const result = await this.call('formExtract', prompt, {
-            system: 'You are an HTML form analyzer. Identify comment form fields precisely. Respond only in valid JSON.',
-            temperature: 0.2,
-            maxTokens: 512
+        const body = {
+            model,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ],
+            tools: this._getAgentTools(),
+            tool_choice: { type: 'function', function: { name: 'agent_action' } },
+            max_tokens: 1024,
+            temperature: 0.3,
+        };
+
+        const response = await fetch(this.API_URL, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': 'chrome-extension://backlink-analyzer',
+                'X-Title': 'Backlink Analyzer'
+            },
+            body: JSON.stringify(body)
         });
 
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`API 错误 (${response.status}): ${errText}`);
+        }
+
+        const data = await response.json();
+        return this._parseAgentResponse(data);
+    },
+
+    _buildAgentSystemPrompt() {
+        return `You are a browser automation agent that fills comment forms on blog pages.
+
+You operate in a loop: observe the page → decide an action → execute → observe again.
+
+<input_format>
+You receive a list of interactive page elements in this format:
+[index]<tagName attributes>visible text />
+Use the index number to interact with elements.
+</input_format>
+
+<rules>
+1. Only interact with elements by their [index] number
+2. Fill the comment form fields: comment text, author name, email, website URL
+3. Generate a genuine, relevant comment based on the page title (2-4 sentences, not spammy)
+4. Uncheck notification/subscription checkboxes if checked
+5. Check anti-spam checkboxes (e.g. "I am not a spammer")
+6. Solve simple math captchas (e.g. "3 + 7 = ?") by calculating the answer
+7. If you encounter a CAPTCHA you cannot solve, use ask_user
+8. After filling all fields, use done with success=true
+9. If there is no comment form on the page, use done with success=false
+10. Do NOT click submit buttons — just fill the form
+11. If the page needs scrolling to find the comment form, scroll down first
+12. Maximum 3 attempts per action — if something fails 3 times, skip it
+</rules>
+
+<output_format>
+Always respond with a single tool call to agent_action containing:
+- evaluation: brief assessment of what happened in the last step
+- next_goal: what you plan to do next
+- action_name: one of click_element_by_index, input_text, select_dropdown_option, scroll, wait, ask_user, done
+- action_params: parameters for the action
+</output_format>`;
+    },
+
+    _buildAgentUserPrompt(params) {
+        const { elements, url, title, task, history, step, maxSteps } = params;
+
+        let prompt = `<task>${task}</task>\n`;
+        prompt += `<step>Step ${step} of ${maxSteps}</step>\n`;
+        prompt += `<page url="${url}" title="${title}">\n`;
+        prompt += elements;
+        prompt += `\n</page>\n`;
+
+        if (history && history.length > 0) {
+            prompt += `<history>\n`;
+            for (const h of history.slice(-5)) { // 只保留最近 5 步
+                prompt += `Step ${h.step}: ${h.action}(${JSON.stringify(h.params)}) → ${h.result}\n`;
+            }
+            prompt += `</history>\n`;
+        }
+
+        return prompt;
+    },
+
+    _getAgentTools() {
+        return [{
+            type: 'function',
+            function: {
+                name: 'agent_action',
+                description: 'Execute the next browser action',
+                parameters: {
+                    type: 'object',
+                    required: ['action_name', 'action_params'],
+                    properties: {
+                        evaluation: {
+                            type: 'string',
+                            description: 'Brief assessment of the previous step result'
+                        },
+                        next_goal: {
+                            type: 'string',
+                            description: 'What you plan to do in this step'
+                        },
+                        action_name: {
+                            type: 'string',
+                            enum: ['click_element_by_index', 'input_text', 'select_dropdown_option',
+                                   'scroll', 'wait', 'ask_user', 'done'],
+                            description: 'The action to perform'
+                        },
+                        action_params: {
+                            type: 'object',
+                            description: 'Parameters for the action. For click: {index}. For input_text: {index, text}. For select: {index, text}. For scroll: {down, num_pages}. For wait: {seconds}. For ask_user: {question}. For done: {text, success}.',
+                            properties: {
+                                index: { type: 'integer' },
+                                text: { type: 'string' },
+                                down: { type: 'boolean' },
+                                num_pages: { type: 'number' },
+                                seconds: { type: 'number' },
+                                question: { type: 'string' },
+                                success: { type: 'boolean' }
+                            }
+                        }
+                    }
+                }
+            }
+        }];
+    },
+
+    _parseAgentResponse(data) {
+        const message = data.choices?.[0]?.message;
+        if (!message) throw new Error('AI 无响应');
+
+        // 优先解析 tool_calls
+        if (message.tool_calls && message.tool_calls.length > 0) {
+            const call = message.tool_calls[0];
+            let args;
+            try {
+                args = JSON.parse(call.function.arguments);
+            } catch {
+                throw new Error('AI 返回的参数格式错误');
+            }
+            return {
+                action: args.action_name,
+                params: args.action_params || {},
+                evaluation: args.evaluation || '',
+                nextGoal: args.next_goal || '',
+                done: args.action_name === 'done',
+                success: args.action_name === 'done' ? (args.action_params?.success ?? false) : null,
+                doneText: args.action_name === 'done' ? (args.action_params?.text || '') : ''
+            };
+        }
+
+        // 回退：尝试从 content 中解析 JSON
+        const content = message.content || '';
         try {
-            return JSON.parse(result.replace(/```json\n?|```\n?/g, ''));
+            const json = JSON.parse(content.replace(/```json\n?|```\n?/g, ''));
+            return {
+                action: json.action_name || 'done',
+                params: json.action_params || {},
+                evaluation: json.evaluation || '',
+                nextGoal: json.next_goal || '',
+                done: json.action_name === 'done',
+                success: json.action_params?.success ?? false,
+                doneText: json.action_params?.text || ''
+            };
         } catch {
-            return { hasForm: false, fields: [], formSelector: '', submitSelector: '' };
+            return { action: 'done', params: { success: false, text: 'AI 返回格式无法解析' }, done: true, success: false, doneText: content };
         }
     },
 

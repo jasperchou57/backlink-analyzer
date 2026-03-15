@@ -1,379 +1,318 @@
 /**
- * Comment Publisher V3 - AI 驱动
- * 智能表单识别 + 验证码处理 + AI 评论生成
+ * Comment Publisher - 轻量 UI 层
+ * 只负责：显示 Agent 状态浮层 + 用户确认弹窗 + ask_user 交互
+ * 所有 AI 逻辑和 Agent 循环在 background.js 中运行
  */
 
 (function () {
     if (window.__commentPublisherLoaded) return;
     window.__commentPublisherLoaded = true;
 
-    let currentResourceId = null;
-    let currentTaskId = null;
+    let overlay = null;
 
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-        if (msg.action === 'fillComment') {
-            fillCommentForm(msg.data);
+        switch (msg.action) {
+            case 'agent:showStatus':
+                showStatus(msg.step, msg.maxSteps, msg.text);
+                break;
+            case 'agent:askUser':
+                askUser(msg.question).then(answer => sendResponse({ answer }));
+                return true;
+            case 'agent:confirmSubmit':
+                confirmSubmit().then(confirmed => sendResponse({ confirmed }));
+                return true;
+            case 'agent:done':
+                showDone(msg.success, msg.text);
+                break;
+            case 'agent:hide':
+                removeOverlay();
+                break;
         }
     });
 
-    async function fillCommentForm(data) {
-        currentResourceId = data.resourceId;
-        currentTaskId = data.taskId;
-        const { name, email, website, mode, useAI, pageTitle } = data;
+    // ============================================================
+    // 状态浮层 — 显示 Agent 当前在做什么
+    // ============================================================
 
-        // === 1. 尝试 AI 表单识别 ===
-        let aiFormInfo = null;
-        if (useAI) {
-            try {
-                // 获取评论区 HTML（限制大小）
-                const formAreaHtml = getCommentAreaHtml();
-                if (formAreaHtml) {
-                    aiFormInfo = await chrome.runtime.sendMessage({
-                        action: 'aiExtractForm',
-                        html: formAreaHtml
-                    });
-                }
-            } catch (e) {
-                console.log('[BLA] AI 表单识别失败，回退到规则匹配:', e);
-            }
-        }
-
-        // === 2. 找到表单（AI 优先，规则回退） ===
-        let form = null;
-        if (aiFormInfo && aiFormInfo.hasForm && aiFormInfo.formSelector) {
-            form = document.querySelector(aiFormInfo.formSelector);
-        }
-        if (!form) {
-            form = findFormByRules();
-        }
-
-        if (!form) {
-            console.log('[BLA] 未找到评论表单');
-            reportResult('failed');
-            return;
-        }
-
-        // 高亮表单
-        form.style.outline = '2px dashed #3ecfff';
-        form.style.outlineOffset = '8px';
-        form.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-        // === 3. 生成评论（AI 优先） ===
-        let comment = '';
-        if (useAI) {
-            try {
-                const pageContent = getPageContent();
-                const result = await chrome.runtime.sendMessage({
-                    action: 'aiGenerateComment',
-                    pageTitle: pageTitle || document.title,
-                    pageContent,
-                    targetUrl: website
-                });
-                comment = result.comment || '';
-            } catch (e) {
-                console.log('[BLA] AI 评论生成失败:', e);
-            }
-        }
-
-        // AI 失败时用后备方案
-        if (!comment) {
-            comment = generateFallbackComment(pageTitle || document.title);
-        }
-
-        // === 4. 填充字段 ===
-        if (aiFormInfo && aiFormInfo.fields && aiFormInfo.fields.length > 0) {
-            // AI 模式：按 AI 返回的字段结构填充
-            fillFieldsFromAI(form, aiFormInfo, { comment, name, email, website });
-        } else {
-            // 规则模式：传统选择器填充
-            fillFieldsByRules(form, { comment, name, email, website });
-        }
-
-        // === 5. 处理验证码和复选框 ===
-        handleCaptchaAndCheckboxes(form, aiFormInfo);
-
-        // === 6. 取消通知勾选 ===
-        uncheckNotifications();
-
-        // === 7. 根据模式操作 ===
-        if (mode === 'full-auto') {
-            setTimeout(() => submitForm(form), 1500);
-        } else {
-            showCommentReadyDialog(form);
+    function showStatus(step, maxSteps, text) {
+        ensureOverlay();
+        const content = overlay.querySelector('.bla-agent-content');
+        if (content) {
+            content.innerHTML = `
+                <div class="bla-agent-step">Step ${step}/${maxSteps}</div>
+                <div class="bla-agent-text">${escapeHtml(text)}</div>
+                <div class="bla-agent-loader"><div class="bla-agent-loader-bar"></div></div>
+            `;
         }
     }
 
-    // === 表单查找（规则） ===
-    function findFormByRules() {
-        const selectors = [
-            '#commentform', '#respond form', '.comment-form',
-            'form[action*="wp-comments-post"]', 'form.comment-form',
-            '#comments form', '.post-comments form'
-        ];
-        for (const sel of selectors) {
-            const form = document.querySelector(sel);
-            if (form) return form;
-        }
-        // 通用：通过 textarea 反推 form
-        const textareas = document.querySelectorAll('textarea');
-        for (const ta of textareas) {
-            const nameAttr = (ta.name || ta.id || '').toLowerCase();
-            const placeholder = (ta.placeholder || '').toLowerCase();
-            if (nameAttr.includes('comment') || nameAttr.includes('message') ||
-                placeholder.includes('comment') || placeholder.includes('leave') ||
-                placeholder.includes('reply')) {
-                const form = ta.closest('form');
-                if (form) return form;
-            }
-        }
-        return null;
+    // ============================================================
+    // ask_user — AI 遇到验证码等问题时询问用户
+    // ============================================================
+
+    function askUser(question) {
+        return new Promise((resolve) => {
+            ensureOverlay();
+            const content = overlay.querySelector('.bla-agent-content');
+            if (!content) { resolve(''); return; }
+
+            content.innerHTML = `
+                <div class="bla-agent-icon">❓</div>
+                <div class="bla-agent-question">${escapeHtml(question)}</div>
+                <input type="text" class="bla-agent-input" placeholder="输入你的回答..." autofocus />
+                <div class="bla-agent-actions">
+                    <button class="bla-agent-btn bla-agent-btn-skip">跳过</button>
+                    <button class="bla-agent-btn bla-agent-btn-confirm">确认</button>
+                </div>
+            `;
+
+            const input = content.querySelector('.bla-agent-input');
+            const btnConfirm = content.querySelector('.bla-agent-btn-confirm');
+            const btnSkip = content.querySelector('.bla-agent-btn-skip');
+
+            const submit = () => {
+                const answer = input.value.trim();
+                resolve(answer);
+            };
+
+            btnConfirm.addEventListener('click', submit);
+            btnSkip.addEventListener('click', () => resolve(''));
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') submit();
+            });
+
+            input.focus();
+        });
     }
 
-    // === AI 字段填充 ===
-    function fillFieldsFromAI(form, aiFormInfo, values) {
-        for (const field of aiFormInfo.fields) {
-            try {
-                let el = null;
-                if (field.selector) {
-                    el = form.querySelector(field.selector) || document.querySelector(field.selector);
-                }
+    // ============================================================
+    // 确认提交 — 半自动模式下，提交前让用户确认
+    // ============================================================
 
-                if (!el) continue;
+    function confirmSubmit() {
+        return new Promise((resolve) => {
+            ensureOverlay();
+            const content = overlay.querySelector('.bla-agent-content');
+            if (!content) { resolve(false); return; }
 
-                switch (field.type) {
-                    case 'comment':
-                        setFieldValue(el, values.comment);
-                        break;
-                    case 'name':
-                        if (values.name) setFieldValue(el, values.name);
-                        break;
-                    case 'email':
-                        if (values.email) setFieldValue(el, values.email);
-                        break;
-                    case 'website':
-                        if (values.website) setFieldValue(el, values.website);
-                        break;
-                    case 'captcha':
-                        if (field.answer) setFieldValue(el, field.answer);
-                        break;
-                    case 'checkbox':
-                        if (field.shouldCheck && !el.checked) {
-                            el.checked = true;
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                        break;
-                }
-            } catch (e) {
-                console.log(`[BLA] 填充字段失败 (${field.type}):`, e);
-            }
-        }
+            content.innerHTML = `
+                <div class="bla-agent-icon">📝</div>
+                <div class="bla-agent-question">表单已填写完毕，是否提交？</div>
+                <div class="bla-agent-actions">
+                    <button class="bla-agent-btn bla-agent-btn-skip">跳过</button>
+                    <button class="bla-agent-btn bla-agent-btn-confirm">提交</button>
+                </div>
+            `;
+
+            content.querySelector('.bla-agent-btn-confirm').addEventListener('click', () => resolve(true));
+            content.querySelector('.bla-agent-btn-skip').addEventListener('click', () => resolve(false));
+        });
     }
 
-    // === 规则字段填充 ===
-    function fillFieldsByRules(form, values) {
-        // Comment
-        const commentField = form.querySelector(
-            'textarea[name="comment"], textarea#comment, textarea[name="message"], textarea'
-        );
-        if (commentField) setFieldValue(commentField, values.comment);
+    // ============================================================
+    // 完成状态
+    // ============================================================
 
-        // Name
-        const nameField = form.querySelector(
-            'input[name="author"], input#author, input[name="name"], input[placeholder*="name" i], input[placeholder*="名" i]'
-        );
-        if (nameField && values.name) setFieldValue(nameField, values.name);
+    function showDone(success, text) {
+        ensureOverlay();
+        const content = overlay.querySelector('.bla-agent-content');
+        if (!content) return;
 
-        // Email
-        const emailField = form.querySelector(
-            'input[name="email"], input#email, input[type="email"]'
-        );
-        if (emailField && values.email) setFieldValue(emailField, values.email);
-
-        // Website
-        const websiteField = form.querySelector(
-            'input[name="url"], input#url, input[name="website"], input[type="url"]'
-        );
-        if (websiteField && values.website) setFieldValue(websiteField, values.website);
-    }
-
-    // === 验证码和复选框处理 ===
-    function handleCaptchaAndCheckboxes(form, aiFormInfo) {
-        // AI 已处理的跳过
-        if (aiFormInfo && aiFormInfo.fields) {
-            const aiHandled = aiFormInfo.fields.some(f => f.type === 'captcha' || f.type === 'checkbox');
-            if (aiHandled) return;
-        }
-
-        // 规则处理简单数学验证码
-        const allLabels = form.querySelectorAll('label, span, div, p');
-        for (const label of allLabels) {
-            const text = label.textContent.trim();
-            // 匹配 "Sum of X + Y ?" 或 "X + Y = ?" 等
-            const mathMatch = text.match(/(\d+)\s*[\+\-\*×]\s*(\d+)/);
-            if (mathMatch) {
-                const a = parseInt(mathMatch[1]);
-                const b = parseInt(mathMatch[2]);
-                let answer;
-                if (text.includes('+') || text.includes('Sum')) answer = a + b;
-                else if (text.includes('-')) answer = a - b;
-                else if (text.includes('*') || text.includes('×')) answer = a * b;
-                else answer = a + b; // 默认加法
-
-                // 找到临近的 input
-                const input = label.querySelector('input') ||
-                    label.nextElementSibling?.querySelector('input') ||
-                    label.parentElement?.querySelector('input[type="text"], input[type="number"]');
-                if (input) {
-                    setFieldValue(input, String(answer));
-                }
-            }
-        }
-
-        // 处理反垃圾复选框
-        const spamCheckboxes = form.querySelectorAll(
-            'input[type="checkbox"]'
-        );
-        for (const cb of spamCheckboxes) {
-            const label = cb.closest('label')?.textContent?.toLowerCase() ||
-                cb.parentElement?.textContent?.toLowerCase() || '';
-            if (label.includes('not a spammer') || label.includes('not spam') ||
-                label.includes('human') || label.includes('robot') ||
-                label.includes('confirm') || label.includes('agree')) {
-                if (!cb.checked) {
-                    cb.checked = true;
-                    cb.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-            }
-        }
-    }
-
-    // === 取消通知勾选 ===
-    function uncheckNotifications() {
-        const notifySelectors = [
-            'input[name="subscribe"]', 'input[name="subscribe_comments"]',
-            'input[name="subscribe_blog"]', 'input[id*="subscribe"]',
-            'input[id*="notify"]', 'input[name*="notify"]',
-            'input[id*="follow"]', 'input[name*="follow"]',
-            '#jetpack-subscribe-comment', '#jetpack-subscribe-blog',
-            '.comment-form-subscribe input[type="checkbox"]',
-            '#wp-comment-cookies-consent'
-        ];
-        for (const sel of notifySelectors) {
-            document.querySelectorAll(sel).forEach(cb => { cb.checked = false; });
-        }
-    }
-
-    // === 工具函数 ===
-    function setFieldValue(el, value) {
-        el.value = value;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-
-    function getCommentAreaHtml() {
-        const selectors = [
-            '#respond', '#commentform', '.comment-form', '#comments',
-            'form[action*="wp-comments-post"]', '.comment-respond'
-        ];
-        for (const sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el) return el.outerHTML.substring(0, 4000);
-        }
-        // 回退：找包含 textarea 的 form
-        const form = findFormByRules();
-        if (form) return form.outerHTML.substring(0, 4000);
-        return '';
-    }
-
-    function getPageContent() {
-        // 提取文章正文（限制长度）
-        const selectors = [
-            'article', '.post-content', '.entry-content',
-            '.article-content', 'main', '.content'
-        ];
-        for (const sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el) return el.textContent.substring(0, 2000);
-        }
-        return document.body?.textContent?.substring(0, 2000) || '';
-    }
-
-    function generateFallbackComment(title) {
-        const templates = [
-            `This is a really insightful article about ${title || 'this topic'}. I appreciate the detailed analysis and practical approach.`,
-            `Thanks for sharing this comprehensive post. The examples make it much easier to understand the key concepts.`,
-            `Really well explained! I've been looking for clear information on this topic and this article delivers exactly that.`,
-            `Great breakdown of ${title || 'the topic'}. I found the practical insights particularly helpful for my own projects.`,
-            `This clarifies a lot of things I was uncertain about. Looking forward to reading more content like this.`
-        ];
-        return templates[Math.floor(Math.random() * templates.length)];
-    }
-
-    // === 弹窗 ===
-    function showCommentReadyDialog(form) {
-        const overlay = document.createElement('div');
-        overlay.id = 'bla-dialog-overlay';
-
-        const dialog = document.createElement('div');
-        dialog.id = 'bla-dialog';
-        dialog.innerHTML = `
-            <h3 class="bla-dialog-title">Comment Ready</h3>
-            <p class="bla-dialog-message">
-                The comment form has been filled. Please review the content and click Submit to post, or Skip to move to the next resource.
-            </p>
-            <div class="bla-dialog-actions">
-                <button id="bla-skip" class="bla-btn bla-btn-skip">Skip</button>
-                <button id="bla-submit" class="bla-btn bla-btn-submit">Submit</button>
-            </div>
+        content.innerHTML = `
+            <div class="bla-agent-icon">${success ? '✅' : '❌'}</div>
+            <div class="bla-agent-text">${escapeHtml(text || (success ? '评论已填写完成' : '未找到评论表单'))}</div>
         `;
 
-        document.body.appendChild(overlay);
-        document.body.appendChild(dialog);
-
-        requestAnimationFrame(() => {
-            overlay.classList.add('bla-show');
-            dialog.classList.add('bla-show');
-        });
-
-        dialog.querySelector('#bla-submit').addEventListener('click', () => {
-            removeDialog();
-            submitForm(form);
-        });
-
-        dialog.querySelector('#bla-skip').addEventListener('click', () => {
-            removeDialog();
-            form.style.outline = 'none';
-            reportResult('skipped');
-        });
+        // 3 秒后自动消失
+        setTimeout(removeOverlay, 3000);
     }
 
-    function submitForm(form) {
-        const submitBtn = form.querySelector(
-            'button[type="submit"], input[type="submit"], button#submit, .submit, button[name="submit"]'
-        );
+    // ============================================================
+    // 浮层管理
+    // ============================================================
 
-        if (submitBtn) {
-            submitBtn.click();
-        } else {
-            form.submit();
+    function ensureOverlay() {
+        if (overlay && document.body.contains(overlay)) return;
+
+        overlay = document.createElement('div');
+        overlay.id = 'bla-agent-overlay';
+        overlay.innerHTML = `<div class="bla-agent-panel"><div class="bla-agent-header">
+                <span class="bla-agent-title">Backlink Analyzer</span>
+                <button class="bla-agent-close">&times;</button>
+            </div><div class="bla-agent-content"></div></div>`;
+
+        // 注入样式
+        if (!document.getElementById('bla-agent-styles')) {
+            const style = document.createElement('style');
+            style.id = 'bla-agent-styles';
+            style.textContent = getStyles();
+            document.head.appendChild(style);
         }
 
-        setTimeout(() => reportResult('submitted'), 2000);
-    }
+        document.body.appendChild(overlay);
+        requestAnimationFrame(() => overlay.classList.add('bla-show'));
 
-    function reportResult(result) {
-        chrome.runtime.sendMessage({
-            action: 'commentAction',
-            resourceId: currentResourceId,
-            taskId: currentTaskId,
-            result
+        overlay.querySelector('.bla-agent-close').addEventListener('click', () => {
+            chrome.runtime.sendMessage({ action: 'agent:userClose' });
+            removeOverlay();
         });
     }
 
-    function removeDialog() {
-        const overlay = document.getElementById('bla-dialog-overlay');
-        const dialog = document.getElementById('bla-dialog');
-        if (overlay) overlay.remove();
-        if (dialog) dialog.remove();
+    function removeOverlay() {
+        if (overlay) {
+            overlay.classList.remove('bla-show');
+            setTimeout(() => { overlay?.remove(); overlay = null; }, 300);
+        }
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    function getStyles() {
+        return `
+            #bla-agent-overlay {
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                z-index: 2147483647;
+                opacity: 0;
+                transform: translateY(-10px);
+                transition: opacity 0.3s, transform 0.3s;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }
+            #bla-agent-overlay.bla-show {
+                opacity: 1;
+                transform: translateY(0);
+            }
+            .bla-agent-panel {
+                width: 340px;
+                background: #1a1a2e;
+                border: 1px solid rgba(62, 207, 255, 0.3);
+                border-radius: 12px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 20px rgba(62, 207, 255, 0.1);
+                overflow: hidden;
+            }
+            .bla-agent-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 12px 16px;
+                background: linear-gradient(135deg, #16213e, #1a1a2e);
+                border-bottom: 1px solid rgba(62, 207, 255, 0.2);
+            }
+            .bla-agent-title {
+                color: #3ecfff;
+                font-size: 14px;
+                font-weight: 600;
+                letter-spacing: 0.5px;
+            }
+            .bla-agent-close {
+                background: none;
+                border: none;
+                color: #666;
+                font-size: 20px;
+                cursor: pointer;
+                padding: 0 4px;
+                line-height: 1;
+            }
+            .bla-agent-close:hover { color: #ff4757; }
+            .bla-agent-content {
+                padding: 20px 16px;
+                color: #e0e0e0;
+                font-size: 13px;
+                line-height: 1.6;
+            }
+            .bla-agent-step {
+                color: #3ecfff;
+                font-size: 11px;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                margin-bottom: 8px;
+            }
+            .bla-agent-text {
+                color: #ccc;
+                font-size: 13px;
+                margin-bottom: 12px;
+            }
+            .bla-agent-icon {
+                font-size: 28px;
+                text-align: center;
+                margin-bottom: 12px;
+            }
+            .bla-agent-question {
+                color: #fff;
+                font-size: 14px;
+                font-weight: 500;
+                margin-bottom: 16px;
+                text-align: center;
+            }
+            .bla-agent-input {
+                width: 100%;
+                padding: 10px 12px;
+                background: #0f0f23;
+                border: 1px solid rgba(62, 207, 255, 0.3);
+                border-radius: 8px;
+                color: #fff;
+                font-size: 14px;
+                outline: none;
+                box-sizing: border-box;
+                margin-bottom: 12px;
+            }
+            .bla-agent-input:focus {
+                border-color: #3ecfff;
+                box-shadow: 0 0 8px rgba(62, 207, 255, 0.2);
+            }
+            .bla-agent-actions {
+                display: flex;
+                gap: 10px;
+                justify-content: flex-end;
+            }
+            .bla-agent-btn {
+                padding: 8px 20px;
+                border-radius: 8px;
+                border: none;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.2s;
+            }
+            .bla-agent-btn-skip {
+                background: #2a2a3e;
+                color: #888;
+            }
+            .bla-agent-btn-skip:hover {
+                background: #333350;
+                color: #aaa;
+            }
+            .bla-agent-btn-confirm {
+                background: linear-gradient(135deg, #3ecfff, #2196f3);
+                color: #fff;
+            }
+            .bla-agent-btn-confirm:hover {
+                background: linear-gradient(135deg, #5dd9ff, #42a5f5);
+                box-shadow: 0 4px 12px rgba(62, 207, 255, 0.3);
+            }
+            .bla-agent-loader {
+                height: 3px;
+                background: #0f0f23;
+                border-radius: 2px;
+                overflow: hidden;
+            }
+            .bla-agent-loader-bar {
+                height: 100%;
+                width: 30%;
+                background: linear-gradient(90deg, #3ecfff, #2196f3);
+                border-radius: 2px;
+                animation: bla-loader 1.5s infinite ease-in-out;
+            }
+            @keyframes bla-loader {
+                0% { transform: translateX(-100%); }
+                100% { transform: translateX(400%); }
+            }
+        `;
     }
 })();

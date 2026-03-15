@@ -116,17 +116,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case 'resetStatus':
             updateResourceStatus(msg.resourceId, 'pending');
             break;
-        // AI 请求从 content script 转发
-        case 'aiExtractForm':
-            AIEngine.extractFormStructure(msg.html).then(result => sendResponse(result));
-            return true;
-        case 'aiGenerateComment':
-            AIEngine.generateComment(msg.pageTitle, msg.pageContent, msg.targetUrl).then(comment => {
-                sendResponse({ comment });
-            }).catch(err => {
-                sendResponse({ comment: '', error: err.message });
-            });
-            return true;
+        // Agent UI 事件
+        case 'agent:userClose':
+            stopPublish();
+            break;
     }
 });
 
@@ -667,41 +660,218 @@ async function publishNext() {
     });
 
     try {
+        // 1. 打开页面
         const tab = await chrome.tabs.create({ url, active: true });
         await waitForTabLoad(tab.id);
         await delay(2000);
 
+        // 2. 注入 page-agent（DOM 操作层）和 comment-publisher（UI 层）
+        await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ['content/page-agent.js']
+        });
         await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             files: ['content/comment-publisher.js']
         });
-        await chrome.scripting.insertCSS({
-            target: { tabId: tab.id },
-            files: ['content/comment-publisher.css']
-        });
 
-        await chrome.tabs.sendMessage(tab.id, {
-            action: 'fillComment',
-            data: {
-                name: task.name || '',
-                email: task.email || '',
-                website: task.website || '',
-                mode: task.mode || 'semi-auto',
-                resourceId: resource.id,
-                taskId: task.id,
-                useAI: true,
-                pageTitle: resource.pageTitle || ''
+        // 3. 运行 Agent 循环
+        const result = await runAgentLoop(tab.id, task, resource);
+
+        // 4. 处理结果
+        if (result.success) {
+            if (task.mode === 'full-auto') {
+                // 全自动：直接提交
+                await sendToTab(tab.id, { action: 'agent:done', success: true, text: '自动提交中...' });
+                await submitViaAgent(tab.id);
+                await handlePublishResult(resource.id, 'submitted', task.id);
+            } else {
+                // 半自动：询问用户
+                const response = await sendToTab(tab.id, { action: 'agent:confirmSubmit' });
+                if (response?.confirmed) {
+                    await submitViaAgent(tab.id);
+                    await handlePublishResult(resource.id, 'submitted', task.id);
+                } else {
+                    await sendToTab(tab.id, { action: 'agent:hide' });
+                    await handlePublishResult(resource.id, 'skipped', task.id);
+                }
             }
-        });
+        } else {
+            await sendToTab(tab.id, { action: 'agent:done', success: false, text: result.reason || '未找到评论表单' });
+            await handlePublishResult(resource.id, 'failed', task.id);
+        }
     } catch (e) {
         await Logger.error(`发布失败: ${resource.url}`, { error: e.message });
         await updateResourceStatus(resource.id, 'failed');
-        publishState.currentIndex++;
-        await publishNext();
+    }
+
+    publishState.currentIndex++;
+    await delay(1000);
+    await publishNext();
+}
+
+// ============================================================
+// Agent 循环 — 核心发布引擎
+// ============================================================
+
+const AGENT_MAX_STEPS = 20;
+
+async function runAgentLoop(tabId, task, resource) {
+    const history = [];
+    const taskDescription = buildTaskDescription(task, resource);
+
+    for (let step = 1; step <= AGENT_MAX_STEPS; step++) {
+        if (!publishState.isPublishing) {
+            return { success: false, reason: '用户停止发布' };
+        }
+
+        try {
+            // 1. 扫描页面元素
+            const scanResult = await sendToTab(tabId, {
+                type: 'PAGE_AGENT', action: 'scan', payload: {}
+            });
+
+            if (!scanResult?.success) {
+                return { success: false, reason: '页面扫描失败' };
+            }
+
+            // 2. 显示状态
+            await sendToTab(tabId, {
+                action: 'agent:showStatus',
+                step, maxSteps: AGENT_MAX_STEPS,
+                text: history.length > 0 ? history[history.length - 1].nextGoal || '分析中...' : '正在分析页面...'
+            });
+
+            // 3. 调用 AI 决策
+            const aiResult = await AIEngine.agentStep({
+                elements: scanResult.elements,
+                url: scanResult.url,
+                title: scanResult.title,
+                task: taskDescription,
+                history,
+                step,
+                maxSteps: AGENT_MAX_STEPS
+            });
+
+            await Logger.ai(`Agent Step ${step}: ${aiResult.action}`, {
+                params: aiResult.params,
+                evaluation: aiResult.evaluation
+            });
+
+            // 4. 完成？
+            if (aiResult.done) {
+                return { success: aiResult.success, reason: aiResult.doneText };
+            }
+
+            // 5. ask_user？
+            if (aiResult.action === 'ask_user') {
+                const response = await sendToTab(tabId, {
+                    action: 'agent:askUser',
+                    question: aiResult.params.question || '请输入验证码'
+                });
+                history.push({
+                    step, action: 'ask_user',
+                    params: aiResult.params,
+                    result: response?.answer || '(用户未回答)',
+                    nextGoal: aiResult.nextGoal
+                });
+                // 如果用户给了答案，下一步 AI 会用它来填入
+                continue;
+            }
+
+            // 6. 执行工具
+            const execResult = await sendToTab(tabId, {
+                type: 'PAGE_AGENT',
+                action: aiResult.action,
+                payload: aiResult.params
+            });
+
+            history.push({
+                step,
+                action: aiResult.action,
+                params: aiResult.params,
+                result: execResult?.message || execResult?.error || 'ok',
+                nextGoal: aiResult.nextGoal
+            });
+
+            // 7. 步间延迟
+            await delay(400);
+
+        } catch (e) {
+            await Logger.error(`Agent Step ${step} 失败: ${e.message}`);
+            history.push({
+                step, action: 'error', params: {},
+                result: e.message, nextGoal: '重试'
+            });
+            // 出错后继续尝试
+        }
+    }
+
+    return { success: false, reason: '超过最大步骤数' };
+}
+
+function buildTaskDescription(task, resource) {
+    return `Fill the comment form on this blog page.
+
+Commenter info:
+- Name: ${task.name || 'Anonymous'}
+- Email: ${task.email || ''}
+- Website: ${task.website || ''}
+
+Instructions:
+1. Find the comment form on this page (scroll down if needed)
+2. Generate a genuine, relevant comment based on the page content (2-4 sentences, in the same language as the article)
+3. Fill in: comment text, name, email, and website URL
+4. Uncheck any notification/subscription checkboxes
+5. Check anti-spam checkboxes if present
+6. Solve simple math captchas if present
+7. Do NOT click the submit button
+8. When all fields are filled, call done with success=true`;
+}
+
+async function submitViaAgent(tabId) {
+    // 扫描页面找到提交按钮
+    const scanResult = await sendToTab(tabId, {
+        type: 'PAGE_AGENT', action: 'scan', payload: {}
+    });
+    if (!scanResult?.success) return;
+
+    // 在元素列表中找提交按钮
+    const lines = scanResult.elements.split('\n');
+    for (const line of lines) {
+        const lower = line.toLowerCase();
+        if ((lower.includes('type="submit"') || lower.includes('>submit') ||
+             lower.includes('>post comment') || lower.includes('>发表评论') ||
+             lower.includes('>post ') || lower.includes('>发布')) &&
+            (lower.includes('<button') || lower.includes('<input'))) {
+            const indexMatch = line.match(/^\[(\d+)\]/);
+            if (indexMatch) {
+                await sendToTab(tabId, {
+                    type: 'PAGE_AGENT',
+                    action: 'click_element_by_index',
+                    payload: { index: parseInt(indexMatch[1]) }
+                });
+                await delay(2000);
+                return;
+            }
+        }
     }
 }
 
-async function handleCommentAction(resourceId, result, taskId) {
+// 发送消息给 tab 的辅助函数
+function sendToTab(tabId, msg) {
+    return new Promise((resolve) => {
+        chrome.tabs.sendMessage(tabId, msg, (response) => {
+            if (chrome.runtime.lastError) {
+                resolve(null);
+            } else {
+                resolve(response);
+            }
+        });
+    });
+}
+
+async function handlePublishResult(resourceId, result, taskId) {
     const statusMap = { submitted: 'published', skipped: 'skipped', failed: 'failed' };
     const status = statusMap[result] || result;
 
@@ -738,7 +908,11 @@ async function handleCommentAction(resourceId, result, taskId) {
             }
         }
     } catch {}
+}
 
+// 兼容旧的 commentAction 消息（来自旧版 comment-publisher）
+async function handleCommentAction(resourceId, result, taskId) {
+    await handlePublishResult(resourceId, result, taskId);
     publishState.currentIndex++;
     await publishNext();
 }

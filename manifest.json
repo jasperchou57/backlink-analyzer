@@ -21,14 +21,5 @@
         "client_id": "YOUR_GOOGLE_OAUTH2_CLIENT_ID.apps.googleusercontent.com",
         "scopes": ["https://www.googleapis.com/auth/spreadsheets"]
     },
-    "web_accessible_resources": [
-        {
-            "resources": [
-                "content/comment-publisher.css"
-            ],
-            "matches": [
-                "<all_urls>"
-            ]
-        }
-    ]
+    "web_accessible_resources": []
 }
