@@ -173,19 +173,13 @@
                 title.textContent = isMarketing ? '营销任务' : '外链发布任务';
             }
             if (resetBtn) resetBtn.style.display = isMarketing ? 'none' : 'inline-flex';
-            if (isMarketing) {
-                if (publishOverview) publishOverview.style.display = 'none';
-                if (publishStats) publishStats.style.display = 'none';
-                if (blogBar) blogBar.style.display = 'none';
-                if (anchorBar) anchorBar.style.display = 'none';
-                if (currentBox) currentBox.style.display = 'none';
-                if (publishEmpty) publishEmpty.style.display = 'none';
-            } else {
-                if (publishOverview) publishOverview.style.display = '';
-                if (publishStats) publishStats.style.display = '';
-                if (blogBar) blogBar.style.display = '';
-                if (anchorBar) anchorBar.style.display = '';
-            }
+            // Global overview hidden — each task card has its own per-task stats
+            if (publishOverview) publishOverview.style.display = 'none';
+            if (publishStats) publishStats.style.display = 'none';
+            if (blogBar) blogBar.style.display = 'none';
+            if (anchorBar) anchorBar.style.display = 'none';
+            if (currentBox) currentBox.style.display = 'none';
+            if (publishEmpty) publishEmpty.style.display = 'none';
         }
 
         function formatLastRunLabel(value) {
