@@ -73,87 +73,16 @@
             </div>
         </div>
 
-        <!-- ===== 发布 Tab ===== -->
+        <!-- ===== 发布 Tab (项目进度仪表盘) ===== -->
         <div class="tab-panel" id="panel-publish">
-            <!-- 分类卡片 -->
-            <div class="publish-cards" id="publish-cards">
-                <div class="pub-card" data-category="comment">
-                    <div class="pub-card-icon">📝</div>
-                    <div class="pub-card-body">
-                        <div class="pub-card-title">博客评论</div>
-                        <div class="pub-card-desc">在博客文章下发布评论，获取外链机会。</div>
-                        <div class="pub-card-actions">
-                            <button class="pub-card-btn" data-action="publish" data-category="comment">开始发布</button>
-                            <span class="pub-card-count" id="count-comment">0 个待发布</span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="pub-card" data-category="submit-site">
-                    <div class="pub-card-icon">📋</div>
-                    <div class="pub-card-body">
-                        <div class="pub-card-title">目录 / Startup 提交</div>
-                        <div class="pub-card-desc">提交到目录站、Startup 平台和列表网站。</div>
-                        <div class="pub-card-actions">
-                            <button class="pub-card-btn" data-action="publish" data-category="submit-site">开始发布</button>
-                            <span class="pub-card-count" id="count-submit-site">0 个待发布</span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="pub-card" data-category="forum">
-                    <div class="pub-card-icon">💬</div>
-                    <div class="pub-card-body">
-                        <div class="pub-card-title">论坛发帖</div>
-                        <div class="pub-card-desc">在相关论坛发帖或回帖，植入外链。</div>
-                        <div class="pub-card-actions">
-                            <button class="pub-card-btn" data-action="publish" data-category="forum">开始发布</button>
-                            <span class="pub-card-count" id="count-forum">0 个待发布</span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="pub-card" data-category="listing">
-                    <div class="pub-card-icon">🌐</div>
-                    <div class="pub-card-body">
-                        <div class="pub-card-title">综合外链</div>
-                        <div class="pub-card-desc">其他类型外链资源，包括社交、媒体等。</div>
-                        <div class="pub-card-actions">
-                            <button class="pub-card-btn" data-action="publish" data-category="listing">开始发布</button>
-                            <span class="pub-card-count" id="count-listing">0 个待发布</span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="pub-card pub-card-fav" data-category="favorites">
-                    <div class="pub-card-icon">⭐</div>
-                    <div class="pub-card-body">
-                        <div class="pub-card-title">我的收藏</div>
-                        <div class="pub-card-desc">手动标记的高质量外链资源。</div>
-                        <div class="pub-card-actions">
-                            <button class="pub-card-btn pub-card-btn-outline" data-action="view-favorites">查看收藏</button>
-                            <span class="pub-card-count" id="count-favorites">0 个</span>
-                        </div>
-                    </div>
-                </div>
+            <div class="project-header">
+                <h3>我的网站</h3>
+                <button id="btn-add-task" class="btn btn-small">+ 新建任务</button>
             </div>
 
-            <!-- 发布概览（折叠） -->
-            <details class="pub-overview">
-                <summary>发布概览</summary>
-                <div class="publish-stats">
-                    <div class="pub-stat"><span class="pub-num" id="pub-pending">0</span><span class="pub-lbl">待发布</span></div>
-                    <div class="pub-stat"><span class="pub-num green" id="pub-published">0</span><span class="pub-lbl">已发布</span></div>
-                    <div class="pub-stat"><span class="pub-num yellow" id="pub-skipped">0</span><span class="pub-lbl">已跳过</span></div>
-                    <div class="pub-stat"><span class="pub-num red" id="pub-failed">0</span><span class="pub-lbl">失败</span></div>
-                </div>
-            </details>
-
-            <!-- 任务管理（折叠） -->
-            <details class="pub-tasks-section">
-                <summary>发布任务 <button id="btn-add-task" class="btn btn-small" style="margin-left:auto">+ 新建任务</button></summary>
-                <div id="task-list" class="task-list"></div>
-            </details>
+            <!-- 任务列表（每个任务=一个项目，含分类进度） -->
+            <div id="task-list" class="task-list"></div>
+            <div class="empty-hint" id="task-empty">暂无发布任务，点击"+ 新建任务"创建</div>
 
             <!-- 当前发布进度 -->
             <div class="publish-current" id="publish-current" style="display:none">
@@ -171,30 +100,52 @@
             </div>
         </div>
 
-        <!-- ===== 资源库 Tab ===== -->
+        <!-- ===== 资源库 Tab (Submify风格资源浏览) ===== -->
         <div class="tab-panel" id="panel-resources">
             <div class="panel-header">
-                <h3>资源库 <span class="badge" id="res-count">0</span></h3>
-                <button id="btn-export" class="btn btn-small">导出</button>
+                <h3>外链资源 <span class="badge" id="res-count">0</span></h3>
+                <div class="panel-header-actions">
+                    <button id="btn-favorites-view" class="btn btn-small" title="我的收藏">我的收藏</button>
+                    <button id="btn-export" class="btn btn-small">导出</button>
+                </div>
             </div>
 
+            <!-- 搜索栏 -->
+            <div class="res-search-bar">
+                <input type="text" id="res-search" class="input" placeholder="搜索域名或名称...">
+            </div>
+
+            <!-- 分类筛选 -->
             <div class="res-filters">
                 <button class="res-filter active" data-filter="all">全部</button>
-                <button class="res-filter" data-filter="comment">可直接发</button>
-                <button class="res-filter" data-filter="other">需手动</button>
+                <button class="res-filter" data-filter="comment">评论</button>
+                <button class="res-filter" data-filter="submit-site">目录提交</button>
+                <button class="res-filter" data-filter="forum">论坛</button>
+                <button class="res-filter" data-filter="listing">综合</button>
             </div>
 
+            <!-- 结果统计 + 每页数 -->
+            <div class="res-results-bar">
+                <span id="res-results-text">共 0 条</span>
+                <div class="res-pager-info">
+                    <span>每页</span>
+                    <select id="res-page-size" class="res-page-select">
+                        <option value="20">20</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- 资源列表 -->
             <div class="resources-list" id="resources-list">
                 <div class="empty-state" id="resources-empty">
-                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                        stroke-width="1.5">
-                        <path d="M12 2L2 7l10 5 10-5-10-5z" />
-                        <path d="M2 17l10 5 10-5" />
-                        <path d="M2 12l10 5 10-5" />
-                    </svg>
                     <p>暂无资源数据</p>
                 </div>
             </div>
+
+            <!-- 分页 -->
+            <div class="res-pager" id="res-pager"></div>
         </div>
 
         <!-- ===== 日志 Tab ===== -->

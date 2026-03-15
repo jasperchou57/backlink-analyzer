@@ -1,7 +1,12 @@
 /**
- * Popup.js V3 - 主弹窗逻辑
- * 新增：日志 Tab、多任务管理、AI/Sheets 设置
+ * Popup.js V4 - 主弹窗逻辑
+ * 发布tab: 项目进度仪表盘 | 资源库tab: Submify风格资源浏览
  */
+
+// === 资源库分页状态 ===
+let resCurrentPage = 1;
+let resPageSize = 20;
+let resSearchQuery = '';
 
 document.addEventListener('DOMContentLoaded', async () => {
     // === 关闭按钮 ===
@@ -30,7 +35,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
 
             if (btn.dataset.tab === 'resources') refreshResources();
-            if (btn.dataset.tab === 'publish') { refreshPublishStats(); refreshTasks(); }
+            if (btn.dataset.tab === 'publish') refreshTasks();
             if (btn.dataset.tab === 'logs') refreshLogs();
         });
     });
@@ -40,8 +45,42 @@ document.addEventListener('DOMContentLoaded', async () => {
         btn.addEventListener('click', () => {
             document.querySelectorAll('.res-filter').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
+            resCurrentPage = 1;
             refreshResources();
         });
+    });
+
+    // === 资源库搜索 ===
+    const searchInput = document.getElementById('res-search');
+    let searchTimer;
+    searchInput.addEventListener('input', () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => {
+            resSearchQuery = searchInput.value.trim().toLowerCase();
+            resCurrentPage = 1;
+            refreshResources();
+        }, 300);
+    });
+
+    // === 资源库每页数 ===
+    document.getElementById('res-page-size').addEventListener('change', (e) => {
+        resPageSize = parseInt(e.target.value);
+        resCurrentPage = 1;
+        refreshResources();
+    });
+
+    // === 收藏按钮 ===
+    document.getElementById('btn-favorites-view').addEventListener('click', () => {
+        // 切换收藏筛选
+        const btn = document.getElementById('btn-favorites-view');
+        const isActive = btn.classList.toggle('active');
+        if (isActive) {
+            document.querySelectorAll('.res-filter').forEach(b => b.classList.remove('active'));
+        } else {
+            document.querySelector('.res-filter[data-filter="all"]').classList.add('active');
+        }
+        resCurrentPage = 1;
+        refreshResources(isActive ? 'favorites' : undefined);
     });
 
     // === 收集按钮 ===
@@ -99,32 +138,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    // === 多任务发布 ===
-    document.getElementById('btn-add-task').addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
+    // === 新建任务 ===
+    document.getElementById('btn-add-task').addEventListener('click', () => {
         openTaskEditor();
     });
-
-    // === 发布卡片按钮 ===
-    document.querySelectorAll('.pub-card-btn[data-action="publish"]').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const category = btn.dataset.category;
-            startCategoryPublish(category);
-        });
-    });
-
-    const viewFavBtn = document.querySelector('[data-action="view-favorites"]');
-    if (viewFavBtn) {
-        viewFavBtn.addEventListener('click', () => {
-            // 切到资源库 Tab 并筛选收藏
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-            document.querySelector('[data-tab="resources"]').classList.add('active');
-            document.getElementById('panel-resources').classList.add('active');
-            refreshResources('favorites');
-        });
-    }
 
     // === 导入数据库 ===
     document.getElementById('btn-import-db').addEventListener('click', importBacklinkDatabase);
@@ -152,7 +169,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             await StorageHelper.clearAll();
             updateStats({ backlinksFound: 0, analyzed: 0, blogResources: 0, inQueue: 0 });
             refreshResources();
-            refreshPublishStats();
+            refreshTasks();
         }
     });
 
@@ -169,7 +186,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (msg.action === 'publishDone') {
             document.getElementById('publish-current').style.display = 'none';
-            refreshPublishStats();
             refreshTasks();
         }
         if (msg.action === 'newLog') {
@@ -196,8 +212,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         setCollectingUI(true);
     }
 
-    refreshPublishStats();
     refreshTasks();
+    checkImportStatus();
 
     // === 定时轮询最新状态（每 2 秒） ===
     setInterval(async () => {
@@ -219,63 +235,147 @@ function updateStats(stats) {
     document.getElementById('stat-queue').textContent = stats.inQueue || 0;
 }
 
-async function refreshPublishStats() {
-    const resources = await StorageHelper.getResources();
-    const counts = { pending: 0, published: 0, skipped: 0, failed: 0 };
-    resources.forEach(r => { if (counts[r.status] !== undefined) counts[r.status]++; });
-
-    document.getElementById('pub-pending').textContent = counts.pending;
-    document.getElementById('pub-published').textContent = counts.published;
-    document.getElementById('pub-skipped').textContent = counts.skipped;
-    document.getElementById('pub-failed').textContent = counts.failed;
-
-    // Update category card counts
-    const catCounts = { comment: 0, 'submit-site': 0, forum: 0, listing: 0, favorites: 0 };
-    resources.forEach(r => {
-        if (r.status !== 'pending') return;
-        const opps = r.opportunities || [r.type] || [];
-        if (opps.includes('comment')) catCounts.comment++;
-        else if (opps.includes('submit-site')) catCounts['submit-site']++;
-        else if (opps.includes('forum')) catCounts.forum++;
-        else catCounts.listing++;
-        if (r.favorited) catCounts.favorites++;
-    });
-
-    const el = id => document.getElementById(id);
-    el('count-comment').textContent = catCounts.comment + ' 个待发布';
-    el('count-submit-site').textContent = catCounts['submit-site'] + ' 个待发布';
-    el('count-forum').textContent = catCounts.forum + ' 个待发布';
-    el('count-listing').textContent = catCounts.listing + ' 个待发布';
-
-    // Count all favorites regardless of status
-    const favCount = resources.filter(r => r.favorited).length;
-    el('count-favorites').textContent = favCount + ' 个';
-
-    // Hide import button if database already imported
+async function checkImportStatus() {
     const dbImported = await StorageHelper.get('dbImported');
-    const importBar = document.getElementById('import-bar');
     if (dbImported) {
-        importBar.style.display = 'none';
+        document.getElementById('import-bar').style.display = 'none';
     }
 }
 
-async function startCategoryPublish(category) {
-    // Check if there's a task, if not create one on the fly
+// ============================================================
+// 发布 Tab - 项目进度仪表盘
+// ============================================================
+
+function getResourceCategory(r) {
+    const opps = r.opportunities || [r.type] || [];
+    if (opps.includes('comment')) return 'comment';
+    if (opps.includes('submit-site')) return 'submit-site';
+    if (opps.includes('forum')) return 'forum';
+    return 'listing';
+}
+
+async function refreshTasks() {
     const resp = await chrome.runtime.sendMessage({ action: 'getTasks' });
     const tasks = resp?.tasks || [];
+    const list = document.getElementById('task-list');
+    const emptyHint = document.getElementById('task-empty');
+    list.innerHTML = '';
 
     if (tasks.length === 0) {
-        openTaskEditor(null, category);
+        emptyHint.style.display = 'block';
         return;
     }
 
-    // Use first task and start publishing with category filter
-    const task = tasks[0];
-    task.categoryFilter = category;
-    chrome.runtime.sendMessage({ action: 'startPublish', task });
+    emptyHint.style.display = 'none';
 
-    const current = document.getElementById('publish-current');
-    current.style.display = 'block';
+    // 获取所有资源用于统计
+    const resources = await StorageHelper.getResources();
+
+    tasks.forEach(task => {
+        const card = document.createElement('div');
+        card.className = 'task-project-card';
+
+        // 按分类统计资源
+        const catStats = {
+            comment:      { total: 0, success: 0, failed: 0 },
+            'submit-site':{ total: 0, success: 0, failed: 0 },
+            forum:        { total: 0, success: 0, failed: 0 },
+            listing:      { total: 0, success: 0, failed: 0 }
+        };
+        let totalAll = 0, successAll = 0, failedAll = 0;
+
+        resources.forEach(r => {
+            const cat = getResourceCategory(r);
+            catStats[cat].total++;
+            totalAll++;
+            if (r.status === 'published') { catStats[cat].success++; successAll++; }
+            if (r.status === 'failed') { catStats[cat].failed++; failedAll++; }
+        });
+
+        const initial = (task.name || task.website || '?')[0].toUpperCase();
+
+        card.innerHTML = `
+            <div class="task-project-header">
+                <div class="task-project-avatar">${escapeHtml(initial)}</div>
+                <div class="task-project-info">
+                    <div class="task-project-name">${escapeHtml(task.name || task.website)}</div>
+                    <div class="task-project-url">${escapeHtml(task.website)}</div>
+                </div>
+                <div class="task-project-actions">
+                    <button class="task-btn task-edit" title="编辑">✎</button>
+                    <button class="task-btn task-del" title="删除">×</button>
+                </div>
+            </div>
+            <div class="task-project-stats">
+                <div class="task-stat-box">
+                    <span class="task-stat-num">${totalAll}</span>
+                    <span class="task-stat-label">外链总数</span>
+                </div>
+                <div class="task-stat-box stat-green">
+                    <span class="task-stat-num">${successAll}</span>
+                    <span class="task-stat-label">成功</span>
+                </div>
+                <div class="task-stat-box stat-red">
+                    <span class="task-stat-num">${failedAll}</span>
+                    <span class="task-stat-label">失败</span>
+                </div>
+            </div>
+            <div class="task-category-grid">
+                <div class="task-cat-row">
+                    <span class="task-cat-label">评论</span>
+                    <div class="task-cat-bar-wrap">
+                        <div class="task-cat-bar" style="width:${catStats.comment.total ? (catStats.comment.success / catStats.comment.total * 100) : 0}%"></div>
+                    </div>
+                    <span class="task-cat-count">${catStats.comment.success}/${catStats.comment.total}</span>
+                    <button class="task-cat-run" data-category="comment" title="发布评论">▶</button>
+                </div>
+                <div class="task-cat-row">
+                    <span class="task-cat-label">目录提交</span>
+                    <div class="task-cat-bar-wrap">
+                        <div class="task-cat-bar" style="width:${catStats['submit-site'].total ? (catStats['submit-site'].success / catStats['submit-site'].total * 100) : 0}%"></div>
+                    </div>
+                    <span class="task-cat-count">${catStats['submit-site'].success}/${catStats['submit-site'].total}</span>
+                    <button class="task-cat-run" data-category="submit-site" title="发布目录提交">▶</button>
+                </div>
+                <div class="task-cat-row">
+                    <span class="task-cat-label">论坛</span>
+                    <div class="task-cat-bar-wrap">
+                        <div class="task-cat-bar" style="width:${catStats.forum.total ? (catStats.forum.success / catStats.forum.total * 100) : 0}%"></div>
+                    </div>
+                    <span class="task-cat-count">${catStats.forum.success}/${catStats.forum.total}</span>
+                    <button class="task-cat-run" data-category="forum" title="发布论坛">▶</button>
+                </div>
+                <div class="task-cat-row">
+                    <span class="task-cat-label">综合</span>
+                    <div class="task-cat-bar-wrap">
+                        <div class="task-cat-bar" style="width:${catStats.listing.total ? (catStats.listing.success / catStats.listing.total * 100) : 0}%"></div>
+                    </div>
+                    <span class="task-cat-count">${catStats.listing.success}/${catStats.listing.total}</span>
+                    <button class="task-cat-run" data-category="listing" title="发布综合">▶</button>
+                </div>
+            </div>
+        `;
+
+        // 事件绑定
+        card.querySelector('.task-edit').addEventListener('click', () => openTaskEditor(task));
+        card.querySelector('.task-del').addEventListener('click', async () => {
+            if (confirm(`确定删除任务 "${task.name || task.website}"？`)) {
+                await chrome.runtime.sendMessage({ action: 'deleteTask', taskId: task.id });
+                refreshTasks();
+            }
+        });
+
+        card.querySelectorAll('.task-cat-run').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const category = btn.dataset.category;
+                const t = { ...task, categoryFilter: category };
+                chrome.runtime.sendMessage({ action: 'startPublish', task: t });
+                document.getElementById('publish-current').style.display = 'block';
+            });
+        });
+
+        list.appendChild(card);
+    });
 }
 
 async function importBacklinkDatabase() {
@@ -310,7 +410,7 @@ async function importBacklinkDatabase() {
             document.getElementById('import-bar').style.display = 'none';
         }, 2000);
 
-        refreshPublishStats();
+        refreshTasks();
         refreshResources();
     } catch (e) {
         btn.textContent = '导入失败: ' + e.message;
@@ -321,70 +421,18 @@ async function importBacklinkDatabase() {
 function updatePublishProgress(msg) {
     const container = document.getElementById('publish-current');
     container.style.display = 'block';
-    document.getElementById('publish-empty').style.display = 'none';
 
     document.getElementById('current-url').textContent = msg.currentUrl || '-';
     document.getElementById('progress-fill').style.width =
         msg.total > 0 ? ((msg.current / msg.total) * 100) + '%' : '0%';
     document.getElementById('progress-text').textContent = `${msg.current} / ${msg.total}`;
-
-    refreshPublishStats();
 }
 
 // ============================================================
-// 多任务管理
+// 任务编辑器（含锚文本）
 // ============================================================
 
-async function refreshTasks() {
-    const resp = await chrome.runtime.sendMessage({ action: 'getTasks' });
-    const tasks = resp?.tasks || [];
-    const list = document.getElementById('task-list');
-    list.innerHTML = '';
-
-    if (tasks.length === 0) {
-        list.innerHTML = '<div class="empty-hint">暂无发布任务，点击"新建任务"创建</div>';
-        return;
-    }
-
-    tasks.forEach(task => {
-        const card = document.createElement('div');
-        card.className = 'task-card';
-        const stats = task.stats || { total: 0, success: 0, pending: 0, failed: 0 };
-        card.innerHTML = `
-            <div class="task-info">
-                <div class="task-name">${escapeHtml(task.name || task.website)}</div>
-                <div class="task-meta">
-                    ${escapeHtml(task.website)} · ${task.mode === 'full-auto' ? '全自动' : '半自动'}
-                </div>
-                <div class="task-stats-mini">
-                    ✓${stats.success} · ✗${stats.failed} · Σ${stats.total}
-                </div>
-            </div>
-            <div class="task-actions">
-                <button class="task-btn task-run" title="开始发布">▶</button>
-                <button class="task-btn task-edit" title="编辑">✎</button>
-                <button class="task-btn task-del" title="删除">×</button>
-            </div>
-        `;
-
-        card.querySelector('.task-run').addEventListener('click', () => {
-            chrome.runtime.sendMessage({ action: 'startPublish', task });
-        });
-        card.querySelector('.task-edit').addEventListener('click', () => {
-            openTaskEditor(task);
-        });
-        card.querySelector('.task-del').addEventListener('click', async () => {
-            if (confirm(`确定删除任务 "${task.name || task.website}"？`)) {
-                await chrome.runtime.sendMessage({ action: 'deleteTask', taskId: task.id });
-                refreshTasks();
-            }
-        });
-
-        list.appendChild(card);
-    });
-}
-
-function openTaskEditor(existingTask, categoryFilter) {
+function openTaskEditor(existingTask) {
     const overlay = document.createElement('div');
     overlay.className = 'settings-overlay';
 
@@ -413,6 +461,21 @@ function openTaskEditor(existingTask, categoryFilter) {
                 <label>评论者邮箱</label>
                 <input class="input" id="task-email" value="${escapeHtml(task.email || '')}">
             </div>
+        </div>
+
+        <div class="settings-section">
+            <h4>锚文本设置</h4>
+            <div class="settings-field">
+                <label>锚文本关键词</label>
+                <input class="input" id="task-anchor-kw" value="${escapeHtml(task.anchorKeyword || '')}" placeholder="例如：SEO工具">
+            </div>
+            <div class="settings-field">
+                <label>锚文本链接 URL</label>
+                <input class="input" id="task-anchor-url" value="${escapeHtml(task.anchorUrl || '')}" placeholder="https://mysite.com/page">
+            </div>
+        </div>
+
+        <div class="settings-section">
             <div class="settings-field">
                 <label>发布模式</label>
                 <select class="input" id="task-mode">
@@ -441,6 +504,8 @@ function openTaskEditor(existingTask, categoryFilter) {
             website,
             name_commenter: overlay.querySelector('#task-commenter').value.trim(),
             email: overlay.querySelector('#task-email').value.trim(),
+            anchorKeyword: overlay.querySelector('#task-anchor-kw').value.trim(),
+            anchorUrl: overlay.querySelector('#task-anchor-url').value.trim(),
             mode: overlay.querySelector('#task-mode').value
         };
 
@@ -491,13 +556,13 @@ async function refreshLogs() {
 }
 
 // ============================================================
-// 资源库
+// 资源库 - Submify风格资源浏览
 // ============================================================
 
 const TYPE_LABELS = {
     comment: '评论', forum: '论坛', register: '注册',
     'submit-site': '提交网站', 'guest-post': '投稿',
-    listing: '展示平台', wiki: 'Wiki', 'rich-editor': '编辑器',
+    listing: '综合', wiki: 'Wiki', 'rich-editor': '编辑器',
     disqus: 'Disqus', form: '表单'
 };
 
@@ -505,101 +570,157 @@ async function refreshResources(overrideFilter) {
     const allResources = await StorageHelper.getResources();
     const list = document.getElementById('resources-list');
     const empty = document.getElementById('resources-empty');
-    const count = document.getElementById('res-count');
+    const countEl = document.getElementById('res-count');
+    const resultsText = document.getElementById('res-results-text');
+
+    // 判断收藏模式
+    const favBtn = document.getElementById('btn-favorites-view');
+    const isFavMode = overrideFilter === 'favorites' || favBtn.classList.contains('active');
 
     const activeFilter = document.querySelector('.res-filter.active');
-    const filter = overrideFilter || (activeFilter ? activeFilter.dataset.filter : 'all');
+    const filter = isFavMode ? 'favorites' : (activeFilter ? activeFilter.dataset.filter : 'all');
 
-    let resources;
-    if (filter === 'comment') {
-        resources = allResources.filter(r =>
+    // 筛选
+    let resources = allResources;
+    if (filter === 'favorites') {
+        resources = resources.filter(r => r.favorited);
+    } else if (filter === 'comment') {
+        resources = resources.filter(r =>
             (r.opportunities && r.opportunities.includes('comment')) || r.type === 'comment'
         );
-    } else if (filter === 'favorites') {
-        resources = allResources.filter(r => r.favorited);
-    } else if (filter === 'other') {
-        resources = allResources.filter(r =>
-            !(r.opportunities && r.opportunities.includes('comment')) && r.type !== 'comment'
+    } else if (filter === 'submit-site') {
+        resources = resources.filter(r =>
+            (r.opportunities && r.opportunities.includes('submit-site')) || r.type === 'submit-site'
         );
-    } else {
-        resources = allResources;
+    } else if (filter === 'forum') {
+        resources = resources.filter(r =>
+            (r.opportunities && r.opportunities.includes('forum')) || r.type === 'forum'
+        );
+    } else if (filter === 'listing') {
+        resources = resources.filter(r => {
+            const opps = r.opportunities || [r.type] || [];
+            return !opps.includes('comment') && !opps.includes('submit-site') && !opps.includes('forum');
+        });
     }
 
-    count.textContent = allResources.length;
+    // 搜索
+    if (resSearchQuery) {
+        resources = resources.filter(r =>
+            (r.url && r.url.toLowerCase().includes(resSearchQuery)) ||
+            (r.pageTitle && r.pageTitle.toLowerCase().includes(resSearchQuery))
+        );
+    }
 
-    if (resources.length === 0) {
+    countEl.textContent = allResources.length;
+    const totalFiltered = resources.length;
+    const totalPages = Math.max(1, Math.ceil(totalFiltered / resPageSize));
+    if (resCurrentPage > totalPages) resCurrentPage = totalPages;
+
+    resultsText.textContent = `共 ${totalFiltered} 条`;
+
+    // 分页
+    const startIdx = (resCurrentPage - 1) * resPageSize;
+    const pageResources = resources.slice(startIdx, startIdx + resPageSize);
+
+    if (pageResources.length === 0) {
         empty.style.display = 'block';
-        list.querySelectorAll('.resource-item').forEach(el => el.remove());
+        list.querySelectorAll('.resource-card').forEach(el => el.remove());
+        renderPager(totalPages);
         return;
     }
 
     empty.style.display = 'none';
     list.innerHTML = '';
 
-    resources.forEach(res => {
+    pageResources.forEach(res => {
         const item = document.createElement('div');
-        item.className = 'resource-item';
+        item.className = 'resource-card';
 
-        const sourceTags = (res.sources || []).map(s => {
-            const cls = s === 'A' ? 'source-a' : s === 'S' ? 'source-s' : 'source-w';
-            return `<span class="res-tag ${cls}">${s}</span>`;
-        }).join('');
+        const opps = res.opportunities || [res.type] || [];
+        const mainType = opps[0] || 'listing';
+        const typeLabel = TYPE_LABELS[mainType] || mainType;
+        const paidBadge = res.isPaid
+            ? '<span class="res-badge res-badge-paid">付费</span>'
+            : '<span class="res-badge res-badge-free">免费</span>';
 
-        const typeTags = (res.opportunities || [res.type] || []).map(t => {
-            const label = TYPE_LABELS[t] || t;
-            return `<span class="res-tag type-${t}">${label}</span>`;
-        }).join('');
+        const drInfo = res.dr ? `DR: ${res.dr}` : '';
+        const langInfo = res.language ? `语言: ${res.language}` : '';
+        const catInfo = res.category ? `分类: ${res.category}` : '';
+        const metaParts = [catInfo, langInfo, drInfo].filter(Boolean).join('  ');
 
-        const statusCls = 'status-' + (res.status || 'pending');
-        const title = res.pageTitle ? `<div class="res-title" title="${escapeHtml(res.pageTitle)}">${escapeHtml(res.pageTitle)}</div>` : '';
-        const detail = res.details && res.details.length ? `<div class="res-detail">${res.details.join(' · ')}</div>` : '';
-
-        const showRepublish = res.status === 'published' || res.status === 'failed' || res.status === 'skipped';
+        const favClass = res.favorited ? 'res-fav-btn active' : 'res-fav-btn';
 
         item.innerHTML = `
-      <div class="res-info">
-        ${title}
-        <div class="res-url">${escapeHtml(res.url)}</div>
-        <div class="res-meta">
-          ${sourceTags}
-          ${typeTags}
-          <span class="res-tag ${statusCls}">${i18n.t('status.' + (res.status || 'pending'))}</span>
-        </div>
-        ${detail}
-      </div>
-      <div class="res-actions">
-        ${showRepublish ? `<button class="res-btn res-republish" data-id="${res.id}" title="重新发布">🔄</button>` : ''}
-        ${showRepublish ? `<button class="res-btn res-reset" data-id="${res.id}" title="重置为待发布">↩</button>` : ''}
-        <button class="res-del" data-id="${res.id}" title="删除">×</button>
-      </div>
-    `;
+            <div class="resource-card-main">
+                <div class="resource-card-top">
+                    <div class="resource-card-name">${escapeHtml(res.pageTitle || new URL(res.url).hostname)}</div>
+                    ${paidBadge}
+                </div>
+                <a class="resource-card-url" href="${escapeHtml(res.url)}" target="_blank">${escapeHtml(res.url)}</a>
+                ${metaParts ? `<div class="resource-card-meta">${escapeHtml(metaParts)}</div>` : ''}
+            </div>
+            <div class="resource-card-side">
+                <button class="${favClass}" data-id="${res.id}" title="收藏">☆</button>
+                <button class="res-start-btn" data-id="${res.id}" title="开始发布">▶ 开始</button>
+            </div>
+        `;
 
-        item.querySelector('.res-del').addEventListener('click', async () => {
-            await StorageHelper.deleteResource(res.id);
-            refreshResources();
+        // 收藏
+        item.querySelector('.res-fav-btn').addEventListener('click', async (e) => {
+            const btn = e.currentTarget;
+            const newFav = !res.favorited;
+            await StorageHelper.updateResource(res.id, { favorited: newFav });
+            res.favorited = newFav;
+            btn.classList.toggle('active', newFav);
         });
 
-        const republishBtn = item.querySelector('.res-republish');
-        if (republishBtn) {
-            republishBtn.addEventListener('click', () => {
-                chrome.runtime.sendMessage({ action: 'republish', resourceId: res.id });
-            });
-        }
+        // 开始发布（打开该URL）
+        item.querySelector('.res-start-btn').addEventListener('click', () => {
+            chrome.tabs.create({ url: res.url });
+        });
 
-        const resetBtn = item.querySelector('.res-reset');
-        if (resetBtn) {
-            resetBtn.addEventListener('click', async () => {
-                chrome.runtime.sendMessage({ action: 'resetStatus', resourceId: res.id });
-                setTimeout(refreshResources, 500);
-            });
-        }
-
-        item.querySelector('.res-url').style.cursor = 'pointer';
-        item.querySelector('.res-url').addEventListener('click', () => {
+        // 点击URL打开
+        item.querySelector('.resource-card-url').addEventListener('click', (e) => {
+            e.preventDefault();
             chrome.tabs.create({ url: res.url });
         });
 
         list.appendChild(item);
+    });
+
+    renderPager(totalPages);
+}
+
+function renderPager(totalPages) {
+    const pager = document.getElementById('res-pager');
+    if (totalPages <= 1) {
+        pager.innerHTML = '';
+        return;
+    }
+
+    let html = '';
+    // Previous
+    html += `<button class="pager-btn" data-page="${resCurrentPage - 1}" ${resCurrentPage <= 1 ? 'disabled' : ''}>‹</button>`;
+
+    // Page numbers (show max 5)
+    let start = Math.max(1, resCurrentPage - 2);
+    let end = Math.min(totalPages, start + 4);
+    if (end - start < 4) start = Math.max(1, end - 4);
+
+    for (let i = start; i <= end; i++) {
+        html += `<button class="pager-btn ${i === resCurrentPage ? 'active' : ''}" data-page="${i}">${i}</button>`;
+    }
+
+    // Next
+    html += `<button class="pager-btn" data-page="${resCurrentPage + 1}" ${resCurrentPage >= totalPages ? 'disabled' : ''}>›</button>`;
+
+    pager.innerHTML = html;
+
+    pager.querySelectorAll('.pager-btn:not([disabled])').forEach(btn => {
+        btn.addEventListener('click', () => {
+            resCurrentPage = parseInt(btn.dataset.page);
+            refreshResources();
+        });
     });
 }
 
@@ -633,7 +754,7 @@ async function openSettings() {
     </h2>
 
     <div class="settings-section">
-      <h4>🤖 AI 配置 (OpenRouter)</h4>
+      <h4>AI 配置 (OpenRouter)</h4>
       <div class="settings-field">
         <label>OpenRouter API Key</label>
         <input class="input" id="set-api-key" type="password" value="${escapeHtml(settings.openrouterApiKey || '')}" placeholder="sk-or-...">
@@ -654,17 +775,17 @@ async function openSettings() {
         <label>链接发现模型 (linkDiscover)</label>
         <input class="input" id="set-model-link" value="${escapeHtml(settings.modelLinkDiscover || '')}" placeholder="例如 google/gemini-2.0-flash-001">
       </div>
-      <button class="btn-test" id="btn-test-ai">🔌 测试 AI 连接</button>
+      <button class="btn-test" id="btn-test-ai">测试 AI 连接</button>
       <div class="test-result" id="ai-test-result"></div>
     </div>
 
     <div class="settings-section">
-      <h4>📊 Google Sheets</h4>
+      <h4>Google Sheets</h4>
       <div class="settings-field">
         <label>Google Sheet ID</label>
         <input class="input" id="set-sheet-id" value="${escapeHtml(settings.googleSheetId || '')}" placeholder="从 Sheet URL 中提取的 ID">
       </div>
-      <button class="btn-test" id="btn-sync-sheets">☁ 同步到 Sheets</button>
+      <button class="btn-test" id="btn-sync-sheets">同步到 Sheets</button>
       <div class="test-result" id="sheets-result"></div>
     </div>
 
@@ -685,18 +806,6 @@ async function openSettings() {
     </div>
 
     <div class="settings-section">
-      <h4>${i18n.t('settings.anchor')}</h4>
-      <div class="settings-field">
-        <label>${i18n.t('settings.anchorKeyword')}</label>
-        <input class="input" id="set-anchor-kw" value="${escapeHtml(settings.anchorKeyword || '')}">
-      </div>
-      <div class="settings-field">
-        <label>${i18n.t('settings.anchorUrl')}</label>
-        <input class="input" id="set-anchor-url" value="${escapeHtml(settings.anchorUrl || '')}">
-      </div>
-    </div>
-
-    <div class="settings-section">
       <h4>${i18n.t('settings.templates')}</h4>
       <div style="font-size:11px;color:#8891a8;margin-bottom:8px">可用变量: {title} {greeting} {complement} {question} {domain} {keyword}</div>
       <div id="templates-list">${templatesHtml}</div>
@@ -709,15 +818,12 @@ async function openSettings() {
 
     document.body.appendChild(overlay);
 
-    // Back button
     overlay.querySelector('#settings-back').addEventListener('click', () => overlay.remove());
 
-    // Remove template
     overlay.querySelectorAll('.template-remove').forEach(btn => {
         btn.addEventListener('click', () => btn.closest('.template-item').remove());
     });
 
-    // Add template
     overlay.querySelector('#btn-add-tpl').addEventListener('click', () => {
         const list = overlay.querySelector('#templates-list');
         const item = document.createElement('div');
@@ -730,26 +836,23 @@ async function openSettings() {
         list.appendChild(item);
     });
 
-    // Test AI Connection
     overlay.querySelector('#btn-test-ai').addEventListener('click', async () => {
         const resultEl = overlay.querySelector('#ai-test-result');
         resultEl.textContent = '测试中...';
         resultEl.className = 'test-result';
 
-        // 先临时保存 key 和模型
         await saveCurrentSettings(overlay);
 
         const result = await chrome.runtime.sendMessage({ action: 'testAiConnection' });
         if (result.success) {
-            resultEl.textContent = '✓ 连接成功: ' + result.message;
+            resultEl.textContent = '连接成功: ' + result.message;
             resultEl.className = 'test-result success';
         } else {
-            resultEl.textContent = '✗ 连接失败: ' + result.message;
+            resultEl.textContent = '连接失败: ' + result.message;
             resultEl.className = 'test-result error';
         }
     });
 
-    // Sync to Sheets
     overlay.querySelector('#btn-sync-sheets').addEventListener('click', async () => {
         const resultEl = overlay.querySelector('#sheets-result');
         resultEl.textContent = '同步中...';
@@ -759,15 +862,14 @@ async function openSettings() {
 
         const result = await chrome.runtime.sendMessage({ action: 'syncToSheets' });
         if (result.success) {
-            resultEl.textContent = '✓ ' + result.message;
+            resultEl.textContent = result.message;
             resultEl.className = 'test-result success';
         } else {
-            resultEl.textContent = '✗ ' + result.message;
+            resultEl.textContent = result.message;
             resultEl.className = 'test-result error';
         }
     });
 
-    // Save
     overlay.querySelector('#btn-save-settings').addEventListener('click', async () => {
         await saveCurrentSettings(overlay);
 
@@ -783,20 +885,15 @@ async function saveCurrentSettings(overlay) {
         .filter(Boolean);
 
     const newSettings = {
-        // AI 配置
         openrouterApiKey: overlay.querySelector('#set-api-key').value.trim(),
         modelClassify: overlay.querySelector('#set-model-classify').value.trim(),
         modelFormExtract: overlay.querySelector('#set-model-form').value.trim(),
         modelCommentGen: overlay.querySelector('#set-model-comment').value.trim(),
         modelLinkDiscover: overlay.querySelector('#set-model-link').value.trim(),
-        // Google Sheets
         googleSheetId: overlay.querySelector('#set-sheet-id').value.trim(),
-        // 用户信息
         name: overlay.querySelector('#set-name').value.trim(),
         email: overlay.querySelector('#set-email').value.trim(),
         website: overlay.querySelector('#set-website').value.trim(),
-        anchorKeyword: overlay.querySelector('#set-anchor-kw').value.trim(),
-        anchorUrl: overlay.querySelector('#set-anchor-url').value.trim(),
         commentTemplates: templates,
         language: i18n.currentLang
     };
@@ -807,24 +904,15 @@ async function saveCurrentSettings(overlay) {
 // === 语言更新 ===
 
 function updateUILanguage() {
-    // Tab buttons
     document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.textContent = i18n.t('tab.' + btn.dataset.tab);
     });
 
-    // Collect tab
     document.querySelector('#panel-collect .field-label').textContent = i18n.t('collect.targetDomain');
     document.getElementById('domain-input').placeholder = i18n.t('collect.domainPlaceholder');
     document.getElementById('my-domain-input').placeholder = i18n.t('collect.myDomainPlaceholder');
     document.getElementById('btn-collect').textContent = i18n.t('collect.start');
 
-    // Publish tab - panel-header was replaced by category cards
-
-    // Resources tab
-    document.querySelector('#panel-resources .panel-header h3').innerHTML =
-        i18n.t('resources.title') + ` <span class="badge" id="res-count">0</span>`;
-
-    // Footer
     document.getElementById('btn-settings').textContent = i18n.t('footer.settings');
     document.getElementById('btn-clear').textContent = i18n.t('footer.clear');
 }
