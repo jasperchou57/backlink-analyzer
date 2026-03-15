@@ -2299,21 +2299,8 @@ async function setDomainPublishPolicy(url, patch = {}) {
 }
 
 function getDomainCooldownState(policy = {}, now = Date.now()) {
-    const cooldownUntilRaw = policy?.cooldownUntil || '';
-    if (!cooldownUntilRaw) {
-        return { active: false, remainingMs: 0, cooldownUntil: '' };
-    }
-
-    const cooldownUntilMs = new Date(cooldownUntilRaw).getTime();
-    if (!Number.isFinite(cooldownUntilMs) || cooldownUntilMs <= now) {
-        return { active: false, remainingMs: 0, cooldownUntil: cooldownUntilRaw };
-    }
-
-    return {
-        active: true,
-        remainingMs: cooldownUntilMs - now,
-        cooldownUntil: cooldownUntilRaw
-    };
+    // Cooldown disabled — efficiency first, don't get stuck on one domain
+    return { active: false, remainingMs: 0, cooldownUntil: '' };
 }
 
 function isResourceCoolingDown(resource, policies = {}, now = Date.now()) {
