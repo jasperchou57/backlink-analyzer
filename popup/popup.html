@@ -19,22 +19,30 @@
             <button id="btn-close" class="btn-close" title="关闭">✕</button>
         </div>
 
-        <div class="home-panel active" id="panel-home">
-            <div class="home-hero">
-                <div class="home-kicker">工作流首页</div>
-                <h1 class="home-title">选择一个工作区</h1>
-                <p class="home-desc">把“外链发现与发布”和“产品宣传流程”分开运行，避免两套任务混在同一个面板里。</p>
+        <div class=”home-panel active” id=”panel-home”>
+            <div class=”home-hero”>
+                <div class=”home-kicker”>工作流首页</div>
+                <h1 class=”home-title”>选择一个工作区</h1>
+                <p class=”home-desc”>把”外链发现与发布”和”产品宣传流程”分开运行，避免两套任务混在同一个面板里。</p>
             </div>
-            <div class="home-grid">
-                <button class="home-card" id="btn-enter-backlink">
-                    <span class="home-card-tag">SEO / 外链</span>
-                    <span class="home-card-title">外链工作流</span>
-                    <span class="home-card-desc">持续发现外链、递归分析评论区、筛选可直接发布资源，再进入外链发布流程。</span>
+            <div class=”home-grid”>
+                <button class=”submify-card home-card” id=”btn-enter-backlink”>
+                    <div class=”submify-card-header”>
+                        <span class=”submify-card-icon”>🔗</span>
+                        <span class=”submify-card-tag”>SEO / 外链</span>
+                    </div>
+                    <span class=”submify-card-title”>外链工作流</span>
+                    <span class=”submify-card-desc”>持续发现外链、递归分析评论区、筛选可直接发布资源，再进入外链发布流程。</span>
+                    <span class=”submify-card-action”>进入工作区 →</span>
                 </button>
-                <button class="home-card" id="btn-enter-marketing">
-                    <span class="home-card-tag">营销 / Agent</span>
-                    <span class="home-card-title">产品宣传工作流</span>
-                    <span class="home-card-desc">把产品宣传主任务和长期养号分开管理，后续会继续接自动化执行器。</span>
+                <button class=”submify-card home-card” id=”btn-enter-marketing”>
+                    <div class=”submify-card-header”>
+                        <span class=”submify-card-icon”>📢</span>
+                        <span class=”submify-card-tag”>营销 / Agent</span>
+                    </div>
+                    <span class=”submify-card-title”>产品宣传工作流</span>
+                    <span class=”submify-card-desc”>把产品宣传主任务和长期养号分开管理，后续会继续接自动化执行器。</span>
+                    <span class=”submify-card-action submify-card-action--alt”>进入工作区 →</span>
                 </button>
             </div>
         </div>
@@ -308,6 +316,35 @@
                     <div class="marketing-focus-subtitle">把产品宣传主任务和长期养号分开管理</div>
                 </div>
                 <div class="workflow-library" id="marketing-workflow-library"></div>
+            </div>
+
+            <div class="marketing-focus-card">
+                <div class="marketing-focus-head">
+                    <div class="marketing-focus-title">营销能力总览</div>
+                    <div class="marketing-focus-subtitle">覆盖产品推广全链路的自动化能力</div>
+                </div>
+                <div class="submify-cards-grid">
+                    <div class="submify-card submify-card--compact">
+                        <span class="submify-card-icon">🚀</span>
+                        <span class="submify-card-title">Startup 发布列表</span>
+                        <span class="submify-card-desc">自动提交到 Product Hunt、BetaList 等目录站，快速获取初始曝光。</span>
+                    </div>
+                    <div class="submify-card submify-card--compact">
+                        <span class="submify-card-icon">💬</span>
+                        <span class="submify-card-title">社区推广</span>
+                        <span class="submify-card-desc">在 Reddit、Hacker News、V2EX 等社区发帖或回复，精准触达目标用户。</span>
+                    </div>
+                    <div class="submify-card submify-card--compact">
+                        <span class="submify-card-icon">📝</span>
+                        <span class="submify-card-title">博客提交</span>
+                        <span class="submify-card-desc">向高权重博客评论区提交外链，持续建立反向链接资源。</span>
+                    </div>
+                    <div class="submify-card submify-card--compact">
+                        <span class="submify-card-icon">🌱</span>
+                        <span class="submify-card-title">长期养号</span>
+                        <span class="submify-card-desc">定期在各平台互动养号，提升账号权重，为后续推广蓄力。</span>
+                    </div>
+                </div>
             </div>
         </div>
 
