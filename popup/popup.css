@@ -1171,6 +1171,196 @@ body {
   font-size: 12px;
 }
 
+/* ===== Per-task Publish Overview Toggle ===== */
+.task-overview-toggle {
+  padding: 6px 14px;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  user-select: none;
+  text-align: center;
+  border-top: 1px solid var(--border);
+  transition: background 0.15s;
+}
+
+.task-overview-toggle:hover {
+  background: var(--accent-light);
+}
+
+/* ===== Per-task Publish Stats Grid ===== */
+.task-publish-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.task-publish-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 4px;
+  background: var(--bg-card);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+.task-publish-num {
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--accent);
+}
+
+.task-publish-num.green {
+  color: var(--green);
+}
+
+.task-publish-num.yellow {
+  color: var(--yellow);
+}
+
+.task-publish-num.red {
+  color: var(--red);
+}
+
+.task-publish-lbl {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+/* ===== Per-task Overview Bars ===== */
+.task-overview-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.task-overview-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 8px;
+  background: var(--bg-card);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+.task-overview-bar.anchor {
+  border-left: 3px solid var(--accent);
+}
+
+.task-overview-bar.success {
+  border-left: 3px solid var(--green);
+}
+
+.task-overview-bar-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.task-overview-bar-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* ===== Per-task Session Box ===== */
+.task-session-box {
+  padding: 8px 10px;
+  background: var(--bg-card);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+.task-session-box.active {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+
+.task-session-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.task-session-url {
+  font-size: 11px;
+  color: var(--text-secondary);
+  word-break: break-all;
+  margin-bottom: 6px;
+}
+
+.task-session-progress {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+
+.task-session-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.task-session-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.task-session-text {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.task-session-subtext {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.task-session-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* ===== Task Inline Buttons ===== */
+.task-inline-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent);
+  background: var(--bg-card);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.task-inline-btn:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+.task-inline-btn.danger {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+.task-inline-btn.danger:hover {
+  background: var(--red);
+  color: #fff;
+}
+
 .task-render-diagnostics {
   padding: 8px 14px;
   background: var(--red-light);
