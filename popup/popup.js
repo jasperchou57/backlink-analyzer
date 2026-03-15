@@ -818,8 +818,7 @@ function updateUILanguage() {
     document.getElementById('my-domain-input').placeholder = i18n.t('collect.myDomainPlaceholder');
     document.getElementById('btn-collect').textContent = i18n.t('collect.start');
 
-    // Publish tab
-    document.querySelector('#panel-publish .panel-header h3').textContent = i18n.t('publish.tasks');
+    // Publish tab - panel-header was replaced by category cards
 
     // Resources tab
     document.querySelector('#panel-resources .panel-header h3').innerHTML =
