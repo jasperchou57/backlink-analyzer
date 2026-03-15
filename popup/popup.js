@@ -74,10 +74,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     function renderSiteSelect() {
         siteSelect.innerHTML = '';
         if (sites.length === 0) {
-            const opt = document.createElement('option');
-            opt.value = '';
-            opt.textContent = '+ 添加网站';
-            siteSelect.appendChild(opt);
+            // Disabled placeholder so selecting "添加网站" triggers change event
+            const placeholder = document.createElement('option');
+            placeholder.value = '';
+            placeholder.textContent = '选择网站...';
+            placeholder.disabled = true;
+            placeholder.selected = true;
+            siteSelect.appendChild(placeholder);
+            const addOpt = document.createElement('option');
+            addOpt.value = '__add__';
+            addOpt.textContent = '+ 添加网站';
+            siteSelect.appendChild(addOpt);
             return;
         }
         sites.forEach(site => {
@@ -93,23 +100,27 @@ document.addEventListener('DOMContentLoaded', async () => {
         siteSelect.value = activeSiteId;
     }
 
+    async function triggerAddSite() {
+        const name = prompt('网站名称（如 My Blog）');
+        if (!name) { siteSelect.value = activeSiteId; return; }
+        const url = prompt('网站地址（如 https://myblog.com）');
+        if (!url) { siteSelect.value = activeSiteId; return; }
+        const newSite = {
+            id: crypto.randomUUID(),
+            name: name.trim(),
+            url: normalizeHttpUrl(url.trim()),
+            createdAt: new Date().toISOString()
+        };
+        sites.push(newSite);
+        activeSiteId = newSite.id;
+        await chrome.storage.local.set({ sites, activeSiteId });
+        renderSiteSelect();
+    }
+
     siteSelect.addEventListener('change', async () => {
         const val = siteSelect.value;
-        if (val === '__add__' || val === '') {
-            const name = prompt('网站名称（如 My Blog）');
-            if (!name) { siteSelect.value = activeSiteId; return; }
-            const url = prompt('网站地址（如 https://myblog.com）');
-            if (!url) { siteSelect.value = activeSiteId; return; }
-            const newSite = {
-                id: crypto.randomUUID(),
-                name: name.trim(),
-                url: normalizeHttpUrl(url.trim()),
-                createdAt: new Date().toISOString()
-            };
-            sites.push(newSite);
-            activeSiteId = newSite.id;
-            await chrome.storage.local.set({ sites, activeSiteId });
-            renderSiteSelect();
+        if (val === '__add__') {
+            await triggerAddSite();
             return;
         }
         activeSiteId = val;
@@ -129,10 +140,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     });
 
-    // === 初始化模块 ===
+    // === 持久化展开状态（不会在 refreshTasks 时丢失） ===
     const expandedPublishTaskIds = new Set();
     const expandedMarketingTaskIds = new Set();
 
+    // === 初始化模块 ===
     const taskPanel = TaskPanel.create({
         escapeHtml,
         normalizeUrl: normalizeHttpUrl,
@@ -517,12 +529,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (msg.action === 'publishProgress') {
             taskPanel.updatePublishProgress(msg);
+            // Also refresh global stats so per-task overview picks up latest resource statuses
+            refreshPublishStats();
         }
         if (msg.action === 'publishDone') {
-            taskPanel.refreshPublishState().then(() => taskPanel.refreshTasks());
+            taskPanel.refreshPublishState().then(() => {
+                taskPanel.refreshTasks();
+                refreshPublishStats();
+            });
         }
         if (msg.action === 'publishBatchUpdate') {
-            taskPanel.refreshPublishState().then(() => taskPanel.refreshTasks());
+            taskPanel.refreshPublishState().then(() => {
+                taskPanel.refreshTasks();
+                refreshPublishStats();
+            });
         }
         if (msg.action === 'newLog') {
             const logsPanel = document.getElementById('panel-logs');

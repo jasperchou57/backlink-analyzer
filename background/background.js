@@ -341,6 +341,13 @@ async function bootstrapBackgroundRuntime() {
     }
     await restoreTaskSchedules();
     await performStorageMaintenance();
+    // Recover stalled batch publish after service worker restart (e.g., after sleep)
+    try {
+        await publishBatchRuntime.ensureLoaded();
+        if (publishBatchRuntime.isRunning()) {
+            publishBatchRuntime.scheduleAdvance('service-worker-restart', 2000);
+        }
+    } catch {}
 }
 
 function triggerBackgroundBootstrap() {
@@ -364,6 +371,10 @@ if (!chrome.sidePanel?.setPanelBehavior) {
 
 function handleAlarmEvent(alarm) {
     if (!alarm?.name) return;
+    if (alarm.name === publishBatchRuntime.WATCHDOG_ALARM_NAME) {
+        publishBatchRuntime.handleWatchdogAlarm().catch(() => {});
+        return;
+    }
     if (alarm.name.startsWith('nurture:')) {
         handleNurtureAlarm(alarm.name.slice('nurture:'.length)).catch(() => {});
         return;

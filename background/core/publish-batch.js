@@ -85,10 +85,44 @@
             return !!state?.isRunning;
         }
 
+        const WATCHDOG_ALARM_NAME = 'publish-batch-watchdog';
+
         function clearAdvanceTimer() {
             if (advanceTimer) {
                 clearTimeout(advanceTimer);
                 advanceTimer = null;
+            }
+        }
+
+        async function startWatchdog() {
+            try {
+                await chrome.alarms.create(WATCHDOG_ALARM_NAME, {
+                    delayInMinutes: 0.5,
+                    periodInMinutes: 0.5
+                });
+            } catch {}
+        }
+
+        async function stopWatchdog() {
+            try { await chrome.alarms.clear(WATCHDOG_ALARM_NAME); } catch {}
+        }
+
+        async function handleWatchdogAlarm() {
+            await ensureLoaded();
+            if (!isRunning()) {
+                await stopWatchdog();
+                return;
+            }
+            const sessionView = await config.getPublishStateView();
+            const queueTaskIdSet = new Set(state.queueTaskIds || []);
+            const activeTaskIds = uniqueIds(
+                (sessionView.activeTaskIds || []).filter((id) => queueTaskIdSet.has(id))
+            );
+            if (activeTaskIds.length === 0 && getRemainingTaskIds(state).length > 0) {
+                await logger.publish('看门狗恢复：检测到批量发布停滞，重新接力', { reason: 'watchdog' });
+                await advance('watchdog-recover').catch(async (error) => {
+                    await logger.error(`看门狗接力失败: ${error.message}`);
+                });
             }
         }
 
@@ -114,6 +148,7 @@
         }
 
         async function finalize(message = '批量发布已完成') {
+            await stopWatchdog();
             await ensureLoaded();
             if (!state.queueTaskIds?.length) {
                 setState({
@@ -196,11 +231,13 @@
                 activeTaskIds.join('::') !== (state.activeTaskIds || []).join('::')
                 || (activeTaskIds[0] || '') !== (state.currentTaskId || '')
             ) {
+                const doneCountSync = getDoneTaskIds(state).length;
+                const totalCountSync = (state.queueTaskIds || []).length;
                 updateState({
                     activeTaskIds,
                     currentTaskId: activeTaskIds[0] || '',
                     lastMessage: activeTaskIds.length > 0
-                        ? `并发执行中 ${activeTaskIds.length} 个发布任务`
+                        ? `正在执行第 ${doneCountSync + 1}/${totalCountSync} 个发布任务`
                         : (state.lastMessage || '等待批量发布结果')
                 });
             }
@@ -214,11 +251,11 @@
                     success: true,
                     waiting: true,
                     activeTaskIds,
-                    message: `并发执行中 ${activeTaskIds.length} 个发布任务`
+                    message: `正在执行发布任务，等待完成`
                 };
             }
 
-            const startedTaskIds = [];
+            let startedTaskId = '';
             for (const taskId of remainingTaskIds) {
                 const task = taskMap.get(taskId);
                 if (!task || config.getTaskType(task) !== 'publish') {
@@ -228,8 +265,8 @@
 
                 const result = await config.startPublish(task, { fromBatch: true, batchReason: reason });
                 if (result?.success) {
-                    startedTaskIds.push(taskId);
-                    continue;
+                    startedTaskId = taskId;
+                    break;
                 }
 
                 if (shouldSkipTask(result)) {
@@ -242,12 +279,14 @@
 
             const refreshedSessionView = await config.getPublishStateView();
             const nextActiveTaskIds = uniqueIds((refreshedSessionView.activeTaskIds || []).filter((taskId) => queueTaskIdSet.has(taskId)));
+            const doneCount = getDoneTaskIds(state).length;
+            const totalCount = (state.queueTaskIds || []).length;
             updateState({
                 activeTaskIds: nextActiveTaskIds,
                 currentTaskId: nextActiveTaskIds[0] || '',
                 lastMessage: nextActiveTaskIds.length > 0
-                    ? `并发执行中 ${nextActiveTaskIds.length} 个发布任务`
-                    : (startedTaskIds.length > 0 ? '批量发布已启动，等待任务完成' : state.lastMessage || '')
+                    ? `正在执行第 ${doneCount + 1}/${totalCount} 个发布任务`
+                    : (startedTaskId ? '批量发布已启动，等待任务完成' : state.lastMessage || '')
             });
 
             if (getRemainingTaskIds(state).length === 0 && nextActiveTaskIds.length === 0) {
@@ -256,11 +295,11 @@
 
             return {
                 success: true,
-                started: startedTaskIds.length > 0,
-                startedTaskIds,
+                started: !!startedTaskId,
+                startedTaskIds: startedTaskId ? [startedTaskId] : [],
                 activeTaskIds: nextActiveTaskIds,
                 message: nextActiveTaskIds.length > 0
-                    ? `批量并发执行中 ${nextActiveTaskIds.length} 个任务`
+                    ? `正在执行第 ${doneCount + 1}/${totalCount} 个发布任务`
                     : '批量发布没有新的可启动任务'
             };
         }
@@ -308,10 +347,11 @@
                 startedAt: now,
                 updatedAt: now,
                 lastMessage: activeTaskIds.length > 0
-                    ? `准备并发接管 ${queueTaskIds.length} 个发布任务`
-                    : `准备并发执行 ${queueTaskIds.length} 个发布任务`
+                    ? `准备依次执行 ${queueTaskIds.length} 个发布任务`
+                    : `准备依次执行 ${queueTaskIds.length} 个发布任务`
             });
 
+            await startWatchdog();
             await logger.publish('启动批量发布', {
                 totalTasks: queueTaskIds.length,
                 activeTaskIds,
@@ -337,6 +377,7 @@
             });
 
             clearAdvanceTimer();
+            await stopWatchdog();
 
             if (options.stopActiveTask !== false && activeTaskIds.length > 0) {
                 for (const activeTaskId of activeTaskIds) {
@@ -391,7 +432,9 @@
             start,
             stop,
             reset,
-            clearAdvanceTimer
+            clearAdvanceTimer,
+            handleWatchdogAlarm,
+            WATCHDOG_ALARM_NAME
         };
     }
 

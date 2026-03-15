@@ -1,5 +1,57 @@
 /** Publish flow - extracted from background.js */
 
+/**
+ * Daily period boundary: Beijing time 17:00 = UTC 09:00.
+ * Returns the UTC timestamp (ms) of the most recent period start.
+ */
+function getDailyPeriodStart(now) {
+    const d = now || new Date();
+    const boundary = new Date(Date.UTC(
+        d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 9, 0, 0, 0
+    ));
+    if (d.getTime() < boundary.getTime()) {
+        boundary.setUTCDate(boundary.getUTCDate() - 1);
+    }
+    return boundary.getTime();
+}
+
+/**
+ * Read the current-day publish count for a task's active limit metric.
+ * Returns 0 if the stored period doesn't match today's period.
+ */
+function getTaskDailyLimitCount(task) {
+    const periodStart = getDailyPeriodStart();
+    const isCurrentPeriod = Number(task?.dailyPeriodStart || 0) === periodStart;
+    if (!isCurrentPeriod) return 0;
+    const isAnchorLimit = task?.commentStyle === 'anchor-html';
+    return isAnchorLimit
+        ? Number(task?.dailyAnchorSuccessCount || 0)
+        : Number(task?.dailyPublishedCount || 0);
+}
+
+/**
+ * Increment daily publish counts on the task and persist.
+ * Returns the updated daily limit-relevant count.
+ */
+async function incrementTaskDailyPublishCount(taskId, { published = false, anchorSuccess = false } = {}) {
+    const periodStart = getDailyPeriodStart();
+    const result = await TaskStore.updateTask(taskId, (task) => {
+        const isCurrentPeriod = Number(task.dailyPeriodStart || 0) === periodStart;
+        const prevPublished = isCurrentPeriod ? Number(task.dailyPublishedCount || 0) : 0;
+        const prevAnchor = isCurrentPeriod ? Number(task.dailyAnchorSuccessCount || 0) : 0;
+        return {
+            ...task,
+            dailyPeriodStart: periodStart,
+            dailyPublishedCount: prevPublished + (published ? 1 : 0),
+            dailyAnchorSuccessCount: prevAnchor + (anchorSuccess ? 1 : 0)
+        };
+    });
+    const isAnchorLimit = result?.commentStyle === 'anchor-html';
+    return isAnchorLimit
+        ? Number(result?.dailyAnchorSuccessCount || 0)
+        : Number(result?.dailyPublishedCount || 0);
+}
+
 async function savePublishTask(task) {
     task.workflowId = task.workflowId || WorkflowRegistry.DEFAULT_WORKFLOW_ID;
     task.taskType = getTaskType(task);
@@ -342,6 +394,9 @@ function getPublishRuntimeContext(taskId) {
         getPublishCandidatePriority: (resource, task) => self.ResourceRules?.getPublishCandidatePriority?.(resource, task) || 0,
         getResourcePublishRankingScore: (resource, task, siteTemplates = {}) => getResourcePublishRankingScore(resource, task, siteTemplates),
         getTaskPublishTarget,
+        getTaskDailyLimitCount: (task) => getTaskDailyLimitCount(task),
+        incrementDailyPublishCount: async (tId, delta) => await incrementTaskDailyPublishCount(tId, delta),
+        getDailyPeriodStart: () => getDailyPeriodStart(),
         rebalanceDispatchQueue: () => rebalanceDispatchQueue(taskId),
         acquirePublishLease: (resource, options = {}) => acquirePublishLease(taskId, resource, options),
         releasePublishLease: (options = {}) => releasePublishLease(taskId, options),

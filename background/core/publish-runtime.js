@@ -157,22 +157,20 @@ const PublishRuntime = {
         const carriedAnchorSuccessCount = shouldCarryRunCounts
             ? Number(previousState.sessionAnchorSuccessCount || 0)
             : 0;
-        const carriedLimitMetric = this.getPublishLimitMetric(task, {
-            sessionPublishedCount: carriedPublishedCount,
-            sessionAnchorSuccessCount: carriedAnchorSuccessCount
-        });
+
+        const isAnchorLimit = task?.commentStyle === 'anchor-html';
+        const dailyLimitCount = ctx.getTaskDailyLimitCount(task);
 
         if (
-            shouldCarryRunCounts
-            && maxPublishes > 0
-            && Number(carriedLimitMetric.count || 0) >= maxPublishes
+            maxPublishes > 0
+            && dailyLimitCount >= maxPublishes
         ) {
             return {
                 success: false,
                 code: 'publish_limit_reached',
-                message: carriedLimitMetric.isAnchorLimit
-                    ? `当前连续运行已达到成功锚文本外链上限 ${maxPublishes}`
-                    : `当前连续运行已达到成功发布上限 ${maxPublishes}`
+                message: isAnchorLimit
+                    ? `今日已达到每日成功锚文本外链上限 ${maxPublishes}`
+                    : `今日已达到每日成功发布上限 ${maxPublishes}`
             };
         }
 
@@ -182,8 +180,8 @@ const PublishRuntime = {
             workflow?.id || ctx.defaultWorkflowId,
             {
                 currentTabId: previousState.currentTabId || null,
-                limitType: carriedLimitMetric.isAnchorLimit ? 'anchor-success' : 'published',
-                currentLimitCount: carriedLimitMetric.count,
+                limitType: isAnchorLimit ? 'anchor-success' : 'published',
+                currentLimitCount: dailyLimitCount,
                 targetLimitCount: maxPublishes > 0 ? maxPublishes : 0,
                 sessionPublishedCount: carriedPublishedCount,
                 sessionAnchorSuccessCount: carriedAnchorSuccessCount
@@ -196,15 +194,15 @@ const PublishRuntime = {
             maxPublishes,
             activePool: dispatchSelection.activePool || 'mixed',
             poolCounts: dispatchSelection.counts,
-            limitType: carriedLimitMetric.isAnchorLimit ? 'anchor-success' : 'published',
-            currentLimitCount: carriedLimitMetric.count
+            limitType: isAnchorLimit ? 'anchor-success' : 'published',
+            currentLimitCount: dailyLimitCount
         });
 
         return {
             success: true,
             queued: pending.length,
             resumed: shouldCarryRunCounts,
-            currentLimitCount: carriedLimitMetric.count
+            currentLimitCount: dailyLimitCount
         };
     },
 
@@ -218,8 +216,8 @@ const PublishRuntime = {
             ctx.broadcastDone();
             await ctx.logger.publish(
                 state.limitType === 'anchor-success'
-                    ? `已达到本次成功锚文本外链上限 ${state.targetLimitCount}`
-                    : `已达到本次成功发布上限 ${state.targetLimitCount}`
+                    ? `已达到每日成功锚文本外链上限 ${state.targetLimitCount}`
+                    : `已达到每日成功发布上限 ${state.targetLimitCount}`
             );
             return;
         }
@@ -585,22 +583,23 @@ const PublishRuntime = {
 
         let sessionPublishedCount = Number(ctx.getState().sessionPublishedCount || 0);
         let sessionAnchorSuccessCount = Number(ctx.getState().sessionAnchorSuccessCount || 0);
+        let dailyLimitCount = Number(ctx.getState().currentLimitCount || 0);
 
         if (status === 'published') {
             sessionPublishedCount += 1;
             if (publishMeta.anchorVisible) {
                 sessionAnchorSuccessCount += 1;
             }
+            dailyLimitCount = await ctx.incrementDailyPublishCount(
+                ctx.getState().currentTask?.id,
+                { published: true, anchorSuccess: !!publishMeta.anchorVisible }
+            );
         }
 
         if (Number(ctx.getState().targetLimitCount || 0) > 0) {
-            const limitMetric = this.getPublishLimitMetric(ctx.getState().currentTask, {
-                sessionPublishedCount,
-                sessionAnchorSuccessCount
-            });
             ctx.updateState({
-                currentLimitCount: limitMetric.count,
-                limitType: limitMetric.isAnchorLimit ? 'anchor-success' : 'published',
+                currentLimitCount: dailyLimitCount,
+                limitType: (ctx.getState().currentTask?.commentStyle === 'anchor-html') ? 'anchor-success' : 'published',
                 sessionPublishedCount,
                 sessionAnchorSuccessCount
             });
@@ -642,8 +641,8 @@ const PublishRuntime = {
             ctx.broadcastDone();
             await ctx.logger.publish(
                 limitState.limitType === 'anchor-success'
-                    ? `已达到本次成功锚文本外链上限 ${limitState.targetLimitCount}`
-                    : `已达到本次成功发布上限 ${limitState.targetLimitCount}`
+                    ? `已达到每日成功锚文本外链上限 ${limitState.targetLimitCount}`
+                    : `已达到每日成功发布上限 ${limitState.targetLimitCount}`
             );
             return;
         }

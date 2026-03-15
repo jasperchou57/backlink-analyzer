@@ -173,7 +173,6 @@
                 title.textContent = isMarketing ? '营销任务' : '外链发布任务';
             }
             if (resetBtn) resetBtn.style.display = isMarketing ? 'none' : 'inline-flex';
-            // Global overview hidden — each task card has its own per-task stats
             if (publishOverview) publishOverview.style.display = 'none';
             if (publishStats) publishStats.style.display = 'none';
             if (blogBar) blogBar.style.display = 'none';
@@ -188,7 +187,23 @@
         }
 
         function getTaskPublishTargetKey(task) {
-            return normalizeUrl(task?.website || task?.anchorUrl || '');
+            const raw = task?.website || task?.anchorUrl || '';
+            return normalizeTargetKey(raw);
+        }
+
+        // Must match background's normalizeUrlBg exactly:
+        // strips protocol, www., trailing slashes → "hostname/path"
+        function normalizeTargetKey(url) {
+            if (!url) return '';
+            try {
+                let u = url.trim().toLowerCase();
+                if (!u.startsWith('http')) u = 'https://' + u;
+                const parsed = new URL(u);
+                let path = parsed.pathname.replace(/\/+$/, '') || '/';
+                return parsed.hostname.replace(/^www\./, '') + path;
+            } catch {
+                return url.trim().toLowerCase();
+            }
         }
 
         function getTaskHistoryEntry(resource, task) {
@@ -411,11 +426,44 @@
             list.appendChild(card);
         }
 
+        function getDailyPeriodStart(now) {
+            const d = now || new Date();
+            const boundary = new Date(Date.UTC(
+                d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 9, 0, 0, 0
+            ));
+            if (d.getTime() < boundary.getTime()) {
+                boundary.setUTCDate(boundary.getUTCDate() - 1);
+            }
+            return boundary.getTime();
+        }
+
+        function getNextDailyResetLabel() {
+            const now = new Date();
+            const periodStart = getDailyPeriodStart(now);
+            const nextReset = new Date(periodStart + 24 * 60 * 60 * 1000);
+            const isToday = nextReset.getUTCDate() === now.getUTCDate()
+                && nextReset.getUTCMonth() === now.getUTCMonth()
+                && nextReset.getUTCFullYear() === now.getUTCFullYear();
+            return isToday ? '今天 17:00' : '明天 17:00';
+        }
+
+        function getTaskDailyCount(task) {
+            const periodStart = getDailyPeriodStart();
+            const isCurrentPeriod = Number(task?.dailyPeriodStart || 0) === periodStart;
+            if (!isCurrentPeriod) return 0;
+            const isAnchorLimit = task?.commentStyle === 'anchor-html';
+            return isAnchorLimit
+                ? Number(task?.dailyAnchorSuccessCount || 0)
+                : Number(task?.dailyPublishedCount || 0);
+        }
+
         function getTaskPublishLimitLabel(task) {
             if (Number(task?.maxPublishes) <= 0) return '不限量';
+            const dailyCount = getTaskDailyCount(task);
+            const resetLabel = getNextDailyResetLabel();
             return task?.commentStyle === 'anchor-html'
-                ? `本次成功锚文本上限 ${task.maxPublishes}`
-                : `本次成功发布上限 ${task.maxPublishes}`;
+                ? `每日锚文本 ${dailyCount}/${task.maxPublishes} · 重置 ${resetLabel}`
+                : `每日发布 ${dailyCount}/${task.maxPublishes} · 重置 ${resetLabel}`;
         }
 
         function getCommentStyleLabel(commentStyle = 'standard') {
@@ -427,23 +475,23 @@
         function getTaskMaxPublishesFieldMeta(commentStyle = 'standard') {
             if (commentStyle === 'anchor-html') {
                 return {
-                    label: '本次成功锚文本上限',
+                    label: '每日成功锚文本上限',
                     placeholder: '留空表示持续尝试，直到没有可发资源',
-                    help: '只在检测到页面支持 HTML 锚文本时才发布；不支持会直接跳过，不会退化成普通评论。'
+                    help: '只在检测到页面支持 HTML 锚文本时才发布；不支持会直接跳过，不会退化成普通评论。次日北京时间 17:00 自动重置。'
                 };
             }
             if (commentStyle === 'anchor-prefer') {
                 return {
-                    label: '本次成功发布上限',
+                    label: '每日成功发布上限',
                     placeholder: '留空表示持续尝试，直到没有可发资源',
-                    help: '优先尝试 HTML 锚文本；如果页面不支持，则自动降级为普通评论发布。'
+                    help: '优先尝试 HTML 锚文本；如果页面不支持，则自动降级为普通评论发布。次日北京时间 17:00 自动重置。'
                 };
             }
 
             return {
-                label: '本次成功发布上限',
+                label: '每日成功发布上限',
                 placeholder: '留空表示发送全部符合条件的资源',
-                help: '达到成功发布数量后，当前任务会自动停止。'
+                help: '达到每日成功发布上限后，当前任务会自动停止。次日北京时间 17:00 自动重置。'
             };
         }
 
@@ -639,8 +687,8 @@
                         : 0;
                     const hasSessionLimit = Number(sessionState?.targetLimitCount || 0) > 0;
                     const sessionLimitLabel = sessionState?.limitType === 'anchor-success'
-                        ? '本次成功锚文本'
-                        : '本次成功发布';
+                        ? '今日成功锚文本'
+                        : '今日成功发布';
                     const sessionLimitProgressPercent = hasSessionLimit
                         ? Math.min(100, Math.round((Number(sessionState?.currentLimitCount || 0) / Number(sessionState?.targetLimitCount || 1)) * 100))
                         : queueProgressPercent;
@@ -1013,8 +1061,8 @@
                 ).length;
                 const workflowBatchSummary = workspace === 'backlink' && workflowTaskIds.length
                     ? `${workflowDoneCount}/${workflowTaskIds.length} · ${isWorkflowBatchRunning
-                        ? `并发中 ${workflowActiveCount} 个 · ${escapeHtml(batchState.lastMessage || '')}`
-                        : '按当前任务批量并发执行'}`
+                        ? `执行中 ${workflowActiveCount} 个 · ${escapeHtml(batchState.lastMessage || '')}`
+                        : '按当前任务批量依次执行'}`
                     : '';
                 const typeLabel = workflow.id === 'product-promote-campaign'
                     ? '宣传'
@@ -1036,7 +1084,7 @@
                         ? '另一批任务正在执行中'
                         : (isWorkflowBatchRunning
                             ? '停止当前批量发布'
-                            : '按当前任务批量并发发布');
+                            : '按当前任务批量依次发布');
 
                 return `
                     <div class="workflow-card">
