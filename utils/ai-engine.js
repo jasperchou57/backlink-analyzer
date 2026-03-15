@@ -1,24 +1,61 @@
 /**
- * AI Engine - OpenRouter API 封装
+ * AI Engine - 多平台 AI API 封装
+ * 支持 OpenRouter / 通义千问 / OpenAI / DeepSeek / 自定义
  * 4 个 AI 任务各自可配置不同模型
  */
 
+const AI_PROVIDERS = {
+    openrouter: {
+        name: 'OpenRouter',
+        baseUrl: 'https://openrouter.ai/api/v1/chat/completions',
+        keyPlaceholder: 'sk-or-...',
+        modelPlaceholder: '例如 google/gemini-2.0-flash-001',
+        extraHeaders: {
+            'HTTP-Referer': 'chrome-extension://backlink-analyzer',
+            'X-Title': 'Backlink Analyzer'
+        }
+    },
+    qwen: {
+        name: '通义千问 (DashScope)',
+        baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
+        keyPlaceholder: 'sk-...',
+        modelPlaceholder: '例如 qwen-plus / qwen-turbo',
+        extraHeaders: {}
+    },
+    openai: {
+        name: 'OpenAI',
+        baseUrl: 'https://api.openai.com/v1/chat/completions',
+        keyPlaceholder: 'sk-...',
+        modelPlaceholder: '例如 gpt-4o-mini',
+        extraHeaders: {}
+    },
+    deepseek: {
+        name: 'DeepSeek',
+        baseUrl: 'https://api.deepseek.com/chat/completions',
+        keyPlaceholder: 'sk-...',
+        modelPlaceholder: '例如 deepseek-chat',
+        extraHeaders: {}
+    },
+    custom: {
+        name: '自定义 (OpenAI兼容)',
+        baseUrl: '',
+        keyPlaceholder: 'API Key...',
+        modelPlaceholder: '模型 ID',
+        extraHeaders: {}
+    }
+};
+
 const AIEngine = {
-    // OpenRouter API 端点
-    API_URL: 'https://openrouter.ai/api/v1/chat/completions',
 
     /**
-     * 调用 OpenRouter API
-     * @param {string} task - 任务类型: classify | formExtract | commentGen | linkDiscover
-     * @param {string} prompt - 用户 prompt
-     * @param {object} options - 可选参数
-     * @returns {string} AI 返回的文本
+     * 调用 AI API（自动匹配提供商）
      */
     async call(task, prompt, options = {}) {
         const settings = await this._getSettings();
-        const apiKey = settings.openrouterApiKey;
+        const { apiUrl, apiKey, headers } = this._getApiConfig(settings);
+
         if (!apiKey) {
-            throw new Error('OpenRouter API Key 未配置，请在设置中填入');
+            throw new Error('API Key 未配置，请在设置中填入');
         }
 
         const model = this._getModelForTask(task, settings);
@@ -40,20 +77,19 @@ const AIEngine = {
             temperature: options.temperature !== undefined ? options.temperature : 0.7,
         };
 
-        const response = await fetch(this.API_URL, {
+        const response = await fetch(apiUrl, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${apiKey}`,
                 'Content-Type': 'application/json',
-                'HTTP-Referer': 'chrome-extension://backlink-analyzer',
-                'X-Title': 'Backlink Analyzer'
+                ...headers
             },
             body: JSON.stringify(body)
         });
 
         if (!response.ok) {
             const errText = await response.text();
-            throw new Error(`OpenRouter API 错误 (${response.status}): ${errText}`);
+            throw new Error(`API 错误 (${response.status}): ${errText}`);
         }
 
         const data = await response.json();
@@ -95,22 +131,10 @@ Respond in JSON format:
     // Agent 模式 — 带工具调用的 AI 步骤
     // ============================================================
 
-    /**
-     * Agent 步骤调用 — 发送页面状态给 AI，返回工具调用指令
-     * @param {object} params
-     * @param {string} params.elements - 页面元素列表（[index]<type>text 格式）
-     * @param {string} params.url - 当前页面 URL
-     * @param {string} params.title - 当前页面标题
-     * @param {string} params.task - 用户任务描述
-     * @param {Array} params.history - 之前步骤的历史记录
-     * @param {number} params.step - 当前步骤号
-     * @param {number} params.maxSteps - 最大步骤数
-     * @returns {object} { action, params, evaluation, memory, nextGoal, done, success }
-     */
     async agentStep(params) {
         const settings = await this._getSettings();
-        const apiKey = settings.openrouterApiKey;
-        if (!apiKey) throw new Error('OpenRouter API Key 未配置');
+        const { apiUrl, apiKey, headers } = this._getApiConfig(settings);
+        if (!apiKey) throw new Error('API Key 未配置');
 
         const model = settings.modelCommentGen || settings.modelFormExtract;
         if (!model) throw new Error('AI 模型未配置');
@@ -130,13 +154,12 @@ Respond in JSON format:
             temperature: 0.3,
         };
 
-        const response = await fetch(this.API_URL, {
+        const response = await fetch(apiUrl, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${apiKey}`,
                 'Content-Type': 'application/json',
-                'HTTP-Referer': 'chrome-extension://backlink-analyzer',
-                'X-Title': 'Backlink Analyzer'
+                ...headers
             },
             body: JSON.stringify(body)
         });
@@ -318,7 +341,7 @@ Write ONLY the comment text, nothing else.`;
      * 链接发现 - 从评论内容中提取有效域名
      */
     async discoverLinks(commentsHtml) {
-        const prompt = `Extract all unique website domains from these blog comments. 
+        const prompt = `Extract all unique website domains from these blog comments.
 These are websites left by other commenters in their profile links.
 Only include domains that look like real websites (not social media, not email providers).
 
@@ -359,6 +382,18 @@ Respond in JSON format:
 
     // === 内部方法 ===
 
+    _getApiConfig(settings) {
+        const provider = settings.aiProvider || 'openrouter';
+        const providerInfo = AI_PROVIDERS[provider] || AI_PROVIDERS.openrouter;
+
+        // 兼容旧设置：如果用的是 openrouter 且有旧的 openrouterApiKey
+        const apiKey = settings.aiApiKey || settings.openrouterApiKey || '';
+        const apiUrl = settings.aiBaseUrl || providerInfo.baseUrl;
+        const headers = providerInfo.extraHeaders || {};
+
+        return { apiUrl, apiKey, headers };
+    },
+
     _getModelForTask(task, settings) {
         const modelMap = {
             classify: settings.modelClassify,
@@ -378,7 +413,8 @@ Respond in JSON format:
     }
 };
 
-// Export for service worker (background.js)
+// Export
 if (typeof self !== 'undefined') {
     self.AIEngine = AIEngine;
+    self.AI_PROVIDERS = AI_PROVIDERS;
 }
