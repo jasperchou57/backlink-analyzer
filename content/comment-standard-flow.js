@@ -36,20 +36,48 @@
         return (el.tagName || '').toLowerCase();
     }
 
-    function writeInputValue(el, value) {
-        const nextValue = String(value || '');
+    function setInputValueDirect(el, value) {
         if (el instanceof HTMLInputElement) {
             const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-            if (descriptor?.set) descriptor.set.call(el, nextValue);
-            else el.value = nextValue;
+            if (descriptor?.set) descriptor.set.call(el, value);
+            else el.value = value;
         } else if (el instanceof HTMLTextAreaElement) {
             const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
-            if (descriptor?.set) descriptor.set.call(el, nextValue);
-            else el.value = nextValue;
+            if (descriptor?.set) descriptor.set.call(el, value);
+            else el.value = value;
         } else {
-            el.value = nextValue;
+            el.value = value;
         }
+    }
+
+    function randomDelay(min, max) {
+        return Math.floor(Math.random() * (max - min + 1)) + min;
+    }
+
+    function wait(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    /**
+     * 模拟真人逐字输入，防止 Cloudflare 等反机器人拦截
+     * 每字符 10-40ms 随机延迟 + 完整键盘事件链
+     */
+    async function writeInputValue(el, value) {
+        const nextValue = String(value || '');
+        el.focus?.();
+        setInputValueDirect(el, '');
         el.dispatchEvent(new Event('input', { bubbles: true }));
+
+        for (let i = 0; i < nextValue.length; i++) {
+            const char = nextValue[i];
+            el.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+            el.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
+            setInputValueDirect(el, nextValue.substring(0, i + 1));
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+            await wait(randomDelay(10, 40));
+        }
+
         el.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
@@ -189,18 +217,21 @@
         ].join(' ')).toLowerCase();
     }
 
-    function fillField(field, value) {
+    async function fillField(field, value) {
         if (!field || !compactText(value)) return false;
-        writeInputValue(field, value);
+        await writeInputValue(field, value);
         return valueMatches(field, value);
     }
 
     async function fillStandardCommentForm(form, values = {}) {
         const signals = getClassicFormSignals(form);
-        const commentFilled = fillField(signals.commentField, values.comment);
-        const nameFilled = fillField(signals.nameField, values.name);
-        const emailFilled = fillField(signals.emailField, values.email);
-        const websiteFilled = fillField(signals.websiteField, values.website);
+        const commentFilled = await fillField(signals.commentField, values.comment);
+        await wait(randomDelay(100, 300)); // 字段间模拟真人切换延迟
+        const nameFilled = await fillField(signals.nameField, values.name);
+        await wait(randomDelay(100, 300));
+        const emailFilled = await fillField(signals.emailField, values.email);
+        await wait(randomDelay(100, 300));
+        const websiteFilled = await fillField(signals.websiteField, values.website);
 
         return {
             commentFilled,

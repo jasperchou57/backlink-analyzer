@@ -746,6 +746,9 @@
             }
         }
 
+        // 字段间模拟真人切换延迟（防止 Cloudflare 反机器人拦截）
+        await wait(Math.floor(100 + Math.random() * 200));
+
         // Name
         if (allowed.has('name')) {
             const nameField = findBestField(form, [
@@ -764,6 +767,8 @@
             }
         }
 
+        await wait(Math.floor(100 + Math.random() * 200));
+
         // Email
         if (allowed.has('email')) {
             const emailField = findBestField(form, [
@@ -779,6 +784,8 @@
                 });
             }
         }
+
+        await wait(Math.floor(100 + Math.random() * 200));
 
         // Website
         if (allowed.has('website')) {
@@ -890,7 +897,8 @@
         if (fieldType === 'comment') {
             return execution?.preferHumanTypingForComment === false ? 'direct' : 'typing';
         }
-        return 'direct';
+        // 所有字段都用逐字输入，防止 Cloudflare 等反机器人拦截
+        return 'typing';
     }
 
     function findBestField(form, selectors = [], fieldType = 'text') {
@@ -2057,8 +2065,8 @@
         writeElementValue(el, '');
         dispatchFieldInputEvents(el);
 
-        const minDelay = Number(options.minDelay || 8);
-        const maxDelay = Math.max(minDelay, Number(options.maxDelay || 18));
+        const minDelay = Number(options.minDelay || 10);
+        const maxDelay = Math.max(minDelay, Number(options.maxDelay || 40));
         for (const character of nextValue) {
             el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: character }));
             writeElementValue(el, `${readElementValue(el)}${character}`);
