@@ -41,6 +41,94 @@ document.addEventListener('DOMContentLoaded', async () => {
     const langSelect = document.getElementById('lang-select');
     langSelect.value = i18n.currentLang;
 
+    // === 网站管理 ===
+    const siteSelect = document.getElementById('site-select');
+    let sites = [];
+    let activeSiteId = '';
+
+    async function loadSites() {
+        const data = await chrome.storage.local.get(['sites', 'activeSiteId']);
+        sites = data.sites || [];
+        activeSiteId = data.activeSiteId || '';
+
+        // If no sites, create default from settings
+        if (sites.length === 0) {
+            const settingsData = await chrome.storage.local.get('settings');
+            const settings = settingsData.settings || {};
+            if (settings.website) {
+                const defaultSite = {
+                    id: crypto.randomUUID(),
+                    name: settings.name || getHostLabel(settings.website),
+                    url: normalizeHttpUrl(settings.website),
+                    createdAt: new Date().toISOString()
+                };
+                sites = [defaultSite];
+                activeSiteId = defaultSite.id;
+                await chrome.storage.local.set({ sites, activeSiteId });
+            }
+        }
+
+        renderSiteSelect();
+    }
+
+    function renderSiteSelect() {
+        siteSelect.innerHTML = '';
+        if (sites.length === 0) {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = '+ 添加网站';
+            siteSelect.appendChild(opt);
+            return;
+        }
+        sites.forEach(site => {
+            const opt = document.createElement('option');
+            opt.value = site.id;
+            opt.textContent = site.name || getHostLabel(site.url);
+            siteSelect.appendChild(opt);
+        });
+        const addOpt = document.createElement('option');
+        addOpt.value = '__add__';
+        addOpt.textContent = '+ 添加网站...';
+        siteSelect.appendChild(addOpt);
+        siteSelect.value = activeSiteId;
+    }
+
+    siteSelect.addEventListener('change', async () => {
+        const val = siteSelect.value;
+        if (val === '__add__' || val === '') {
+            const name = prompt('网站名称（如 My Blog）');
+            if (!name) { siteSelect.value = activeSiteId; return; }
+            const url = prompt('网站地址（如 https://myblog.com）');
+            if (!url) { siteSelect.value = activeSiteId; return; }
+            const newSite = {
+                id: crypto.randomUUID(),
+                name: name.trim(),
+                url: normalizeHttpUrl(url.trim()),
+                createdAt: new Date().toISOString()
+            };
+            sites.push(newSite);
+            activeSiteId = newSite.id;
+            await chrome.storage.local.set({ sites, activeSiteId });
+            renderSiteSelect();
+            return;
+        }
+        activeSiteId = val;
+        await chrome.storage.local.set({ activeSiteId });
+    });
+
+    await loadSites();
+
+    // === Submify marketing cards click handlers ===
+    document.querySelectorAll('.mkt-submit-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const card = btn.closest('.mkt-card');
+            const workflowId = card?.dataset.workflow;
+            if (workflowId) {
+                switchWorkspace('marketing', 'marketing');
+            }
+        });
+    });
+
     // === 初始化模块 ===
     const taskPanel = TaskPanel.create({
         escapeHtml,
@@ -117,7 +205,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         const visibleButtons = Array.from(document.querySelectorAll('.tab-btn')).filter((btn) => btn.style.display !== 'none');
-        const fallbackTab = workspace === 'marketing' ? 'marketing' : 'collect';
+        const fallbackTab = workspace === 'marketing' ? 'marketing-home' : 'collect';
         const nextTab = targetTab || fallbackTab;
         const activeButton = visibleButtons.find((btn) => btn.dataset.tab === nextTab) || visibleButtons[0];
         if (!activeButton) return;
@@ -157,7 +245,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         await switchWorkspace('backlink', 'collect');
     });
     btnEnterMarketing?.addEventListener('click', async () => {
-        await switchWorkspace('marketing', 'marketing');
+        await switchWorkspace('marketing', 'marketing-home');
     });
 
     // === Tab 切换 ===
@@ -725,14 +813,17 @@ function updateUILanguage() {
     const taskPanel = window.__taskPanel;
 
     // Tab buttons
+    const tabLabelMap = {
+        'collect': i18n.t('tab.collect'),
+        'publish': i18n.t('tab.publishBacklink'),
+        'resources': i18n.t('tab.resources'),
+        'marketing-home': '首页',
+        'marketing': i18n.t('tab.marketing'),
+        'logs': i18n.t('tab.logs')
+    };
     document.querySelectorAll('.tab-btn').forEach(btn => {
-        if (btn.dataset.tab === 'publish' && btn.dataset.mode === 'backlink') {
-            btn.textContent = i18n.t('tab.publishBacklink');
-        } else if (btn.dataset.tab === 'publish' && btn.dataset.mode === 'marketing') {
-            btn.textContent = i18n.t('tab.marketing');
-        } else {
-            btn.textContent = i18n.t('tab.' + btn.dataset.tab);
-        }
+        const label = tabLabelMap[btn.dataset.tab];
+        if (label) btn.textContent = label;
     });
 
     // Collect tab
