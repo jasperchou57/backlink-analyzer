@@ -1749,9 +1749,64 @@ body {
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(0, 0, 0, 0.4);
+  background: var(--bg-card);
   z-index: 1000;
-  animation: fadeIn 0.2s ease;
+  overflow-y: auto;
+  padding: 20px;
+  animation: fadeIn 0.15s ease;
+}
+
+.settings-overlay h2 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-back {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font);
+  transition: background 0.2s;
+}
+
+.settings-back:hover {
+  background: var(--accent-light);
+}
+
+.btn-save {
+  display: block;
+  width: 100%;
+  padding: 10px 16px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-top: 20px;
+  font-family: var(--font);
+  transition: background 0.2s;
+}
+
+.btn-save:hover {
+  background: var(--accent-hover);
+}
+
+.settings-help {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  line-height: 1.5;
 }
 
 .settings-panel {
