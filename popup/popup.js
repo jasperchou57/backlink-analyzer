@@ -674,9 +674,21 @@ async function refreshResources(overrideFilter) {
             btn.classList.toggle('active', newFav);
         });
 
-        // 开始发布（打开该URL）
-        item.querySelector('.res-start-btn').addEventListener('click', () => {
-            chrome.tabs.create({ url: res.url });
+        // 开始发布
+        item.querySelector('.res-start-btn').addEventListener('click', async () => {
+            const resp = await chrome.runtime.sendMessage({ action: 'getTasks' });
+            const tasks = resp?.tasks || [];
+            if (tasks.length === 0) {
+                alert('请先在"发布"页面创建一个任务，设置网站URL和锚文本等信息。');
+                return;
+            }
+            // 用第一个任务的设置，发布这单个资源
+            const task = tasks[0];
+            chrome.runtime.sendMessage({
+                action: 'startPublish',
+                task,
+                resourceIds: [res.id]
+            });
         });
 
         // 点击URL打开
