@@ -42,6 +42,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     langSelect.value = i18n.currentLang;
 
     // === 初始化模块 ===
+    const expandedPublishTaskIds = new Set();
+    const expandedMarketingTaskIds = new Set();
+
     const taskPanel = TaskPanel.create({
         escapeHtml,
         normalizeUrl: normalizeHttpUrl,
@@ -51,6 +54,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         StorageHelper,
         getCurrentWorkspace: () => currentWorkspace,
         getCurrentTab: () => currentTab,
+        getExpandedPublishTaskIds: () => expandedPublishTaskIds,
+        getExpandedMarketingTaskIds: () => expandedMarketingTaskIds,
         refreshPublishStats,
         refreshMarketingWorkspace: () => marketingPanel.refreshMarketingWorkspace(),
         compactText
