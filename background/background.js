@@ -32,26 +32,30 @@ let publishState = {
 let panelWindowId = null;
 let collectTabId = null;
 
-// === 点击图标 → 打开/聚焦悬浮窗口 ===
-chrome.action.onClicked.addListener(async () => {
-    if (panelWindowId !== null) {
-        try {
-            await chrome.windows.update(panelWindowId, { focused: true });
-            return;
-        } catch {
-            panelWindowId = null;
+// === 点击图标 → 打开侧边栏 ===
+chrome.action.onClicked.addListener(async (tab) => {
+    try {
+        await chrome.sidePanel.open({ tabId: tab.id });
+    } catch {
+        // Fallback: 打开悬浮窗口
+        if (panelWindowId !== null) {
+            try {
+                await chrome.windows.update(panelWindowId, { focused: true });
+                return;
+            } catch {
+                panelWindowId = null;
+            }
         }
+        const win = await chrome.windows.create({
+            url: 'popup/popup.html',
+            type: 'popup',
+            width: 420,
+            height: 680,
+            top: 80,
+            left: 50
+        });
+        panelWindowId = win.id;
     }
-
-    const win = await chrome.windows.create({
-        url: 'popup/popup.html',
-        type: 'popup',
-        width: 420,
-        height: 680,
-        top: 80,
-        left: 50
-    });
-    panelWindowId = win.id;
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {

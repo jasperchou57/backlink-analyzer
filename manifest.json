@@ -8,8 +8,12 @@
         "tabs",
         "storage",
         "scripting",
-        "identity"
+        "identity",
+        "sidePanel"
     ],
+    "side_panel": {
+        "default_path": "popup/popup.html"
+    },
     "host_permissions": [
         "<all_urls>"
     ],

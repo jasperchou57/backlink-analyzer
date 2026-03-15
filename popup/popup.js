@@ -100,7 +100,34 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // === 多任务发布 ===
-    document.getElementById('btn-add-task').addEventListener('click', () => openTaskEditor());
+    document.getElementById('btn-add-task').addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openTaskEditor();
+    });
+
+    // === 发布卡片按钮 ===
+    document.querySelectorAll('.pub-card-btn[data-action="publish"]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const category = btn.dataset.category;
+            startCategoryPublish(category);
+        });
+    });
+
+    const viewFavBtn = document.querySelector('[data-action="view-favorites"]');
+    if (viewFavBtn) {
+        viewFavBtn.addEventListener('click', () => {
+            // 切到资源库 Tab 并筛选收藏
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            document.querySelector('[data-tab="resources"]').classList.add('active');
+            document.getElementById('panel-resources').classList.add('active');
+            refreshResources('favorites');
+        });
+    }
+
+    // === 导入数据库 ===
+    document.getElementById('btn-import-db').addEventListener('click', importBacklinkDatabase);
 
     // === 资源导出 ===
     document.getElementById('btn-export').addEventListener('click', async () => {
@@ -202,17 +229,92 @@ async function refreshPublishStats() {
     document.getElementById('pub-skipped').textContent = counts.skipped;
     document.getElementById('pub-failed').textContent = counts.failed;
 
-    const blogCount = resources.filter(r =>
-        r.status === 'pending' &&
-        ((r.opportunities && r.opportunities.includes('comment')) || r.type === 'comment')
-    ).length;
-    document.getElementById('pub-blog-count').textContent = blogCount;
+    // Update category card counts
+    const catCounts = { comment: 0, 'submit-site': 0, forum: 0, listing: 0, favorites: 0 };
+    resources.forEach(r => {
+        if (r.status !== 'pending') return;
+        const opps = r.opportunities || [r.type] || [];
+        if (opps.includes('comment')) catCounts.comment++;
+        else if (opps.includes('submit-site')) catCounts['submit-site']++;
+        else if (opps.includes('forum')) catCounts.forum++;
+        else catCounts.listing++;
+        if (r.favorited) catCounts.favorites++;
+    });
 
-    const emptyState = document.getElementById('publish-empty');
-    if (counts.pending === 0) {
-        emptyState.style.display = 'block';
-    } else {
-        emptyState.style.display = 'none';
+    const el = id => document.getElementById(id);
+    el('count-comment').textContent = catCounts.comment + ' 个待发布';
+    el('count-submit-site').textContent = catCounts['submit-site'] + ' 个待发布';
+    el('count-forum').textContent = catCounts.forum + ' 个待发布';
+    el('count-listing').textContent = catCounts.listing + ' 个待发布';
+
+    // Count all favorites regardless of status
+    const favCount = resources.filter(r => r.favorited).length;
+    el('count-favorites').textContent = favCount + ' 个';
+
+    // Hide import button if database already imported
+    const dbImported = await StorageHelper.get('dbImported');
+    const importBar = document.getElementById('import-bar');
+    if (dbImported) {
+        importBar.style.display = 'none';
+    }
+}
+
+async function startCategoryPublish(category) {
+    // Check if there's a task, if not create one on the fly
+    const resp = await chrome.runtime.sendMessage({ action: 'getTasks' });
+    const tasks = resp?.tasks || [];
+
+    if (tasks.length === 0) {
+        openTaskEditor(null, category);
+        return;
+    }
+
+    // Use first task and start publishing with category filter
+    const task = tasks[0];
+    task.categoryFilter = category;
+    chrome.runtime.sendMessage({ action: 'startPublish', task });
+
+    const current = document.getElementById('publish-current');
+    current.style.display = 'block';
+}
+
+async function importBacklinkDatabase() {
+    const btn = document.getElementById('btn-import-db');
+    btn.disabled = true;
+    btn.textContent = '导入中...';
+
+    try {
+        const url = chrome.runtime.getURL('data/backlink-database.json');
+        const resp = await fetch(url);
+        const data = await resp.json();
+
+        let added = 0;
+        for (const item of data) {
+            const resource = {
+                url: item.u,
+                pageTitle: item.n,
+                sources: ['DB'],
+                opportunities: [item.o],
+                category: item.c,
+                dr: item.d,
+                language: item.l,
+                isPaid: item.p === 1
+            };
+            const isNew = await StorageHelper.addResource(resource);
+            if (isNew) added++;
+        }
+
+        await StorageHelper.set('dbImported', true);
+        btn.textContent = `已导入 ${added} 条`;
+        setTimeout(() => {
+            document.getElementById('import-bar').style.display = 'none';
+        }, 2000);
+
+        refreshPublishStats();
+        refreshResources();
+    } catch (e) {
+        btn.textContent = '导入失败: ' + e.message;
+        btn.disabled = false;
     }
 }
 
@@ -282,7 +384,7 @@ async function refreshTasks() {
     });
 }
 
-function openTaskEditor(existingTask) {
+function openTaskEditor(existingTask, categoryFilter) {
     const overlay = document.createElement('div');
     overlay.className = 'settings-overlay';
 
@@ -399,20 +501,22 @@ const TYPE_LABELS = {
     disqus: 'Disqus', form: '表单'
 };
 
-async function refreshResources() {
+async function refreshResources(overrideFilter) {
     const allResources = await StorageHelper.getResources();
     const list = document.getElementById('resources-list');
     const empty = document.getElementById('resources-empty');
     const count = document.getElementById('res-count');
 
     const activeFilter = document.querySelector('.res-filter.active');
-    const filter = activeFilter ? activeFilter.dataset.filter : 'all';
+    const filter = overrideFilter || (activeFilter ? activeFilter.dataset.filter : 'all');
 
     let resources;
     if (filter === 'comment') {
         resources = allResources.filter(r =>
             (r.opportunities && r.opportunities.includes('comment')) || r.type === 'comment'
         );
+    } else if (filter === 'favorites') {
+        resources = allResources.filter(r => r.favorited);
     } else if (filter === 'other') {
         resources = allResources.filter(r =>
             !(r.opportunities && r.opportunities.includes('comment')) && r.type !== 'comment'

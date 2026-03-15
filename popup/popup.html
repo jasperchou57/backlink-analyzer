@@ -75,36 +75,87 @@
 
         <!-- ===== 发布 Tab ===== -->
         <div class="tab-panel" id="panel-publish">
-            <!-- 任务管理 -->
-            <div class="panel-header">
-                <h3>发布任务</h3>
-                <button id="btn-add-task" class="btn btn-small">+ 新建任务</button>
-            </div>
-
-            <div id="task-list" class="task-list"></div>
-
-            <div class="panel-header" style="margin-top:12px">
-                <h3>发布概览</h3>
-            </div>
-
-            <div class="publish-stats">
-                <div class="pub-stat"><span class="pub-num" id="pub-pending">0</span><span class="pub-lbl">待发布</span>
+            <!-- 分类卡片 -->
+            <div class="publish-cards" id="publish-cards">
+                <div class="pub-card" data-category="comment">
+                    <div class="pub-card-icon">📝</div>
+                    <div class="pub-card-body">
+                        <div class="pub-card-title">博客评论</div>
+                        <div class="pub-card-desc">在博客文章下发布评论，获取外链机会。</div>
+                        <div class="pub-card-actions">
+                            <button class="pub-card-btn" data-action="publish" data-category="comment">开始发布</button>
+                            <span class="pub-card-count" id="count-comment">0 个待发布</span>
+                        </div>
+                    </div>
                 </div>
-                <div class="pub-stat"><span class="pub-num green" id="pub-published">0</span><span
-                        class="pub-lbl">已发布</span></div>
-                <div class="pub-stat"><span class="pub-num yellow" id="pub-skipped">0</span><span
-                        class="pub-lbl">已跳过</span></div>
-                <div class="pub-stat"><span class="pub-num red" id="pub-failed">0</span><span class="pub-lbl">失败</span>
+
+                <div class="pub-card" data-category="submit-site">
+                    <div class="pub-card-icon">📋</div>
+                    <div class="pub-card-body">
+                        <div class="pub-card-title">目录 / Startup 提交</div>
+                        <div class="pub-card-desc">提交到目录站、Startup 平台和列表网站。</div>
+                        <div class="pub-card-actions">
+                            <button class="pub-card-btn" data-action="publish" data-category="submit-site">开始发布</button>
+                            <span class="pub-card-count" id="count-submit-site">0 个待发布</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="pub-card" data-category="forum">
+                    <div class="pub-card-icon">💬</div>
+                    <div class="pub-card-body">
+                        <div class="pub-card-title">论坛发帖</div>
+                        <div class="pub-card-desc">在相关论坛发帖或回帖，植入外链。</div>
+                        <div class="pub-card-actions">
+                            <button class="pub-card-btn" data-action="publish" data-category="forum">开始发布</button>
+                            <span class="pub-card-count" id="count-forum">0 个待发布</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="pub-card" data-category="listing">
+                    <div class="pub-card-icon">🌐</div>
+                    <div class="pub-card-body">
+                        <div class="pub-card-title">综合外链</div>
+                        <div class="pub-card-desc">其他类型外链资源，包括社交、媒体等。</div>
+                        <div class="pub-card-actions">
+                            <button class="pub-card-btn" data-action="publish" data-category="listing">开始发布</button>
+                            <span class="pub-card-count" id="count-listing">0 个待发布</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="pub-card pub-card-fav" data-category="favorites">
+                    <div class="pub-card-icon">⭐</div>
+                    <div class="pub-card-body">
+                        <div class="pub-card-title">我的收藏</div>
+                        <div class="pub-card-desc">手动标记的高质量外链资源。</div>
+                        <div class="pub-card-actions">
+                            <button class="pub-card-btn pub-card-btn-outline" data-action="view-favorites">查看收藏</button>
+                            <span class="pub-card-count" id="count-favorites">0 个</span>
+                        </div>
+                    </div>
                 </div>
             </div>
 
-            <div class="blog-count-bar" id="blog-count-bar">
-                <span class="blog-count-icon">📝</span>
-                <span class="blog-count-label">可直接发博客：</span>
-                <span class="blog-count-num" id="pub-blog-count">0</span>
-                <span class="blog-count-unit">个</span>
-            </div>
+            <!-- 发布概览（折叠） -->
+            <details class="pub-overview">
+                <summary>发布概览</summary>
+                <div class="publish-stats">
+                    <div class="pub-stat"><span class="pub-num" id="pub-pending">0</span><span class="pub-lbl">待发布</span></div>
+                    <div class="pub-stat"><span class="pub-num green" id="pub-published">0</span><span class="pub-lbl">已发布</span></div>
+                    <div class="pub-stat"><span class="pub-num yellow" id="pub-skipped">0</span><span class="pub-lbl">已跳过</span></div>
+                    <div class="pub-stat"><span class="pub-num red" id="pub-failed">0</span><span class="pub-lbl">失败</span></div>
+                </div>
+            </details>
 
+            <!-- 任务管理（折叠） -->
+            <details class="pub-tasks-section">
+                <summary>发布任务 <button id="btn-add-task" class="btn btn-small" style="margin-left:auto">+ 新建任务</button></summary>
+                <div id="task-list" class="task-list"></div>
+            </details>
+
+            <!-- 当前发布进度 -->
             <div class="publish-current" id="publish-current" style="display:none">
                 <div class="current-label">当前发布：</div>
                 <div class="current-url" id="current-url">-</div>
@@ -114,11 +165,9 @@
                 <div class="progress-text" id="progress-text">0 / 0</div>
             </div>
 
-            <div class="empty-state" id="publish-empty">
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                </svg>
-                <p>暂无可发布资源，请先收集外链</p>
+            <!-- 导入数据库按钮 -->
+            <div class="import-bar" id="import-bar">
+                <button id="btn-import-db" class="btn-import">导入 2700+ 外链数据库</button>
             </div>
         </div>
 
