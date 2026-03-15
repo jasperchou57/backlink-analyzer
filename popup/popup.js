@@ -569,7 +569,6 @@ const TYPE_LABELS = {
 async function refreshResources(overrideFilter) {
     const allResources = await StorageHelper.getResources();
     const list = document.getElementById('resources-list');
-    const empty = document.getElementById('resources-empty');
     const countEl = document.getElementById('res-count');
     const resultsText = document.getElementById('res-results-text');
 
@@ -623,13 +622,11 @@ async function refreshResources(overrideFilter) {
     const pageResources = resources.slice(startIdx, startIdx + resPageSize);
 
     if (pageResources.length === 0) {
-        empty.style.display = 'block';
-        list.querySelectorAll('.resource-card').forEach(el => el.remove());
+        list.innerHTML = '<div class="empty-state"><p>暂无资源数据</p></div>';
         renderPager(totalPages);
         return;
     }
 
-    empty.style.display = 'none';
     list.innerHTML = '';
 
     pageResources.forEach(res => {
