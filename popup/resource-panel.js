@@ -149,13 +149,13 @@
             }
 
             if (resources.length === 0) {
-                empty.style.display = 'block';
-                list.innerHTML = '';
+                if (empty) empty.style.display = 'block';
+                if (list) list.innerHTML = '';
                 scheduleHeaderSync(0);
                 return;
             }
 
-            empty.style.display = 'none';
+            if (empty) empty.style.display = 'none';
             const fragment = document.createDocumentFragment();
 
             for (const resource of resources) {
