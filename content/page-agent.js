@@ -216,28 +216,56 @@
             // 先点击聚焦
             await simulateClick(el);
 
-            if (el.isContentEditable) {
-                // contentEditable 元素
-                el.textContent = text;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-            } else {
-                // 使用原生 setter（兼容 React/Vue）
-                if (el instanceof HTMLTextAreaElement) {
-                    nativeTextareaSetter.call(el, text);
-                } else {
-                    nativeInputSetter.call(el, text);
-                }
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-            }
+            // 模拟真人逐字输入，防止 Cloudflare 等反机器人拦截
+            await simulateHumanTyping(el, text);
 
             // blur 触发验证
+            await wait(randomDelay(80, 200));
             el.dispatchEvent(new Event('blur', { bubbles: true }));
 
             return { success: true, message: `已输入 [${index}]: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"` };
         } catch (e) {
             return { success: false, error: `输入失败: ${e.message}` };
         }
+    }
+
+    /**
+     * 模拟真人逐字输入
+     * 每个字符间 10-40ms 随机延迟，避免被 Cloudflare 等反机器人系统识别
+     */
+    async function simulateHumanTyping(el, text) {
+        if (el.isContentEditable) {
+            el.textContent = '';
+            for (let i = 0; i < text.length; i++) {
+                el.textContent += text[i];
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                await wait(randomDelay(10, 40));
+            }
+        } else {
+            const setter = el instanceof HTMLTextAreaElement ? nativeTextareaSetter : nativeInputSetter;
+            setter.call(el, '');
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+
+            // 逐字输入，模拟完整键盘事件链
+            for (let i = 0; i < text.length; i++) {
+                const char = text[i];
+                el.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
+                el.dispatchEvent(new KeyboardEvent('keypress', { key: char, bubbles: true }));
+
+                // 通过原生 setter 更新值（兼容 React/Vue）
+                setter.call(el, text.substring(0, i + 1));
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+
+                el.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+                await wait(randomDelay(10, 40));
+            }
+
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }
+
+    function randomDelay(min, max) {
+        return Math.floor(Math.random() * (max - min + 1)) + min;
     }
 
     // ============================================================
