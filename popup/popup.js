@@ -635,10 +635,8 @@ async function refreshPublishStats() {
     document.getElementById('pub-blog-count').textContent = blogCount;
 
     const emptyState = document.getElementById('publish-empty');
-    if (counts.pending === 0) {
-        emptyState.style.display = 'block';
-    } else {
-        emptyState.style.display = 'none';
+    if (emptyState) {
+        emptyState.style.display = counts.pending === 0 ? 'block' : 'none';
     }
 }
 

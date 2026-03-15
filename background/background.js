@@ -1067,19 +1067,19 @@ function mergeDomainStatus(current = 'discovered', next = 'discovered') {
 // Domain intel delegators
 function ensureDomainIntelLoaded() { return domainIntel.ensureLoaded(); }
 function flushDomainIntel() { return domainIntel.flush(); }
-function createDomainFrontierEntry(domain) { return domainIntel.createDomainFrontierEntry(domain); }
-function ensureDomainFrontierEntry(domain) { return domainIntel.ensureDomainFrontierEntry(domain); }
-function shouldQueueDomainForRecursiveCollection(context) { return domainIntel.shouldQueueDomainForRecursiveCollection(context); }
+function createDomainFrontierEntry(domain) { return domainIntel.createEntry(domain); }
+function ensureDomainFrontierEntry(domain) { return domainIntel.ensureFrontierEntry(domain); }
+function shouldQueueDomainForRecursiveCollection(context) { return domainIntel.shouldQueueForRecursive(context); }
 function getContextRecursiveDepth(context) { return domainIntel.getContextRecursiveDepth(context); }
 function markEntryCrawlPending(entry, context) { return domainIntel.markEntryCrawlPending(entry, context); }
-function markDomainCrawlState(domain, patch) { return domainIntel.markDomainCrawlState(domain, patch); }
-function getNextPendingFrontierDomain() { return domainIntel.getNextPendingFrontierDomain(); }
-function recordDomainIntel(items, context) { return domainIntel.recordDomainIntel(items, context); }
-function recordDomainPublishEvidence(url, status, publishMeta) { return domainIntel.recordDomainPublishEvidence(url, status, publishMeta); }
-function recordDomainDrilldown(seed, finalUrl, html, pages) { return domainIntel.recordDomainDrilldown(seed, finalUrl, html, pages); }
-function enrichDomainProfileFromPage(url, html, ruleResult) { return domainIntel.enrichDomainProfileFromPage(url, html, ruleResult); }
-function recalculateDomainIntelScores() { return domainIntel.recalculateDomainIntelScores(); }
-function getDomainIntelView() { return domainIntel.getDomainIntelView(); }
+function markDomainCrawlState(domain, patch) { return domainIntel.markCrawlState(domain, patch); }
+function getNextPendingFrontierDomain() { return domainIntel.getNextPending(); }
+function recordDomainIntel(items, context) { return domainIntel.recordIntel(items, context); }
+function recordDomainPublishEvidence(url, status, publishMeta) { return domainIntel.recordPublishEvidence(url, status, publishMeta); }
+function recordDomainDrilldown(seed, finalUrl, html, pages) { return domainIntel.recordDrilldown(seed, finalUrl, html, pages); }
+function enrichDomainProfileFromPage(url, html, ruleResult) { return domainIntel.enrichProfile(url, html, ruleResult); }
+function recalculateDomainIntelScores() { return domainIntel.recalculateScores(); }
+function getDomainIntelView() { return domainIntel.getView(); }
 
 async function startContinuousDiscovery(domain, myDomain, sources = []) {
     await ensureContinuousDiscoveryLoaded();
