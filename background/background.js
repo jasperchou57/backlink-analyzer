@@ -72,7 +72,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             stopCollect();
             break;
         case 'startPublish':
-            startPublish(msg.task);
+            startPublish(msg.task, msg.resourceIds);
             break;
         case 'stopPublish':
             stopPublish();
@@ -620,13 +620,30 @@ async function deletePublishTask(taskId) {
     await chrome.storage.local.set({ publishTasks: tasks });
 }
 
-async function startPublish(task) {
+async function startPublish(task, resourceIds) {
     const data = await chrome.storage.local.get('resources');
     const resources = data.resources || [];
-    const pending = resources.filter(r =>
-        r.status === 'pending' &&
-        (r.opportunities?.includes('comment') || r.type?.includes('comment'))
-    );
+
+    let pending;
+    if (resourceIds && resourceIds.length > 0) {
+        // 发布指定的资源（从资源库的"开始"按钮）
+        pending = resources.filter(r => resourceIds.includes(r.id));
+    } else if (task.categoryFilter) {
+        // 按分类发布（从任务卡片的分类▶按钮）
+        const cat = task.categoryFilter;
+        pending = resources.filter(r => {
+            if (r.status !== 'pending') return false;
+            const opps = r.opportunities || [r.type] || [];
+            if (cat === 'comment') return opps.includes('comment');
+            if (cat === 'submit-site') return opps.includes('submit-site');
+            if (cat === 'forum') return opps.includes('forum');
+            // listing = everything else
+            return !opps.includes('comment') && !opps.includes('submit-site') && !opps.includes('forum');
+        });
+    } else {
+        // 发布所有待发布资源
+        pending = resources.filter(r => r.status === 'pending');
+    }
 
     if (pending.length === 0) return;
 
