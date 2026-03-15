@@ -143,6 +143,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         openTaskEditor();
     });
 
+    // === 停止发布 ===
+    document.getElementById('btn-stop-publish').addEventListener('click', () => {
+        chrome.runtime.sendMessage({ action: 'stopPublish' });
+        document.getElementById('publish-current').style.display = 'none';
+    });
+
     // === 导入数据库 ===
     document.getElementById('btn-import-db').addEventListener('click', importBacklinkDatabase);
 

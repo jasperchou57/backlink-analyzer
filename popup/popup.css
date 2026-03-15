@@ -546,6 +546,28 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px;
+}
+
+.publish-current-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.publish-current-header .current-label {
+  margin-bottom: 0;
+}
+
+.btn-danger {
+  background: var(--red-light);
+  color: var(--red);
+  border: 1px solid var(--red);
+}
+
+.btn-danger:hover {
+  background: var(--red);
+  color: #fff;
   margin-bottom: 14px;
   box-shadow: var(--shadow-card);
 }
