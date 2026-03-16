@@ -139,6 +139,14 @@
             const hasEvidence = evidence.verified || evidence.sourceBacked;
             const standardCommentCandidate = resourceClass === 'blog-comment' || resourceClass === 'inline-comment';
 
+            // ── Submify-verified seeds: trust pre-assigned pool ───
+            if (resource.submifySeed && resource.resourcePool && resource.resourcePoolReason) {
+                return {
+                    pool: resource.resourcePool,
+                    reason: resource.resourcePoolReason
+                };
+            }
+
             // ── Domain-level verification reuse ───────────────────
             const domain = getDomainFromUrl(resource.url || '');
             const domainVerification = domain ? getDomainVerificationStatus(domain) : null;

@@ -1964,6 +1964,16 @@ function sanitizeResourceSignals(resource = {}) {
 
 function finalizeResourceSignals(resource = {}) {
     let nextResource = sanitizeResourceSignals(resource);
+
+    // Submify-verified seeds: trust the pre-assigned signals, skip recomputation
+    if (nextResource.submifySeed && nextResource.resourceClass && nextResource.resourceClass !== 'weak') {
+        nextResource.sourceTier = getEffectiveResourceSourceTier(nextResource) || nextResource.discoverySourceTier || nextResource.sourceTier || '';
+        nextResource.sourceTierScore = getSourceTierScore(nextResource.sourceTier);
+        nextResource.sourceEvidence = summarizeSourceEvidenceFromEdges(nextResource.discoveryEdges || []);
+        nextResource = applyResourcePool(nextResource);
+        return nextResource;
+    }
+
     const recomputedClass = self.ResourceRules?.getResourceClass?.({
         ...nextResource,
         resourceClass: ''
