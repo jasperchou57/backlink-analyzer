@@ -303,6 +303,11 @@
         const disqusDetected = !!root.querySelector('#disqus_thread, [class*="disqus"], iframe[src*="disqus.com"]');
         const bloggerDetected = !!root.querySelector('#comment-editor, iframe[src*="blogger.com/comment"], #blogger-comment-from, .blogger-comment-from');
 
+        // 检查是否有已存在的评论（证明评论功能确实可用）
+        const existingCommentNodes = root.querySelectorAll('.comment-list > *, .comment-body, li.comment, .comment-content, ol.commentlist > li, .comments-area .comment');
+        const hasExistingComments = existingCommentNodes.length > 0;
+        result.hasExistingComments = hasExistingComments;
+
         result.requiresLogin = loginRequired;
         result.commentsClosed = commentsClosed;
         result.hasCaptcha = hasCaptcha;
@@ -383,6 +388,13 @@
         result.directPublishReady = !!globalScope.ResourceRules?.isDirectPublishReady?.(resourceShape);
         result.resourceClass = globalScope.ResourceRules?.getResourceClass?.(resourceShape) || '';
         result.frictionLevel = globalScope.ResourceRules?.getResourceFrictionLevel?.(resourceShape) || '';
+
+        // 没有已有评论的页面降为不可直发（评论功能可能被后台关闭或审核拦截）
+        if (!hasExistingComments && result.directPublishReady) {
+            result.directPublishReady = false;
+            result.frictionLevel = 'medium';
+            result.details.push('no-existing-comments');
+        }
 
         if ((result.linkModes.includes('raw-html-anchor') || result.linkModes.includes('rich-editor-anchor'))) {
             result.linkMethod = 'html';

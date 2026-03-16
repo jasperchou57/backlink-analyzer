@@ -143,10 +143,6 @@
                 status: trimStorageText(resource.status || 'pending', 24),
                 publishedAt: resource.publishedAt || '',
                 aiClassified: resource.aiClassified ? true : undefined,
-                verifiedReady: resource.verifiedReady ? true : undefined,
-                submifySeed: resource.submifySeed ? true : undefined,
-                submifyCategory: resource.submifyCategory ? trimStorageText(resource.submifyCategory, 24) : undefined,
-                submifyWorkflow: resource.submifyWorkflow ? trimStorageText(resource.submifyWorkflow, 48) : undefined,
                 publishMeta: sanitizePublishMetaForStorage(resource.publishMeta || {}),
                 publishHistory: sanitizePublishHistoryForStorage(resource.publishHistory || {})
             });

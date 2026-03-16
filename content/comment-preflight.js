@@ -83,10 +83,12 @@
                 commentTarget.scrollIntoView({ behavior: immediate ? 'auto' : 'smooth', block: 'center' });
             } catch {}
             context.commentSectionPrimed = true;
-            await wait(immediate ? 80 : 180);
+            // 等评论区加载（懒加载博客需要更多时间）
+            await wait(immediate ? 300 : 600);
             return true;
         }
 
+        // 评论区通常在页面最底部，需要先滚到底部触发懒加载
         const body = globalScope.document.body;
         const doc = globalScope.document.documentElement;
         const viewportHeight = Math.max(globalScope.innerHeight || 0, 600);
@@ -95,16 +97,22 @@
             return false;
         }
 
-        const nextStep = Math.min(Number(context.commentScrollStep || 0) + 1, 4);
+        const nextStep = Math.min(Number(context.commentScrollStep || 0) + 1, 5);
         context.commentScrollStep = nextStep;
         const forceProgressiveScroll = !!options.forceProgressiveScroll;
-        const targetY = nextStep === 1
-            ? Math.max(0, Math.round(scrollHeight * (forceProgressiveScroll ? 0.62 : 0.58)))
-            : nextStep === 2
-                ? Math.max(0, Math.round(scrollHeight * 0.78))
-                : nextStep === 3
-                    ? Math.max(0, scrollHeight - viewportHeight - 260)
-                    : Math.max(0, scrollHeight - viewportHeight - 80);
+
+        // 5 步渐进滚动：50% → 70% → 85% → 95% → 底部
+        const scrollRatios = [
+            forceProgressiveScroll ? 0.50 : 0.45,
+            0.70,
+            0.85,
+            0.95,
+            1.0
+        ];
+        const ratio = scrollRatios[Math.min(nextStep - 1, scrollRatios.length - 1)];
+        const targetY = ratio >= 1.0
+            ? Math.max(0, scrollHeight - viewportHeight - 40)
+            : Math.max(0, Math.round(scrollHeight * ratio));
 
         if (Math.abs((globalScope.scrollY || 0) - targetY) < 80) {
             return false;
@@ -115,7 +123,8 @@
         } catch {
             globalScope.scrollTo(0, targetY);
         }
-        await wait(immediate ? 90 : 220);
+        // 每步等待更长，让懒加载内容有时间渲染
+        await wait(immediate ? 400 : 800);
         return true;
     }
 

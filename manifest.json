@@ -33,7 +33,7 @@
         {
             "resources": [
                 "content/comment-publisher.css",
-                "data/submify-banklinks-2749.json"
+                "data/gefei-226-resources.json"
             ],
             "matches": [
                 "<all_urls>"
