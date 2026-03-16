@@ -731,12 +731,13 @@ async function refreshDomainIntel() {
     const empty = document.getElementById('domain-frontier-empty');
 
     if (items.length === 0) {
-        empty.style.display = 'block';
-        list.querySelectorAll('.frontier-item').forEach((node) => node.remove());
+        if (empty) empty.style.display = 'block';
+        if (list) list.querySelectorAll('.frontier-item').forEach((node) => node.remove());
         return;
     }
 
-    empty.style.display = 'none';
+    if (empty) empty.style.display = 'none';
+    if (!list) return;
     list.innerHTML = '';
 
     items.slice(0, 8).forEach((item) => {
