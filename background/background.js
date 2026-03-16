@@ -120,21 +120,21 @@ const MARKETING_STRATEGY = {
 };
 
 const PUBLISH_WATCHDOG = {
-    DISPATCH_MS: 20000,
-    SUBMISSION_MS: 15000
+    DISPATCH_MS: 35000,
+    SUBMISSION_MS: 20000
 };
 
 const PUBLISH_STAGE_WATCHDOG_MS = {
-    bootstrap: 12000,
-    preflight: 9000,
-    finding_form: 9000,
-    form_detected: 7000,
-    generating_comment: 7000,
-    comment_ready: 5000,
-    filling_form: 6000,
-    form_filled: 5000,
-    pre_submit: 5000,
-    submitting: 12000
+    bootstrap: 18000,
+    preflight: 15000,
+    finding_form: 20000,
+    form_detected: 10000,
+    generating_comment: 12000,
+    comment_ready: 8000,
+    filling_form: 10000,
+    form_filled: 8000,
+    pre_submit: 8000,
+    submitting: 18000
 };
 
 const RESOURCE_POOLS = self.ResourcePoolUtils?.DEFAULT_POOLS || {
