@@ -597,6 +597,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                 refreshPublishStats();
             });
         }
+        if (msg.action === 'resourceStatsUpdate') {
+            // 发布结果返回后实时刷新任务卡片的统计数字
+            taskPanel.refreshTasks();
+            refreshPublishStats();
+        }
         if (msg.action === 'newLog') {
             const logsPanel = document.getElementById('panel-logs');
             if (logsPanel.classList.contains('active')) {

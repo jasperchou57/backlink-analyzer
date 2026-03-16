@@ -497,6 +497,15 @@ async function handleCommentAction(resourceId, result, taskId, meta = {}, sessio
         runtimeTaskId,
         meta
     );
+
+    // 实时同步：每次发布结果返回后立即广播资源统计更新
+    try {
+        const updatedResources = await getStoredResources();
+        syncResourceOpportunityStats(updatedResources);
+        broadcastStats();
+        broadcastToPopup({ action: 'resourceStatsUpdate', taskId: runtimeTaskId });
+    } catch {}
+
     const session = getPublishSessionState(runtimeTaskId);
     if (!isPublishSessionActive(session)) {
         schedulePublishBatchAdvance('publish-session-idle', 500);
