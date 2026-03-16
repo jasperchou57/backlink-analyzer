@@ -582,7 +582,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (msg.action === 'publishProgress') {
             taskPanel.updatePublishProgress(msg);
-            // Also refresh global stats so per-task overview picks up latest resource statuses
+            // 每次进度更新都强制刷新任务卡片数字和全局统计
+            taskPanel.refreshTasks();
             refreshPublishStats();
         }
         if (msg.action === 'publishDone') {
@@ -598,9 +599,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         }
         if (msg.action === 'resourceStatsUpdate') {
-            // 发布结果返回后实时刷新任务卡片的统计数字
-            taskPanel.refreshTasks();
-            refreshPublishStats();
+            // 发布结果返回后实时刷新任务卡片的统计数字（不管当前在哪个tab）
+            taskPanel.refreshPublishState().then(() => {
+                taskPanel.refreshTasks();
+                refreshPublishStats();
+            });
         }
         if (msg.action === 'newLog') {
             const logsPanel = document.getElementById('panel-logs');
