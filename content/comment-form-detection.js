@@ -389,10 +389,8 @@
         result.resourceClass = globalScope.ResourceRules?.getResourceClass?.(resourceShape) || '';
         result.frictionLevel = globalScope.ResourceRules?.getResourceFrictionLevel?.(resourceShape) || '';
 
-        // 没有已有评论的页面降为不可直发（评论功能可能被后台关闭或审核拦截）
-        if (!hasExistingComments && result.directPublishReady) {
-            result.directPublishReady = false;
-            result.frictionLevel = 'medium';
+        // 没有已有评论作为降权信号，不阻断发布（新文章/懒加载可能暂时没有评论）
+        if (!hasExistingComments) {
             result.details.push('no-existing-comments');
         }
 

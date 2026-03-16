@@ -1000,22 +1000,32 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
                 const rawData = await response.json();
                 const clearExisting = msg?.clearExisting !== false;
 
-                const resources = rawData.map((item, index) => ({
-                    id: `gefei-${index}-${Date.now()}`,
-                    url: item.url,
-                    pageTitle: '',
-                    opportunities: ['comment'],
-                    linkModes: item.hasUrlField ? ['website-field'] : [],
-                    details: ['gefei-verified', 'wordpress', 'inline-submit-form', item.hasUrlField ? 'website-field' : ''].filter(Boolean),
-                    sources: [item.discoveredFrom || 'gefei'],
-                    hasUrlField: item.hasUrlField,
-                    hasCaptcha: item.hasCaptcha,
-                    resourceClass: item.type === 'blog_comment' ? 'blog-comment' : 'profile',
-                    frictionLevel: item.hasCaptcha ? 'high' : 'low',
-                    directPublishReady: item.type === 'blog_comment' && item.hasUrlField && !item.hasCaptcha,
-                    status: 'pending',
-                    gefeiSeed: true
-                }));
+                const resources = rawData.map((item, index) => {
+                    const isBlogComment = item.type === 'blog_comment';
+                    const isProfile = item.type === 'profile';
+                    return {
+                        id: `gefei-${index}-${Date.now()}`,
+                        url: item.url,
+                        pageTitle: '',
+                        opportunities: isBlogComment ? ['comment'] : (isProfile ? ['register'] : ['comment']),
+                        linkModes: isBlogComment && item.hasUrlField ? ['website-field'] : (isProfile ? ['profile-link'] : []),
+                        details: [
+                            'gefei-verified',
+                            isBlogComment ? 'wordpress' : '',
+                            isBlogComment ? 'inline-submit-form' : '',
+                            isBlogComment && item.hasUrlField ? 'website-field' : '',
+                            isProfile ? 'profile-link' : ''
+                        ].filter(Boolean),
+                        sources: [item.discoveredFrom || 'gefei'],
+                        hasUrlField: isBlogComment ? item.hasUrlField : false,
+                        hasCaptcha: item.hasCaptcha,
+                        resourceClass: isBlogComment ? 'blog-comment' : 'profile',
+                        frictionLevel: item.hasCaptcha ? 'high' : (isBlogComment ? 'low' : 'medium'),
+                        directPublishReady: isBlogComment && item.hasUrlField && !item.hasCaptcha,
+                        status: 'pending',
+                        gefeiSeed: true
+                    };
+                });
 
                 if (clearExisting) {
                     await writeResourcesToStorage(resources);
@@ -1862,8 +1872,10 @@ function sanitizeResourceSignals(resource = {}) {
 function finalizeResourceSignals(resource = {}) {
     let nextResource = sanitizeResourceSignals(resource);
 
-    // 哥飞验证过的种子：信任预设信号，不重新计算
-    if (nextResource.gefeiSeed && nextResource.directPublishReady) {
+    // 哥飞种子：初始信任预设信号，但发布失败过的允许重新计算
+    const gefeiHasFailures = nextResource.gefeiSeed
+        && (nextResource.publishMeta?.submissionBlocked || nextResource.status === 'failed' || nextResource.status === 'skipped');
+    if (nextResource.gefeiSeed && nextResource.directPublishReady && !gefeiHasFailures) {
         nextResource.sourceTier = getEffectiveResourceSourceTier(nextResource) || nextResource.discoverySourceTier || nextResource.sourceTier || '';
         nextResource.sourceTierScore = getSourceTierScore(nextResource.sourceTier);
         nextResource.sourceEvidence = summarizeSourceEvidenceFromEdges(nextResource.discoveryEdges || []);

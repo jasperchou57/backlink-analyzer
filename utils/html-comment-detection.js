@@ -87,14 +87,14 @@
 
         // ── 判定逻辑 ─────────────────────────────────────────
 
-        // 必须全部通过才标记为可发
+        // 核心条件：WP站 + WP评论表单 + 标准字段 + URL字段 + 无阻断
+        // "已有评论"是加分项，不是必须条件（新文章/懒加载可能暂时没有）
         const isPublishable =
             isWordPress
             && hasWpCommentForm
             && hasAuthorField
             && hasTextarea
             && hasUrlField
-            && hasExistingComments
             && !requiresLogin
             && !commentsClosed
             && !hasCaptcha;
@@ -139,6 +139,9 @@
 
         const pageTitle = text.match(/<title[^>]*>(.*?)<\/title>/i)?.[1]?.trim()?.substring(0, 100) || '';
         const details = ['wordpress', 'inline-submit-form', 'website-field'];
+        if (hasExistingComments) {
+            details.push('has-existing-comments');
+        }
         const linkModes = ['website-field'];
 
         // 额外检测：是否支持 HTML 锚文本
