@@ -889,6 +889,7 @@ async function handleCommentProgressMessage(msg = {}, sender = {}) {
     clearPublishWatchdog(taskId);
     schedulePublishWatchdog(taskId, {
         stage: 'dispatch',
+        timeoutMs,
         resourceId: msg.resourceId || activeResourceId,
         currentUrl: session.currentUrl,
         timeoutMs,
