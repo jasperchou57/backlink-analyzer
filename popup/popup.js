@@ -465,11 +465,64 @@ document.addEventListener('DOMContentLoaded', async () => {
         taskPanel.refreshTasks();
     });
 
-    // === 资源导出 ===
+    // === 资源导出 CSV ===
     document.getElementById('btn-export').addEventListener('click', async () => {
         const resources = await StorageHelper.getResources();
         if (resources.length === 0) return;
         exportToCSV(resources);
+    });
+
+    // === 资源导出 JSON（完整备份） ===
+    document.getElementById('btn-export-json').addEventListener('click', async () => {
+        const resources = await StorageHelper.getResources();
+        if (resources.length === 0) { alert('没有资源可导出'); return; }
+        const blob = new Blob([JSON.stringify(resources, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `backlink-resources-${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+    });
+
+    // === 资源导入 JSON ===
+    document.getElementById('btn-import-json').addEventListener('click', () => {
+        document.getElementById('file-import-json').click();
+    });
+    document.getElementById('file-import-json').addEventListener('change', async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        try {
+            const text = await file.text();
+            const imported = JSON.parse(text);
+            if (!Array.isArray(imported)) { alert('JSON 格式错误：应为数组'); return; }
+            const existing = await StorageHelper.getResources();
+            const existingUrls = new Set(existing.map(r => (r.url || '').replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/+$/, '').toLowerCase()));
+            let added = 0;
+            for (const r of imported) {
+                if (!r.url) continue;
+                const normUrl = r.url.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/+$/, '').toLowerCase();
+                if (!existingUrls.has(normUrl)) {
+                    existing.push(r);
+                    existingUrls.add(normUrl);
+                    added++;
+                }
+            }
+            // 逐个添加新资源，利用 StorageHelper.addResource 的去重逻辑
+            // 但为了效率，直接写入整个数组
+            const localStore = typeof LocalDB !== 'undefined' ? LocalDB : null;
+            if (localStore?.setResources) {
+                await localStore.setResources(existing);
+            } else {
+                await StorageHelper.set('resources', existing);
+            }
+            alert(`导入完成：新增 ${added} 个资源，跳过 ${imported.length - added} 个重复资源，当前总计 ${existing.length} 个`);
+            e.target.value = '';
+            resourcePanel?.refresh?.();
+        } catch (err) {
+            alert('导入失败：' + err.message);
+            e.target.value = '';
+        }
     });
 
     // === 日志 ===

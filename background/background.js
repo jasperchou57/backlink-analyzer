@@ -9,6 +9,8 @@ importScripts(
     'core/domain-intel.js',
     'core/anchor-verifier.js',
     'core/auto-publish-dispatch.js',
+    'core/verification-runtime.js',
+    'core/submify-seed-importer.js',
     'marketing/marketing-research.js',
     'marketing/marketing-planner.js',
     'marketing/marketing-engine.js',
@@ -89,7 +91,7 @@ const STORAGE_STRATEGY = {
     RESOURCE_TITLE_LIMIT: 140,
     RESOURCE_DETAIL_LIMIT: 4,
     RESOURCE_DETAIL_TEXT_LIMIT: 80,
-    RESOURCE_QUOTA_RETRY_LIMITS: [4500, 3500, 2500, 1500]
+    RESOURCE_QUOTA_RETRY_LIMITS: [20000, 15000, 10000, 5000]
 };
 
 const SOURCE_TIERS = {
@@ -187,7 +189,8 @@ const resourcePoolUtils = self.ResourcePoolUtils.create({
     resourceRules: self.ResourceRules,
     getSourceTierScore,
     getResourcePublishedSuccessCount,
-    getResourceAnchorVerifiedCount
+    getResourceAnchorVerifiedCount,
+    getDomainVerificationStatus: (domain) => domainIntel.getVerificationStatus(domain)
 });
 
 const {
@@ -237,6 +240,26 @@ const domainIntel = DomainIntel.create({
     getContinuousSeedDomain: () => continuousDiscoveryState.seedDomain,
     getContinuousMyDomain: () => continuousDiscoveryState.myDomain
 });
+
+const verificationRuntime = VerificationRuntime.create({
+    domainIntel,
+    getDomain: getDomainBg,
+    normalizeUrl: normalizeHttpUrlBg,
+    AIEngine,
+    Logger,
+    delay,
+    waitForTabLoad,
+    resourceStore
+});
+
+const submifySeedImporter = self.SubmifySeedImporter
+    ? self.SubmifySeedImporter.create({
+        getDomain: getDomainBg,
+        normalizeUrl: normalizeHttpUrlBg,
+        SOURCE_TIERS,
+        buildDiscoveryEdge
+    })
+    : null;
 
 const marketingEngine = MarketingEngine.create({
     openOrReuseMarketingTab,
@@ -991,6 +1014,88 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
             } catch (error) {
                 return { comment: '', error: error.message };
             }
+        },
+        // ── Verification & Submify seed import ────────────────
+        verifyResources: async (msg) => {
+            const resources = await getStoredResources();
+            const pool = msg.pool || 'legacy';
+            const maxItems = msg.maxItems || 30;
+            const candidates = resources.filter((r) => {
+                const currentPool = getResourcePool(r);
+                if (pool === 'all') return r.status !== 'published';
+                return currentPool === pool && r.status !== 'published';
+            });
+            const result = await verificationRuntime.verifyBatch(candidates, { maxItems });
+            await verificationRuntime.applyVerificationToResources(result.results, getStoredResources);
+            // Re-classify resources after verification signals applied
+            const updatedResources = await getStoredResources();
+            const reclassified = updatedResources.map((r) => applyResourcePool(r));
+            await writeResourcesToStorage(reclassified);
+            syncResourceOpportunityStats(reclassified);
+            broadcastStats();
+            return {
+                success: true,
+                total: result.total,
+                verified: result.verified,
+                domainsCovered: result.domainsCovered
+            };
+        },
+        verifyUrl: async (msg) => {
+            const result = await verificationRuntime.verifyUrl(msg.url);
+            return { success: !!result, result };
+        },
+        importSubmifySeeds: async () => {
+            if (!submifySeedImporter) {
+                return { success: false, message: 'Submify importer not available' };
+            }
+            try {
+                const response = await fetch(chrome.runtime.getURL('data/submify-banklinks-2749.json'));
+                const rawData = await response.json();
+                const parsed = submifySeedImporter.parseSubmifyData(rawData);
+                const stats = submifySeedImporter.getSeedStats(parsed);
+
+                // Import as domain intel entries
+                const domainItems = submifySeedImporter.buildDomainIntelItems(parsed);
+                await ensureDomainIntelLoaded();
+                await recordDomainIntel(domainItems, {
+                    discoveryMethod: 'submify-import',
+                    status: 'queued'
+                });
+
+                // Import as resource entries
+                const resourceEntries = submifySeedImporter.buildResourceEntries(parsed);
+                const existingResources = await getStoredResources();
+                const existingUrls = new Set(existingResources.map((r) => normalizeHttpUrlBg(r.url || '')));
+                const newResources = resourceEntries.filter((r) => !existingUrls.has(normalizeHttpUrlBg(r.url || '')));
+
+                if (newResources.length > 0) {
+                    const merged = [...existingResources, ...newResources].map((r) => applyResourcePool(r));
+                    await writeResourcesToStorage(merged);
+                    syncResourceOpportunityStats(merged);
+                    broadcastStats();
+                }
+
+                await Logger.collect(`Submify 种子导入完成`, {
+                    total: stats.total,
+                    directories: stats.directories,
+                    blogs: stats.blogs,
+                    newResources: newResources.length
+                });
+
+                return {
+                    success: true,
+                    stats,
+                    newResources: newResources.length,
+                    existingSkipped: resourceEntries.length - newResources.length
+                };
+            } catch (error) {
+                return { success: false, message: error.message };
+            }
+        },
+        getDomainVerification: async (msg) => {
+            await ensureDomainIntelLoaded();
+            const domain = getDomainBg(msg.url || msg.domain || '');
+            return { verification: domainIntel.getVerificationStatus(domain) };
         }
     },
     onError: (action, error) => {
@@ -1606,6 +1711,7 @@ function createDrilldownTarget(url, seed, drilled = true) {
 async function fetchAnalyzeAll(links) {
     const CONCURRENCY = 8;
     const queue = [...links];
+    const savedResources = [];
 
     async function worker() {
         while (queue.length > 0 && collectState.isCollecting) {
@@ -1616,6 +1722,7 @@ async function fetchAnalyzeAll(links) {
                 const result = await fetchAnalyzePage(link);
                 if (result && result.opportunities.length > 0) {
                     await saveResource(result);
+                    savedResources.push(result);
                 }
             } catch {}
 
@@ -1630,6 +1737,46 @@ async function fetchAnalyzeAll(links) {
         workers.push(worker());
     }
     await Promise.all(workers);
+
+    // Post-analysis: trigger batch verification for newly saved resources
+    // that haven't been domain-verified yet (runs in background, non-blocking)
+    if (savedResources.length > 0) {
+        schedulePostAnalysisVerification(savedResources);
+    }
+}
+
+let postAnalysisVerificationTimer = null;
+let postAnalysisVerificationQueue = [];
+
+function schedulePostAnalysisVerification(resources) {
+    postAnalysisVerificationQueue.push(...resources);
+    if (postAnalysisVerificationTimer) return;
+
+    // Debounce: wait 3s after last batch of analysis before starting verification
+    postAnalysisVerificationTimer = setTimeout(async () => {
+        const batch = postAnalysisVerificationQueue.splice(0);
+        postAnalysisVerificationTimer = null;
+
+        if (batch.length === 0) return;
+
+        try {
+            await ensureDomainIntelLoaded();
+            const result = await verificationRuntime.verifyBatch(batch, { maxItems: 30 });
+            if (result.verified > 0) {
+                await verificationRuntime.applyVerificationToResources(result.results, getStoredResources);
+                // Re-classify after verification
+                const updatedResources = await getStoredResources();
+                const reclassified = updatedResources.map((r) => applyResourcePool(r));
+                await writeResourcesToStorage(reclassified);
+                syncResourceOpportunityStats(reclassified);
+                broadcastStats();
+
+                await Logger.collect(`实测验证完成: ${result.verified} 个 URL (${result.domainsCovered} 个域名)`);
+            }
+        } catch (e) {
+            await Logger.error(`实测验证失败: ${e.message}`);
+        }
+    }, 3000);
 }
 
 // fetchAnalyzePage → see core/collection-flow.js

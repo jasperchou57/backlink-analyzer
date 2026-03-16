@@ -15,6 +15,9 @@
         const getSourceTierScore = typeof config.getSourceTierScore === 'function'
             ? config.getSourceTierScore
             : () => 0;
+        const getDomainVerificationStatus = typeof config.getDomainVerificationStatus === 'function'
+            ? config.getDomainVerificationStatus
+            : () => null;
         const getResourcePublishedSuccessCount = typeof config.getResourcePublishedSuccessCount === 'function'
             ? config.getResourcePublishedSuccessCount
             : (resource = {}) => Object.values(resource.publishHistory || {}).reduce((total, entry) => {
@@ -109,6 +112,14 @@
             };
         }
 
+        function getDomainFromUrl(url = '') {
+            try {
+                return new URL(/^https?:\/\//i.test(url) ? url : `https://${url}`).hostname.replace(/^www\./i, '').toLowerCase();
+            } catch {
+                return '';
+            }
+        }
+
         function classify(resource = {}) {
             const evidence = getEvidenceState(resource);
             const publishPriority = getPublishPriority(resource, {
@@ -128,6 +139,33 @@
             const hasEvidence = evidence.verified || evidence.sourceBacked;
             const standardCommentCandidate = resourceClass === 'blog-comment' || resourceClass === 'inline-comment';
 
+            // ── Domain-level verification reuse ───────────────────
+            const domain = getDomainFromUrl(resource.url || '');
+            const domainVerification = domain ? getDomainVerificationStatus(domain) : null;
+
+            // If domain was verified as blocked, fast-track to quarantine
+            if (domainVerification && !domainVerification.verifiedPublishable) {
+                if (domainVerification.status === 'captcha' || domainVerification.status === 'login_required' || domainVerification.status === 'closed' || domainVerification.status === 'no_form') {
+                    if (!evidence.verified) {
+                        return {
+                            pool: pools.QUARANTINE,
+                            reason: `domain_verified_${domainVerification.status}`
+                        };
+                    }
+                }
+            }
+
+            // If domain was verified as publishable, boost to main pool
+            if (domainVerification && domainVerification.verifiedPublishable && !commentOnly && !lowQualityArchive) {
+                if (publishPriority > 0 || directCapability || standardCommentCandidate) {
+                    return {
+                        pool: pools.MAIN,
+                        reason: 'domain_verified_publishable'
+                    };
+                }
+            }
+
+            // ── Original classification logic ─────────────────────
             let pool = '';
             let reason = '';
 

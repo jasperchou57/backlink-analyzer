@@ -6,7 +6,7 @@
             RESOURCE_TITLE_LIMIT: 140,
             RESOURCE_DETAIL_LIMIT: 4,
             RESOURCE_DETAIL_TEXT_LIMIT: 80,
-            RESOURCE_QUOTA_RETRY_LIMITS: [4500, 3500, 2500, 1500],
+            RESOURCE_QUOTA_RETRY_LIMITS: [20000, 15000, 10000, 5000],
             ...(config.strategy || {})
         };
         const compactText = typeof config.compactText === 'function'
@@ -171,7 +171,7 @@
             return score;
         }
 
-        function compactResourcesForQuota(resources = [], limit = 2500) {
+        function compactResourcesForQuota(resources = [], limit = 20000) {
             return [...(resources || [])]
                 .sort((left, right) => getResourceStoragePriority(right) - getResourceStoragePriority(left))
                 .slice(0, Math.max(1, limit));

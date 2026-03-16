@@ -179,8 +179,144 @@ const DomainIntel = {
                 entry.blockedPublishCount = Number(entry.blockedPublishCount || 0) + 1;
             }
 
+            // Update domain archive from publish evidence
+            const profile = cache.profiles[domain] || {};
+            if (status === 'published') {
+                profile.verifiedPublishable = true;
+                profile.lastVerifiedAt = new Date().toISOString();
+                profile.publishSuccessCount = Number(profile.publishSuccessCount || 0) + 1;
+                if (publishMeta.formSignature) {
+                    profile.formSignature = publishMeta.formSignature;
+                }
+                if (publishMeta.cms) {
+                    profile.cms = publishMeta.cms;
+                }
+                if (publishMeta.formFields) {
+                    profile.formFields = publishMeta.formFields;
+                }
+                profile.lastPublishFailureReason = '';
+            } else if (status === 'failed' || publishMeta.submissionBlocked) {
+                profile.publishFailureCount = Number(profile.publishFailureCount || 0) + 1;
+                const reason = publishMeta.terminalFailureReason
+                    || publishMeta.failureReason || '';
+                if (reason) {
+                    profile.lastPublishFailureReason = reason;
+                }
+                if (publishMeta.hasCaptcha) {
+                    profile.hasCaptcha = true;
+                    profile.captchaType = publishMeta.captchaType || 'unknown';
+                }
+                if (publishMeta.requiresLogin) {
+                    profile.requiresLogin = true;
+                }
+            }
+            cache.profiles[domain] = profile;
+
             recalculateDomainIntelScores();
             await flush();
+        }
+
+        // ── domain archive (verification) ─────────────────────────
+
+        async function recordDomainVerification(url, verificationResult = {}) {
+            const domain = getDomain(url);
+            if (!domain) return;
+
+            await ensureLoaded();
+            const entry = ensureDomainFrontierEntry(domain);
+            const profile = cache.profiles[domain] || {};
+            const now = new Date().toISOString();
+
+            const signals = verificationResult.quickSignals || {};
+
+            // Store verification result into domain profile
+            profile.lastVerifiedAt = now;
+            profile.verificationStatus = signals.hasCommentForm
+                ? (signals.hasCaptcha ? 'captcha' : (signals.requiresLogin ? 'login_required' : (signals.commentsClosed ? 'closed' : 'verified_ready')))
+                : 'no_form';
+
+            if (signals.cms) profile.cms = signals.cms;
+            if (signals.captchaType) profile.captchaType = signals.captchaType;
+            if (signals.hasCaptcha) profile.hasCaptcha = true;
+            if (signals.requiresLogin) profile.requiresLogin = true;
+            if (signals.commentsClosed) profile.commentsClosed = true;
+            if (signals.formSignature) profile.formSignature = signals.formSignature;
+            if (signals.hasUrlField) profile.hasUrlField = true;
+            if (signals.hasRichEditor) profile.hasRichEditor = true;
+
+            // Store form field mapping for reuse across same-domain URLs
+            if (Array.isArray(verificationResult.formSummary)) {
+                const commentForm = verificationResult.formSummary.find(
+                    (f) => f.hasTextarea && f.hasSubmit
+                );
+                if (commentForm) {
+                    profile.formFields = commentForm.fields || [];
+                    profile.formAction = commentForm.action || '';
+                    profile.verifiedPublishable = profile.verificationStatus === 'verified_ready';
+                }
+            }
+
+            profile.verificationCount = Number(profile.verificationCount || 0) + 1;
+
+            cache.profiles[domain] = profile;
+            entry.profileUpdatedAt = now;
+            entry.status = mergeDomainStatus(entry.status, 'profiled');
+
+            recalculateDomainIntelScores();
+            await flush();
+        }
+
+        function getDomainVerificationStatus(domain) {
+            if (!domain || !loaded) return null;
+            const profile = cache.profiles[domain];
+            if (!profile || !profile.lastVerifiedAt) return null;
+            return {
+                status: profile.verificationStatus || null,
+                cms: profile.cms || null,
+                hasCaptcha: !!profile.hasCaptcha,
+                captchaType: profile.captchaType || null,
+                requiresLogin: !!profile.requiresLogin,
+                commentsClosed: !!profile.commentsClosed,
+                formSignature: profile.formSignature || null,
+                hasUrlField: !!profile.hasUrlField,
+                hasRichEditor: !!profile.hasRichEditor,
+                formFields: profile.formFields || null,
+                verifiedPublishable: !!profile.verifiedPublishable,
+                lastVerifiedAt: profile.lastVerifiedAt || '',
+                publishSuccessCount: Number(profile.publishSuccessCount || 0),
+                publishFailureCount: Number(profile.publishFailureCount || 0)
+            };
+        }
+
+        function shouldSkipVerification(domain) {
+            if (!domain || !loaded) return false;
+            const profile = cache.profiles[domain];
+            if (!profile || !profile.lastVerifiedAt) return false;
+
+            // If domain was verified within last 7 days, reuse the result
+            const verifiedAt = new Date(profile.lastVerifiedAt).getTime();
+            const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+            if (verifiedAt < sevenDaysAgo) return false;
+
+            // Always re-verify if we have no clear status
+            if (!profile.verificationStatus) return false;
+
+            return true;
+        }
+
+        function getDomainFormTemplate(domain) {
+            if (!domain || !loaded) return null;
+            const profile = cache.profiles[domain];
+            if (!profile || !profile.verifiedPublishable) return null;
+            if (!profile.formFields || !Array.isArray(profile.formFields)) return null;
+            return {
+                cms: profile.cms || null,
+                formSignature: profile.formSignature || null,
+                formFields: profile.formFields,
+                formAction: profile.formAction || '',
+                hasUrlField: !!profile.hasUrlField,
+                hasRichEditor: !!profile.hasRichEditor
+            };
         }
 
         async function recordDomainDrilldown(seed, finalUrl, html, pages = []) {
@@ -286,6 +422,11 @@ const DomainIntel = {
             enrichProfile: async (url, html, ruleResult) => enrichDomainProfileFromPage(url, html, ruleResult),
             recalculateScores: () => recalculateDomainIntelScores(),
             getView: async () => getDomainIntelView(),
+            // domain archive (verification & reuse)
+            recordVerification: async (url, result) => recordDomainVerification(url, result),
+            getVerificationStatus: (domain) => getDomainVerificationStatus(domain),
+            shouldSkipVerification: (domain) => shouldSkipVerification(domain),
+            getFormTemplate: (domain) => getDomainFormTemplate(domain),
             // low-level helpers needed by background.js
             createEntry: (d) => createDomainFrontierEntry(d),
             mergeStatus: (c, n) => mergeDomainStatus(c, n),

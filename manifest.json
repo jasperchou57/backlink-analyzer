@@ -10,7 +10,8 @@
         "scripting",
         "identity",
         "alarms",
-        "sidePanel"
+        "sidePanel",
+        "unlimitedStorage"
     ],
     "host_permissions": [
         "<all_urls>"
@@ -31,7 +32,8 @@
     "web_accessible_resources": [
         {
             "resources": [
-                "content/comment-publisher.css"
+                "content/comment-publisher.css",
+                "data/submify-banklinks-2749.json"
             ],
             "matches": [
                 "<all_urls>"
