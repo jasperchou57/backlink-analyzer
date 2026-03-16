@@ -143,6 +143,7 @@
                 status: trimStorageText(resource.status || 'pending', 24),
                 publishedAt: resource.publishedAt || '',
                 aiClassified: resource.aiClassified ? true : undefined,
+                gefeiSeed: resource.gefeiSeed ? true : undefined,
                 publishMeta: sanitizePublishMetaForStorage(resource.publishMeta || {}),
                 publishHistory: sanitizePublishHistoryForStorage(resource.publishHistory || {})
             });

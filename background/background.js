@@ -1860,6 +1860,16 @@ function sanitizeResourceSignals(resource = {}) {
 
 function finalizeResourceSignals(resource = {}) {
     let nextResource = sanitizeResourceSignals(resource);
+
+    // 哥飞验证过的种子：信任预设信号，不重新计算
+    if (nextResource.gefeiSeed && nextResource.directPublishReady) {
+        nextResource.sourceTier = getEffectiveResourceSourceTier(nextResource) || nextResource.discoverySourceTier || nextResource.sourceTier || '';
+        nextResource.sourceTierScore = getSourceTierScore(nextResource.sourceTier);
+        nextResource.sourceEvidence = summarizeSourceEvidenceFromEdges(nextResource.discoveryEdges || []);
+        nextResource = applyResourcePool(nextResource);
+        return nextResource;
+    }
+
     const recomputedClass = self.ResourceRules?.getResourceClass?.({
         ...nextResource,
         resourceClass: ''
