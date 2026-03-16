@@ -2040,6 +2040,14 @@ async function normalizeStoredResourceSignals() {
             if (!needsResourceSignalNormalization(resource)) {
                 continue;
             }
+            // Skip Submify seeds — their signals are pre-assigned and should not be recomputed
+            if (resource.submifySeed) {
+                if (resource.signalVersion !== RESOURCE_SIGNAL_VERSION) {
+                    nextResources[index] = { ...resource, signalVersion: RESOURCE_SIGNAL_VERSION };
+                    changed = true;
+                }
+                continue;
+            }
 
             const beforeSnapshot = getResourceSignalSnapshot(resource);
             const nextResource = finalizeResourceSignals(resource);
