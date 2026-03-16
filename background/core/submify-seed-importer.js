@@ -20,43 +20,105 @@ const SubmifySeedImporter = {
 
         // ── category normalization ────────────────────────────────
 
+        // Maps Submify link_category to UI workflow categories:
+        //   'startup'   → Startup 发布列表
+        //   'directory'  → 目录提交 (also General + vertical niches)
+        //   'blog'       → 博客提交
+        //   'community'  → 账号养护 (Social/Forum)
+        //   'backlink'   → 直发外链 (General free-post sites)
         const CATEGORY_MAP = {
-            'startup':      'directory',
-            'ai tool':      'directory',
-            'saas':         'directory',
-            'directory':    'directory',
-            'product hunt': 'directory',
-            'app':          'directory',
-            'blog':         'blog',
-            'news':         'blog',
-            'media':        'blog',
-            'forum':        'community',
-            'community':    'community',
-            'reddit':       'community',
-            'social':       'community'
+            // Startup 发布列表
+            'startup':              'startup',
+            'ai tools directory':   'startup',
+            'saas':                 'startup',
+            'mobile app':           'startup',
+            'app directory':        'startup',
+            'software directory':   'startup',
+            'software':             'startup',
+            'tools directory':      'startup',
+            'product hunt':         'startup',
+            'product forum':        'startup',
+            // 博客提交
+            'blog':                 'blog',
+            'marketing':            'blog',
+            'seo':                  'blog',
+            'technology':           'blog',
+            'wordpress plugin':     'blog',
+            'podcast':              'blog',
+            // 账号养护 (Social/Forum/Community)
+            'social':               'community',
+            'social media':         'community',
+            'forum':                'community',
+            'community':            'community',
+            'reddit':               'community',
+            'phone forum':          'community',
+            'music forum':          'community',
+            'sports forum':         'community',
+            // 目录提交 (vertical niche directories)
+            'directory':            'directory',
+            'app':                  'directory',
+            'reviews':              'directory',
+            // General = 免费发帖/分类信息站 → 直发外链
+            'general':              'backlink',
+            'generalit':            'backlink'
         };
 
+        // Vertical niche categories → 目录提交 (directory)
+        const NICHE_CATEGORIES = new Set([
+            'music', 'gaming', 'photography', 'sports', 'developers', 'developer',
+            'books', 'design', 'desgin', 'education', 'educational', 'consumer', 'general consumer',
+            'art', 'business', 'bussiness', 'doctor', 'medicine', 'health', 'fitness',
+            'automobile', 'architecture', 'information', 'informational', 'entertainment',
+            'science', 'food', 'search engine', 'travel', 'finance', 'trading',
+            'scale model', 'anime', 'real estate', 'hosting', 'legal', 'gardening',
+            'pet', 'fishing', 'construction', 'fashion', 'fasion', 'aviation',
+            'agencies', 'cell phone', 'domains name', 'domains names', 'blockchain',
+            'it security', 'religion', '3d printing', 'firearms', 'restaurant',
+            'cannabis', 'website detection', 'public services', 'hunting', 'self improvement',
+            'military', 'spirituality', 'advertising', 'shop', 'gambling',
+            'home services', 'astronomy', 'company info', 'elderly care', 'lifestyle',
+            'sofware'
+        ]);
+
         function normalizeCategory(raw) {
-            if (!raw) return 'other';
+            if (!raw) return 'backlink';
             const key = String(raw).trim().toLowerCase();
-            return CATEGORY_MAP[key] || 'other';
+            if (CATEGORY_MAP[key]) return CATEGORY_MAP[key];
+            if (NICHE_CATEGORIES.has(key)) return 'directory';
+            return 'backlink';
         }
 
         // ── opportunity mapping ───────────────────────────────────
 
         function opportunitiesForCategory(category) {
             switch (category) {
+                case 'startup':    return ['submit-site', 'listing'];
                 case 'directory':  return ['submit-site', 'listing'];
                 case 'blog':      return ['comment'];
-                case 'community': return ['form'];
-                default:          return ['submit-site'];
+                case 'community': return ['form', 'register'];
+                case 'backlink':  return ['comment', 'form'];
+                default:          return ['comment'];
             }
         }
 
         function resourceClassForCategory(category) {
             switch (category) {
-                case 'blog':  return 'blog-comment';
-                default:      return 'profile';
+                case 'blog':      return 'blog-comment';
+                case 'backlink':  return 'blog-comment';
+                case 'community': return 'profile';
+                default:          return 'profile';
+            }
+        }
+
+        // Map to workflow IDs used in your task system
+        function workflowForCategory(category) {
+            switch (category) {
+                case 'startup':    return 'directory-submit-promote';
+                case 'directory':  return 'directory-submit-promote';
+                case 'blog':      return 'community-post-promote';
+                case 'community': return 'account-nurture';
+                case 'backlink':  return 'blog-comment-backlink';
+                default:          return 'blog-comment-backlink';
             }
         }
 
@@ -120,7 +182,7 @@ const SubmifySeedImporter = {
                 url:              entry.url,
                 pageTitle:        entry.name,
                 opportunities:    opportunitiesForCategory(entry.category),
-                linkModes:        ['website-field'],
+                linkModes:        entry.category === 'backlink' ? ['website-field', 'plain-url'] : ['website-field'],
                 details:          [
                     'submify-verified',
                     `category:${entry.category}`,
@@ -132,69 +194,87 @@ const SubmifySeedImporter = {
                 sourceTiers:      ['competitor-backlink'],
                 discoveryEdges:   [buildDiscoveryEdge('competitor-backlink', 'submify-import', entry.url)],
                 resourceClass:    resourceClassForCategory(entry.category),
-                frictionLevel:    entry.isPaid ? 'high' : 'medium',
+                frictionLevel:    entry.isPaid ? 'high' : (entry.category === 'backlink' ? 'low' : 'medium'),
+                directPublishReady: entry.category === 'backlink' && !entry.isPaid,
                 status:           'pending',
                 submifySeed:      true,
                 submifyCategory:  entry.category,
+                submifyWorkflow:  workflowForCategory(entry.category),
                 submifyDr:        entry.dr,
                 submifyLanguage:  entry.language
             }));
         }
 
         /**
-         * Return entries useful for Stage 1 (blog comment backlinks):
-         * - category is 'blog'
+         * Return entries for 直发外链 workflow (General free-post sites + blogs):
+         * - category is 'backlink' or 'blog'
          * - NOT paid
-         * - domain looks like it could have comments (has a path or known blog platform)
          */
-        function filterForBlogCommentSeeds(entries) {
+        function filterForBacklinkSeeds(entries) {
             return entries.filter(entry => {
-                if (entry.category !== 'blog') return false;
-                if (entry.isPaid) return false;
-
-                // Heuristic: domains with paths beyond root, or known blogging
-                // platforms, are more likely to have comment sections.
-                try {
-                    const parsed = new URL(entry.url);
-                    const hasPath = parsed.pathname && parsed.pathname !== '/';
-                    const bloggyDomain = /blog|medium|wordpress|ghost|substack|hashnode|dev\.to|write/i
-                        .test(entry.domain);
-                    return hasPath || bloggyDomain;
-                } catch (_) {
-                    return false;
-                }
+                if (entry.category !== 'backlink' && entry.category !== 'blog') return false;
+                return !entry.isPaid;
             });
         }
 
         /**
-         * Return entries useful for Stage 2 (directory submission):
-         * - category is 'directory' or 'community'
-         * - NOT paid by default; pass includePaid=true to include paid entries
+         * Return entries for Startup 发布列表:
+         * - category is 'startup'
+         */
+        function filterForStartupSeeds(entries, { includePaid = false } = {}) {
+            return entries.filter(entry => {
+                if (entry.category !== 'startup') return false;
+                return includePaid || !entry.isPaid;
+            });
+        }
+
+        /**
+         * Return entries for 目录提交:
+         * - category is 'directory'
          */
         function filterForDirectorySeeds(entries, { includePaid = false } = {}) {
             return entries.filter(entry => {
-                if (entry.category !== 'directory' && entry.category !== 'community') return false;
-                if (!includePaid && entry.isPaid) return false;
-                return true;
+                if (entry.category !== 'directory') return false;
+                return includePaid || !entry.isPaid;
             });
         }
 
         /**
-         * Return summary statistics for a set of parsed entries.
+         * Return entries for 博客提交:
+         * - category is 'blog'
+         */
+        function filterForBlogSeeds(entries) {
+            return entries.filter(entry => entry.category === 'blog' && !entry.isPaid);
+        }
+
+        /**
+         * Return entries for 账号养护:
+         * - category is 'community'
+         */
+        function filterForNurtureSeeds(entries) {
+            return entries.filter(entry => entry.category === 'community');
+        }
+
+        /**
+         * Return summary statistics grouped by UI workflow categories.
          */
         function getSeedStats(entries) {
+            let startups = 0;
             let directories = 0;
             let blogs = 0;
             let communities = 0;
+            let backlinks = 0;
             let paid = 0;
             let free = 0;
             let withDr = 0;
             let drSum = 0;
 
             for (const entry of entries) {
+                if (entry.category === 'startup')    startups++;
                 if (entry.category === 'directory')  directories++;
                 if (entry.category === 'blog')       blogs++;
                 if (entry.category === 'community')  communities++;
+                if (entry.category === 'backlink')   backlinks++;
                 if (entry.isPaid) paid++; else free++;
                 if (entry.dr != null) {
                     withDr++;
@@ -204,9 +284,11 @@ const SubmifySeedImporter = {
 
             return {
                 total:       entries.length,
+                startups,
                 directories,
                 blogs,
                 communities,
+                backlinks,
                 paid,
                 free,
                 withDr,
@@ -220,9 +302,13 @@ const SubmifySeedImporter = {
             parseSubmifyData,
             buildDomainIntelItems,
             buildResourceEntries,
-            filterForBlogCommentSeeds,
+            filterForBacklinkSeeds,
+            filterForStartupSeeds,
             filterForDirectorySeeds,
-            getSeedStats
+            filterForBlogSeeds,
+            filterForNurtureSeeds,
+            getSeedStats,
+            workflowForCategory
         };
     }
 };
