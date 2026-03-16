@@ -177,32 +177,72 @@ const SubmifySeedImporter = {
          * storage in the resource store.
          */
         function buildResourceEntries(entries) {
-            return entries.map(entry => ({
-                id:               `submify-${entry.submifyId}`,
-                url:              entry.url,
-                pageTitle:        entry.name,
-                opportunities:    opportunitiesForCategory(entry.category),
-                linkModes:        entry.category === 'backlink' ? ['website-field', 'plain-url'] : ['website-field'],
-                details:          [
-                    'submify-verified',
-                    `category:${entry.category}`,
-                    `dr:${entry.dr != null ? entry.dr : '?'}`,
-                    entry.tips
-                ].filter(Boolean),
-                sources:          ['submify'],
-                sourceTier:       'competitor-backlink',
-                sourceTiers:      ['competitor-backlink'],
-                discoveryEdges:   [buildDiscoveryEdge('competitor-backlink', 'submify-import', entry.url)],
-                resourceClass:    resourceClassForCategory(entry.category),
-                frictionLevel:    entry.isPaid ? 'high' : (entry.category === 'backlink' ? 'low' : 'medium'),
-                directPublishReady: entry.category === 'backlink' && !entry.isPaid,
-                status:           'pending',
-                submifySeed:      true,
-                submifyCategory:  entry.category,
-                submifyWorkflow:  workflowForCategory(entry.category),
-                submifyDr:        entry.dr,
-                submifyLanguage:  entry.language
-            }));
+            return entries.map(entry => {
+                // Only blog category goes into blog-comment workflow as main pool.
+                // 'backlink' (General/classified sites) and directories need agent-based
+                // submission, so they go to legacy pool until the agent workflow is ready.
+                const isBlogComment = entry.category === 'blog';
+                const isDirectoryLike = entry.category === 'backlink' || entry.category === 'startup' || entry.category === 'directory';
+                const isCommunity = entry.category === 'community';
+
+                let resourceClass, frictionLevel, directPublishReady, resourcePool, resourcePoolReason;
+
+                if (isBlogComment) {
+                    resourceClass = 'blog-comment';
+                    frictionLevel = entry.isPaid ? 'high' : 'low';
+                    directPublishReady = !entry.isPaid;
+                    resourcePool = entry.isPaid ? 'legacy' : 'main';
+                    resourcePoolReason = entry.isPaid ? 'submify_blog_paid' : 'submify_verified_blog';
+                } else if (isDirectoryLike) {
+                    resourceClass = 'profile';
+                    frictionLevel = 'medium';
+                    directPublishReady = false;
+                    resourcePool = 'legacy';
+                    resourcePoolReason = 'submify_directory_needs_agent';
+                } else if (isCommunity) {
+                    resourceClass = 'profile';
+                    frictionLevel = 'medium';
+                    directPublishReady = false;
+                    resourcePool = 'legacy';
+                    resourcePoolReason = 'submify_community_needs_nurture';
+                } else {
+                    resourceClass = 'profile';
+                    frictionLevel = 'medium';
+                    directPublishReady = false;
+                    resourcePool = 'legacy';
+                    resourcePoolReason = 'submify_other';
+                }
+
+                return {
+                    id:               `submify-${entry.submifyId}`,
+                    url:              entry.url,
+                    pageTitle:        entry.name,
+                    opportunities:    opportunitiesForCategory(entry.category),
+                    linkModes:        isBlogComment ? ['website-field'] : ['website-field'],
+                    details:          [
+                        'submify-verified',
+                        `category:${entry.category}`,
+                        `dr:${entry.dr != null ? entry.dr : '?'}`,
+                        entry.tips
+                    ].filter(Boolean).concat(isBlogComment ? ['inline-submit-form'] : []),
+                    sources:          ['submify'],
+                    sourceTier:       'competitor-backlink',
+                    sourceTiers:      ['competitor-backlink'],
+                    discoveryEdges:   [buildDiscoveryEdge('competitor-backlink', 'submify-import', entry.url)],
+                    resourceClass,
+                    frictionLevel,
+                    directPublishReady,
+                    hasUrlField:      isBlogComment,
+                    resourcePool,
+                    resourcePoolReason,
+                    status:           'pending',
+                    submifySeed:      true,
+                    submifyCategory:  entry.category,
+                    submifyWorkflow:  workflowForCategory(entry.category),
+                    submifyDr:        entry.dr,
+                    submifyLanguage:  entry.language
+                };
+            });
         }
 
         /**
