@@ -448,8 +448,8 @@ const PublishRuntime = {
             publishMeta.submissionBlockReason = verification?.submissionBlockReason || '';
             publishMeta.pageUrlAfterSubmit = verification?.pageUrl || '';
             if (publishMeta.reviewPending) {
-                status = 'pending';
-                await ctx.logger.publish('评论已提交，但站点提示仍在审核中，已改判为待确认', {
+                // 评论已提交成功，等待博主审核是正常的，保持 published 状态
+                await ctx.logger.publish('评论已提交成功，站点显示待审核（这是正常的）', {
                     url: ctx.getState().currentUrl,
                     policy: publishMeta.reviewPolicy || 'moderated'
                 });
