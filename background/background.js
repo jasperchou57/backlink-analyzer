@@ -429,31 +429,87 @@ async function handleTabRemoved(tabId) {
 
 function handleTabUpdated(tabId, changeInfo) {
     if (changeInfo.status !== 'complete') return;
-    // 优先检查 pendingSubmission（表单已提交，等待页面跳转完成）
+    // 检查 pendingSubmission（表单已提交，等待页面跳转完成）
     const pendingTaskId = findPublishSessionTaskIdByPendingTab(tabId);
     if (pendingTaskId) {
         finalizePendingSubmissionFromNavigation(pendingTaskId, tabId);
         return;
     }
-    // 其次检查 currentTabId — 表单提交后页面重新加载，content script 被销毁
-    // 此时 pendingSubmission 可能没来得及设置，但 URL 的 #comment-xxx 锚点说明提交成功了
+    // 检查 currentTabId — 表单提交后页面 POST redirect，content script 被销毁
     const currentTaskId = findPublishSessionTaskIdByCurrentTab(tabId);
     if (currentTaskId) {
         const session = getPublishSessionState(currentTaskId);
         if (session.isPublishing && !session.awaitingManualContinue) {
-            chrome.tabs.get(tabId).then((tab) => {
-                const url = tab?.url || '';
-                // URL 包含 #comment- 说明评论提交后跳转回来了
-                if (url.includes('#comment-') || url.includes('#respond') || url.includes('replytocom=')) {
-                    const activeResource = session.queue?.[session.currentIndex];
-                    if (activeResource) {
-                        handleCommentAction(activeResource.id, 'published', currentTaskId, {
-                            reportedVia: 'tab-navigation-detect',
-                            pageUrlAfterSubmit: url
-                        }, session.sessionId || '');
+            const activeResource = session.queue?.[session.currentIndex];
+            if (!activeResource) return;
+
+            // 注入验证脚本：检查评论是否真的出现在页面上
+            chrome.scripting.executeScript({
+                target: { tabId },
+                func: (commenterName, websiteUrl) => {
+                    // 滚到评论区底部
+                    const commentSection = document.querySelector('#comments, .comments-area, .comment-list, ol.commentlist');
+                    if (commentSection) {
+                        commentSection.scrollIntoView({ behavior: 'auto', block: 'end' });
+                    } else {
+                        window.scrollTo(0, document.body.scrollHeight);
                     }
+
+                    // 检查是否有我们的评论
+                    const allComments = document.querySelectorAll('.comment-body, li.comment, .comment-content, .comment');
+                    let found = false;
+                    let reviewPending = false;
+
+                    for (const c of allComments) {
+                        const text = (c.textContent || '').toLowerCase();
+                        const links = c.querySelectorAll('a[href]');
+                        for (const link of links) {
+                            if (websiteUrl && link.href.includes(websiteUrl.replace(/^https?:\/\//, '').replace(/\/$/, ''))) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (commenterName && text.includes(commenterName.toLowerCase())) {
+                            found = true;
+                        }
+                        if (found) break;
+                    }
+
+                    // 检查是否显示审核提示
+                    const pageText = document.body.textContent || '';
+                    if (/awaiting moderation|pending review|comment is awaiting|en attente de modération|pendiente de moderación|aguardando moderação/i.test(pageText)) {
+                        reviewPending = true;
+                        found = true; // 审核中也算提交成功
+                    }
+
+                    return { found, reviewPending, url: location.href, commentCount: allComments.length };
+                },
+                args: [
+                    session.currentTask?.name_commenter || '',
+                    session.currentTask?.website || ''
+                ]
+            }).then((results) => {
+                const verification = results?.[0]?.result;
+                if (verification) {
+                    handleCommentAction(activeResource.id, verification.found ? 'published' : 'failed', currentTaskId, {
+                        reportedVia: 'tab-navigation-verify',
+                        pageUrlAfterSubmit: verification.url,
+                        commentLocated: verification.found,
+                        reviewPending: verification.reviewPending,
+                        submissionBlocked: !verification.found
+                    }, session.sessionId || '');
                 }
-            }).catch(() => {});
+            }).catch(() => {
+                // 脚本注入失败，根据 URL 判断
+                chrome.tabs.get(tabId).then((tab) => {
+                    const url = tab?.url || '';
+                    const likelySuccess = url.includes('#comment-');
+                    handleCommentAction(activeResource.id, likelySuccess ? 'published' : 'failed', currentTaskId, {
+                        reportedVia: 'tab-navigation-fallback',
+                        pageUrlAfterSubmit: url
+                    }, session.sessionId || '');
+                }).catch(() => {});
+            });
         }
     }
 }
