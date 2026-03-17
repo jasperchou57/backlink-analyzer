@@ -429,9 +429,33 @@ async function handleTabRemoved(tabId) {
 
 function handleTabUpdated(tabId, changeInfo) {
     if (changeInfo.status !== 'complete') return;
-    const taskId = findPublishSessionTaskIdByPendingTab(tabId);
-    if (!taskId) return;
-    finalizePendingSubmissionFromNavigation(taskId, tabId);
+    // 优先检查 pendingSubmission（表单已提交，等待页面跳转完成）
+    const pendingTaskId = findPublishSessionTaskIdByPendingTab(tabId);
+    if (pendingTaskId) {
+        finalizePendingSubmissionFromNavigation(pendingTaskId, tabId);
+        return;
+    }
+    // 其次检查 currentTabId — 表单提交后页面重新加载，content script 被销毁
+    // 此时 pendingSubmission 可能没来得及设置，但 URL 的 #comment-xxx 锚点说明提交成功了
+    const currentTaskId = findPublishSessionTaskIdByCurrentTab(tabId);
+    if (currentTaskId) {
+        const session = getPublishSessionState(currentTaskId);
+        if (session.isPublishing && !session.awaitingManualContinue) {
+            chrome.tabs.get(tabId).then((tab) => {
+                const url = tab?.url || '';
+                // URL 包含 #comment- 说明评论提交后跳转回来了
+                if (url.includes('#comment-') || url.includes('#respond') || url.includes('replytocom=')) {
+                    const activeResource = session.queue?.[session.currentIndex];
+                    if (activeResource) {
+                        handleCommentAction(activeResource.id, 'published', currentTaskId, {
+                            reportedVia: 'tab-navigation-detect',
+                            pageUrlAfterSubmit: url
+                        }, session.sessionId || '');
+                    }
+                }
+            }).catch(() => {});
+        }
+    }
 }
 
 chrome.alarms.onAlarm.addListener(handleAlarmEvent);
