@@ -142,8 +142,10 @@
             if (incomingRunKey === activeRunKey) {
                 return;
             }
+            // Tab 复用时上一轮可能没正常结束，强制重置
             cancelCurrentPublish();
-            await wait(120);
+            fillCommentInProgress = false;
+            await wait(300);
         }
 
         fillCommentInProgress = true;
