@@ -914,6 +914,35 @@ function getContinuousMyDomain() {
     return getDomainBg(continuousDiscoveryState.myDomain || '');
 }
 
+// ─── 网络信号处理：来自 network-inspector-bridge.js ───
+let latestNetworkSignals = new Map(); // tabId → signal
+
+function handleNetworkSignal(signal) {
+    if (!signal || !signal.type) return;
+    // 存储最新信号，供 publish verification 时参考
+    const key = signal.url || 'unknown';
+    latestNetworkSignals.set(key, signal);
+    // 清理旧信号（保留最近 50 条）
+    if (latestNetworkSignals.size > 50) {
+        const oldest = latestNetworkSignals.keys().next().value;
+        latestNetworkSignals.delete(oldest);
+    }
+
+    // 如果检测到 moderation 信号，记录日志
+    if (signal.type === 'moderation') {
+        Logger.info('网络层检测到评论进入审核队列', { url: signal.url, source: signal.source });
+    } else if (signal.type === 'rejected') {
+        Logger.warn('网络层检测到评论被拒绝', { url: signal.url, source: signal.source });
+    } else if (signal.type === 'confirmed') {
+        Logger.info('网络层确认评论提交成功', { url: signal.url, source: signal.source });
+    }
+}
+
+function getLatestNetworkSignal(url) {
+    if (!url) return null;
+    return latestNetworkSignals.get(url) || null;
+}
+
 async function handleCommentSubmittingMessage(msg = {}, sender = {}) {
     await ensurePublishSessionsLoaded();
     const taskId = msg.taskId || findPublishSessionTaskIdByCurrentTab(sender.tab?.id) || '';
@@ -1006,6 +1035,7 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
         openFloatingPanel: () => openPanelWindow(),
         backlinkData: (msg) => handleBacklinkData(msg.source, msg.urls, msg.items || []),
         commentAction: (msg) => handleCommentAction(msg.resourceId, msg.result, msg.taskId, msg.meta || {}, msg.sessionId || ''),
+        networkSignal: (msg) => handleNetworkSignal(msg.signal),
         commentSubmitting: (msg, sender) => handleCommentSubmittingMessage(msg, sender),
         commentProgress: (msg, sender) => handleCommentProgressMessage(msg, sender),
         republish: (msg) => republishResource(msg.resourceId, msg.taskId)

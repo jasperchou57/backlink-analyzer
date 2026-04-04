@@ -1,0 +1,14 @@
+{
+  "name": "backlink-analyzer-server",
+  "version": "1.0.0",
+  "description": "Backlink Analyzer 本地数据服务",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "express": "^4.21.0",
+    "cors": "^2.8.5"
+  }
+}

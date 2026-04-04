@@ -1,6 +1,59 @@
 (function (globalScope) {
     if (globalScope.CommentFormDetection) return;
 
+    // ─── 多语言表单字段关键词（30+ 语言覆盖）───
+    const ML_KEYWORDS = {
+        author: [
+            'author', 'name', 'nickname', 'user', 'username', 'login',
+            '姓名', '名字', '昵称', '用户名', '稱呼', '署名',
+            '名前', 'お名前', 'ニックネーム', '성함', '닉네임', '이름',
+            'имя', 'ник', 'автор', 'الاسم', 'اسم المستخدم',
+            'nombre', 'apodo', 'usuario', 'nom', 'pseudo', 'auteur',
+            'vorname', 'nachname', 'benutzer', 'naam', 'gebruikersnaam',
+            'isim', 'ad', 'kullanıcı', 'imię', 'nazwisko', 'użytkownik',
+            'tên', 'biệt danh', 'nome', 'utente', 'namn', 'användarnamn',
+            'नाम', 'ชื่อ', 'نام', 'שם', 'όνομα', 'nume', 'név', 'jméno', 'navn', 'nimi'
+        ],
+        email: [
+            'email', 'mail', 'e-mail', 'address', 'mailbox',
+            '邮箱', '邮件', '电子邮箱', 'メール', 'メールアドレス',
+            '이메일', '메일', 'электронная почта', 'почта',
+            'البريد الإلكتروني', 'correo', 'courriel', 'e-posta',
+            'emailadres', 'e-mail', 'thư điện tử', 'posta elettronica',
+            'ईमेल', 'อีเมล', 'ایمیل', 'דוא"ל', 'email'
+        ],
+        url: [
+            'url', 'website', 'site', 'web', 'link', 'homepage', 'blog',
+            '网址', '网站', '主页', 'ウェブサイト', 'ホームページ',
+            '웹사이트', '홈페이지', 'веб-сайт', 'сайт',
+            'الموقع', 'sitio web', 'site web', 'webseite',
+            'web sitesi', 'strona internetowa', 'trang web',
+            'sito web', 'webbplats', 'वेबसाइट', 'เว็บไซต์',
+            'وب‌سایت', 'אתר', 'ιστότοπος', 'weboldal'
+        ],
+        comment: [
+            'comment', 'message', 'text', 'content', 'reply', 'feedback', 'respond',
+            '评论', '留言', '内容', '回复', 'コメント', 'メッセージ',
+            '댓글', '메시지', '답글', 'комментарий', 'сообщение', 'отзыв',
+            'تعليق', 'رسالة', 'comentario', 'mensaje', 'commentaire',
+            'kommentar', 'nachricht', 'reactie', 'bericht',
+            'yorum', 'mesaj', 'komentarz', 'bình luận',
+            'commento', 'messaggio', 'kommentar', 'meddelande',
+            'टिप्पणी', 'ความคิดเห็น', 'نظر', 'תגובה', 'σχόλιο',
+            'comentariu', 'hozzászólás', 'komentář'
+        ],
+        submit: [
+            'post', 'submit', 'publish', 'send', 'comment', 'add', 'save',
+            '发布', '提交', '发表', '回复', '发送', '投稿', '送信', 'コメントを書く',
+            '게시', '등록', '댓글 달기', 'отправить', 'опубликовать',
+            'إرسال', 'نشر', 'publicar', 'enviar', 'publier', 'envoyer',
+            'absenden', 'veröffentlichen', 'plaatsen', 'verzenden',
+            'gönder', 'yayınla', 'dodaj', 'wyślij', 'gửi', 'đăng',
+            'pubblica', 'invia', 'skicka', 'publicera',
+            'जमा करें', 'ส่ง', 'ارسال', 'שלח', 'υποβολή', 'trimite', 'küldés', 'odeslat'
+        ]
+    };
+
     function compactText(value) {
         return String(value || '').replace(/\s+/g, ' ').trim();
     }
@@ -99,6 +152,17 @@
         ].join(' ')).toLowerCase();
     }
 
+    /**
+     * 多语言关键词匹配：检查表单元素的属性/文本是否命中关键词
+     */
+    function matchesMultiLangKeywords(el, category) {
+        if (!el || !ML_KEYWORDS[category]) return false;
+        const attrs = compactText(
+            `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute?.('aria-label') || ''} ${el.className || ''}`
+        ).toLowerCase();
+        return ML_KEYWORDS[category].some(kw => attrs.includes(kw.toLowerCase()));
+    }
+
     function scoreCommentForm(form) {
         if (!form) return -Infinity;
 
@@ -123,6 +187,32 @@
         if (form.querySelector('input[name="email"], input#email, input[type="email"], input[name*="mail" i]')) score += 12;
         if (form.querySelector('input[name="url"], input#url, input[name="website"], input[type="url"], input[name*="web" i]')) score += 8;
         if (findBasicSubmitButton(form)) score += 10;
+
+        // ─── 多语言关键词加分 ───
+        const textareas = form.querySelectorAll('textarea');
+        for (const ta of textareas) {
+            if (matchesMultiLangKeywords(ta, 'comment')) { score += 15; break; }
+        }
+        const inputs = form.querySelectorAll('input[type="text"], input:not([type]), input[type="email"], input[type="url"]');
+        for (const inp of inputs) {
+            if (matchesMultiLangKeywords(inp, 'author')) { score += 8; break; }
+        }
+        for (const inp of inputs) {
+            if (matchesMultiLangKeywords(inp, 'email')) { score += 8; break; }
+        }
+        for (const inp of inputs) {
+            if (matchesMultiLangKeywords(inp, 'url')) { score += 6; break; }
+        }
+        // 多语言提交按钮检测
+        const buttons = form.querySelectorAll('button, input[type="submit"], input[type="button"]');
+        for (const btn of buttons) {
+            const btnText = compactText(`${btn.textContent || ''} ${btn.value || ''}`).toLowerCase();
+            if (ML_KEYWORDS.submit.some(kw => btnText.includes(kw.toLowerCase()))) { score += 8; break; }
+        }
+        // 社交证据：页面已有评论列表
+        const root = form.ownerDocument || globalScope.document;
+        const existingComments = root.querySelectorAll('.comment-list > *, .comment-body, li.comment, ol.commentlist > li');
+        if (existingComments.length > 0) score += 15;
 
         return score;
     }
@@ -160,6 +250,8 @@
         root.querySelectorAll('textarea').forEach((textarea) => {
             const nameAttr = compactText(textarea.name || textarea.id || '').toLowerCase();
             const placeholder = compactText(textarea.placeholder || '').toLowerCase();
+            const combined = `${nameAttr} ${placeholder}`;
+            // 原有匹配 + 多语言关键词匹配
             if (
                 nameAttr.includes('comment')
                 || nameAttr.includes('message')
@@ -170,6 +262,7 @@
                 || placeholder.includes('write')
                 || placeholder.includes('评论')
                 || placeholder.includes('留言')
+                || ML_KEYWORDS.comment.some(kw => combined.includes(kw.toLowerCase()))
             ) {
                 addCandidate(textarea.closest('form'), 20);
             }

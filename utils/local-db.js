@@ -1,7 +1,6 @@
 (function (globalScope) {
-    const DB_NAME = 'backlink-analyzer-local';
-    const DB_VERSION = 2;
-    const STORE_KV = 'kv';
+    const API_BASE = 'http://127.0.0.1:21891/api';
+
     const KEY_RESOURCES = 'resources';
     const KEY_DOMAIN_INTEL = 'domain-intel';
     const KEY_PUBLISH_TASKS = 'publish-tasks';
@@ -14,83 +13,79 @@
     const KEY_SITE_TEMPLATES = 'site-templates';
     const KEY_PUBLISH_ATTEMPTS = 'publish-attempts';
 
-    let dbPromise = null;
+    // ─── 内部 HTTP 工具 ───
 
-    function getIndexedDb() {
-        if (typeof indexedDB === 'undefined') {
-            throw new Error('IndexedDB is not available in this context');
+    async function apiGet(path) {
+        try {
+            const resp = await fetch(`${API_BASE}${path}`);
+            return await resp.json();
+        } catch (e) {
+            console.error(`[LocalDB] GET ${path} failed:`, e.message);
+            return null;
         }
-        return indexedDB;
     }
 
-    function requestToPromise(request) {
-        return new Promise((resolve, reject) => {
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error || new Error('IndexedDB request failed'));
-        });
+    async function apiPut(path, body) {
+        try {
+            const resp = await fetch(`${API_BASE}${path}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            return await resp.json();
+        } catch (e) {
+            console.error(`[LocalDB] PUT ${path} failed:`, e.message);
+            return null;
+        }
     }
 
-    function openDb() {
-        if (dbPromise) return dbPromise;
-
-        dbPromise = new Promise((resolve, reject) => {
-            const request = getIndexedDb().open(DB_NAME, DB_VERSION);
-            request.onupgradeneeded = () => {
-                const db = request.result;
-                if (!db.objectStoreNames.contains(STORE_KV)) {
-                    db.createObjectStore(STORE_KV, { keyPath: 'key' });
-                }
-            };
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error || new Error('Failed to open IndexedDB'));
-        });
-
-        return dbPromise;
+    async function apiDelete(path) {
+        try {
+            const resp = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
+            return await resp.json();
+        } catch (e) {
+            console.error(`[LocalDB] DELETE ${path} failed:`, e.message);
+            return null;
+        }
     }
+
+    async function apiPost(path, body) {
+        try {
+            const resp = await fetch(`${API_BASE}${path}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            return await resp.json();
+        } catch (e) {
+            console.error(`[LocalDB] POST ${path} failed:`, e.message);
+            return null;
+        }
+    }
+
+    // ─── 通用 KV 操作 ───
 
     async function getValue(key, fallbackValue) {
-        const db = await openDb();
-        const tx = db.transaction(STORE_KV, 'readonly');
-        const store = tx.objectStore(STORE_KV);
-        const result = await requestToPromise(store.get(key));
-        return result?.value !== undefined ? result.value : fallbackValue;
+        const result = await apiGet(`/kv/${encodeURIComponent(key)}`);
+        if (result && result.value !== null && result.value !== undefined) {
+            return result.value;
+        }
+        return fallbackValue;
     }
 
     async function setValue(key, value) {
-        const db = await openDb();
-        const tx = db.transaction(STORE_KV, 'readwrite');
-        const store = tx.objectStore(STORE_KV);
-        await requestToPromise(store.put({ key, value, updatedAt: new Date().toISOString() }));
-        await new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
-            tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
-        });
+        await apiPut(`/kv/${encodeURIComponent(key)}`, { value });
     }
 
     async function deleteValue(key) {
-        const db = await openDb();
-        const tx = db.transaction(STORE_KV, 'readwrite');
-        const store = tx.objectStore(STORE_KV);
-        await requestToPromise(store.delete(key));
-        await new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
-            tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
-        });
+        await apiDelete(`/kv/${encodeURIComponent(key)}`);
     }
 
     async function clearAll() {
-        const db = await openDb();
-        const tx = db.transaction(STORE_KV, 'readwrite');
-        const store = tx.objectStore(STORE_KV);
-        await requestToPromise(store.clear());
-        await new Promise((resolve, reject) => {
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
-            tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
-        });
+        await apiPost('/kv/clear', {});
     }
+
+    // ─── 业务接口（与原 IndexedDB 版完全一致）───
 
     async function getResources() {
         const value = await getValue(KEY_RESOURCES, []);
@@ -217,147 +212,74 @@
     }
 
     async function migrateFromChromeStorage(options = {}) {
+        // 迁移逻辑：从 chrome.storage.local 读取旧数据写入本地 SQLite
         if (!globalScope.chrome?.storage?.local) return;
 
         const { clearLegacy = false } = options;
+
+        // 检查是否已迁移
+        const migrationFlag = await getValue('_chrome_storage_migrated', false);
+        if (migrationFlag) return;
+
         const legacy = await globalScope.chrome.storage.local.get([
-            'resources',
-            'domainFrontier',
-            'domainProfiles',
-            'publishTasks',
-            'publishSessions',
-            'publishState',
-            'logs',
-            'settings',
-            'collectState',
-            'collectStats',
-            'domainPublishPolicies',
-            'aiUsageStats',
-            'siteTemplates',
-            'publishAttempts'
+            'resources', 'domainFrontier', 'domainProfiles',
+            'publishTasks', 'publishSessions', 'publishState',
+            'logs', 'settings', 'collectState', 'collectStats',
+            'domainPublishPolicies', 'aiUsageStats', 'siteTemplates', 'publishAttempts'
         ]);
+
         const legacyResources = Array.isArray(legacy.resources) ? legacy.resources : [];
         const legacyFrontier = Array.isArray(legacy.domainFrontier) ? legacy.domainFrontier : [];
         const legacyProfiles = legacy.domainProfiles && typeof legacy.domainProfiles === 'object' ? legacy.domainProfiles : {};
         const legacyTasks = Array.isArray(legacy.publishTasks) ? legacy.publishTasks : [];
-        const legacySessions = legacy.publishSessions && typeof legacy.publishSessions === 'object'
-            ? legacy.publishSessions
-            : {};
+        const legacySessions = legacy.publishSessions && typeof legacy.publishSessions === 'object' ? legacy.publishSessions : {};
         const legacyLogs = Array.isArray(legacy.logs) ? legacy.logs : [];
         const legacySettings = legacy.settings && typeof legacy.settings === 'object' ? legacy.settings : {};
         const legacyCollectState = legacy.collectState && typeof legacy.collectState === 'object' ? legacy.collectState : null;
         const legacyCollectStats = legacy.collectStats && typeof legacy.collectStats === 'object' ? legacy.collectStats : null;
-        const legacyDomainPublishPolicies = legacy.domainPublishPolicies && typeof legacy.domainPublishPolicies === 'object'
-            ? legacy.domainPublishPolicies
-            : {};
-        const legacyAIUsageStats = legacy.aiUsageStats && typeof legacy.aiUsageStats === 'object' ? legacy.aiUsageStats : null;
-        const legacySiteTemplates = legacy.siteTemplates && typeof legacy.siteTemplates === 'object' ? legacy.siteTemplates : {};
-        const legacyPublishAttempts = Array.isArray(legacy.publishAttempts) ? legacy.publishAttempts : [];
+        const legacyPolicies = legacy.domainPublishPolicies && typeof legacy.domainPublishPolicies === 'object' ? legacy.domainPublishPolicies : {};
+        const legacyAIStats = legacy.aiUsageStats && typeof legacy.aiUsageStats === 'object' ? legacy.aiUsageStats : null;
+        const legacyTemplates = legacy.siteTemplates && typeof legacy.siteTemplates === 'object' ? legacy.siteTemplates : {};
+        const legacyAttempts = Array.isArray(legacy.publishAttempts) ? legacy.publishAttempts : [];
 
-        const currentResources = await getResources();
-        if (legacyResources.length > currentResources.length) {
-            await setResources(legacyResources);
+        // 批量写入
+        const entries = {};
+        if (legacyResources.length > 0) entries[KEY_RESOURCES] = legacyResources;
+        if (legacyFrontier.length > 0 || Object.keys(legacyProfiles).length > 0) {
+            entries[KEY_DOMAIN_INTEL] = { frontier: legacyFrontier, profiles: legacyProfiles };
         }
+        if (legacyTasks.length > 0) entries[KEY_PUBLISH_TASKS] = legacyTasks;
+        if (Object.keys(legacySessions).length > 0) entries[KEY_PUBLISH_SESSIONS] = legacySessions;
+        if (legacyLogs.length > 0) entries[KEY_LOGS] = legacyLogs;
+        if (Object.keys(legacySettings).length > 0) entries[KEY_SETTINGS] = legacySettings;
+        if (legacyCollectState || legacyCollectStats) {
+            entries[KEY_COLLECT_SNAPSHOT] = { collectState: legacyCollectState, collectStats: legacyCollectStats };
+        }
+        if (Object.keys(legacyPolicies).length > 0) entries[KEY_DOMAIN_PUBLISH_POLICIES] = legacyPolicies;
+        if (legacyAIStats) entries[KEY_AI_USAGE_STATS] = legacyAIStats;
+        if (Object.keys(legacyTemplates).length > 0) entries[KEY_SITE_TEMPLATES] = legacyTemplates;
+        if (legacyAttempts.length > 0) entries[KEY_PUBLISH_ATTEMPTS] = legacyAttempts;
 
-        const currentDomainIntel = await loadDomainIntel();
-        const currentProfileCount = Object.keys(currentDomainIntel.profiles || {}).length;
-        const legacyProfileCount = Object.keys(legacyProfiles || {}).length;
-        if (
-            legacyFrontier.length > (currentDomainIntel.frontier || []).length
-            || legacyProfileCount > currentProfileCount
-        ) {
-            await saveDomainIntel(legacyFrontier, legacyProfiles);
-        }
-
-        const currentTasks = await getPublishTasks();
-        if (legacyTasks.length > currentTasks.length) {
-            await setPublishTasks(legacyTasks);
-        }
-
-        const currentSessions = await getPublishSessions();
-        const currentSessionCount = Object.keys(currentSessions || {}).length;
-        let mergedLegacySessions = legacySessions;
-        const legacyPublishState = legacy.publishState && typeof legacy.publishState === 'object'
-            ? legacy.publishState
-            : null;
-        if (
-            legacyPublishState?.currentTask?.id
-            && !Object.prototype.hasOwnProperty.call(mergedLegacySessions, legacyPublishState.currentTask.id)
-        ) {
-            mergedLegacySessions = {
-                ...mergedLegacySessions,
-                [legacyPublishState.currentTask.id]: legacyPublishState
-            };
-        }
-        if (Object.keys(mergedLegacySessions).length > currentSessionCount) {
-            await setPublishSessions(mergedLegacySessions);
+        if (Object.keys(entries).length > 0) {
+            await apiPost('/kv/batch-set', { entries });
+            console.log(`[LocalDB] 迁移完成: ${Object.keys(entries).length} 项数据已写入本地数据库`);
         }
 
-        const currentLogs = await getLogs();
-        if (legacyLogs.length > currentLogs.length) {
-            await setLogs(legacyLogs);
-        }
-
-        const currentSettings = await getSettings();
-        if (Object.keys(legacySettings).length > Object.keys(currentSettings || {}).length) {
-            await setSettings(legacySettings);
-        }
-
-        const currentCollectSnapshot = await getCollectSnapshot();
-        const currentCollectStateKeys = Object.keys(currentCollectSnapshot.collectState || {}).length;
-        const currentCollectStatsKeys = Object.keys(currentCollectSnapshot.collectStats || {}).length;
-        if (
-            Object.keys(legacyCollectState || {}).length > currentCollectStateKeys
-            || Object.keys(legacyCollectStats || {}).length > currentCollectStatsKeys
-        ) {
-            await setCollectSnapshot(legacyCollectState, legacyCollectStats);
-        }
-
-        const currentPolicies = await getDomainPublishPolicies();
-        if (Object.keys(legacyDomainPublishPolicies).length > Object.keys(currentPolicies || {}).length) {
-            await setDomainPublishPolicies(legacyDomainPublishPolicies);
-        }
-
-        const currentAIUsageStats = await getAIUsageStats();
-        if (
-            legacyAIUsageStats
-            && Object.keys(legacyAIUsageStats).length > Object.keys(currentAIUsageStats || {}).length
-        ) {
-            await setAIUsageStats(legacyAIUsageStats);
-        }
-
-        const currentSiteTemplates = await getSiteTemplates();
-        if (Object.keys(legacySiteTemplates).length > Object.keys(currentSiteTemplates || {}).length) {
-            await setSiteTemplates(legacySiteTemplates);
-        }
-
-        const currentPublishAttempts = await getPublishAttempts();
-        if (legacyPublishAttempts.length > currentPublishAttempts.length) {
-            await setPublishAttempts(legacyPublishAttempts);
-        }
+        // 标记已迁移
+        await setValue('_chrome_storage_migrated', true);
 
         if (clearLegacy) {
             await globalScope.chrome.storage.local.remove([
-                'resources',
-                'domainFrontier',
-                'domainProfiles',
-                'publishTasks',
-                'publishSessions',
-                'publishState',
-                'logs',
-                'settings',
-                'collectState',
-                'collectStats',
-                'domainPublishPolicies',
-                'aiUsageStats',
-                'siteTemplates',
-                'publishAttempts'
+                'resources', 'domainFrontier', 'domainProfiles',
+                'publishTasks', 'publishSessions', 'publishState',
+                'logs', 'settings', 'collectState', 'collectStats',
+                'domainPublishPolicies', 'aiUsageStats', 'siteTemplates', 'publishAttempts'
             ]);
         }
     }
 
     const LocalDB = {
-        open: openDb,
+        open: () => Promise.resolve(), // 兼容原有调用
         getValue,
         setValue,
         deleteValue,
