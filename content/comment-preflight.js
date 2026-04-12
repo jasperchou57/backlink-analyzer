@@ -60,12 +60,23 @@
         selectors.forEach((selector) => {
             globalScope.document.querySelectorAll(selector).forEach((el) => {
                 if (!(el instanceof HTMLElement)) return;
+
+                // 严格门槛：必须真有可写入的输入控件，否则只是装饰性的"comment"小工具
+                // （比如 Recent Comments 侧栏 widget），它会骗过文字关键字打分。
+                const hasRealInput = !!el.querySelector(
+                    'textarea, [contenteditable="true"], .ql-editor, .ProseMirror, .mce-content-body'
+                );
+                const isStrictFormElement = el.matches?.(
+                    'textarea[name="comment"], textarea#comment, form[action*="comment" i], form[action*="wp-comments-post" i]'
+                );
+                if (!hasRealInput && !isStrictFormElement) return;
+
                 const text = compactText(el.textContent || '').toLowerCase();
                 const score =
                     (isVisible(el) ? 20 : 0)
                     + (/comment|reply|leave a comment|leave a reply|reactie|laat een reactie|发表评论|留言|评论/.test(text) ? 30 : 0)
-                    + (el.querySelector('textarea, [contenteditable="true"], .ql-editor, .ProseMirror') ? 40 : 0)
-                    + (el.matches?.('textarea[name="comment"], textarea#comment, form[action*="comment" i], form[action*="wp-comments-post" i]') ? 28 : 0)
+                    + (hasRealInput ? 40 : 0)
+                    + (isStrictFormElement ? 28 : 0)
                     + (el.querySelector('button[type="submit"], input[type="submit"], button, input[type="button"]') ? 10 : 0);
                 candidates.push({ el, score });
             });
@@ -75,20 +86,8 @@
         return candidates.find((item) => item.score >= 35)?.el || null;
     }
 
-    async function primeCommentSectionSearch(context = {}, options = {}) {
-        const commentTarget = findLikelyCommentSection();
+    async function doProgressiveBottomScroll(context = {}, options = {}) {
         const immediate = options.immediate !== false;
-        if (commentTarget) {
-            try {
-                commentTarget.scrollIntoView({ behavior: immediate ? 'auto' : 'smooth', block: 'center' });
-            } catch {}
-            context.commentSectionPrimed = true;
-            // 等评论区加载（懒加载博客需要更多时间）
-            await wait(immediate ? 300 : 600);
-            return true;
-        }
-
-        // 评论区通常在页面最底部，需要先滚到底部触发懒加载
         const body = globalScope.document.body;
         const doc = globalScope.document.documentElement;
         const viewportHeight = Math.max(globalScope.innerHeight || 0, 600);
@@ -123,9 +122,31 @@
         } catch {
             globalScope.scrollTo(0, targetY);
         }
-        // 每步等待更长，让懒加载内容有时间渲染
-        await wait(immediate ? 400 : 800);
+        // 越靠近底部，等待越长（懒加载评论组件常需 1-2 秒渲染）
+        const baseWait = immediate ? 400 : 800;
+        const lazyExtra = ratio >= 0.85 ? 700 : 0;
+        await wait(baseWait + lazyExtra);
         return true;
+    }
+
+    async function primeCommentSectionSearch(context = {}, options = {}) {
+        const immediate = options.immediate !== false;
+
+        // 第一步：找一个"真正像样"的评论区目标（带 textarea/可编辑区或严格 form）
+        // 找到了就 scrollIntoView 过去
+        const commentTarget = findLikelyCommentSection();
+        if (commentTarget && !context.commentSectionPrimed) {
+            try {
+                commentTarget.scrollIntoView({ behavior: immediate ? 'auto' : 'smooth', block: 'center' });
+            } catch {}
+            context.commentSectionPrimed = true;
+            await wait(immediate ? 300 : 600);
+            return true;
+        }
+
+        // 第二步：没找到真目标 OR 已经 prime 过但还没找到表单 → 强制渐进滚动到底
+        // 触发底部懒加载的评论组件
+        return await doProgressiveBottomScroll(context, options);
     }
 
     function getCommentAuthorText(node) {
