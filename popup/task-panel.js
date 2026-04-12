@@ -447,12 +447,15 @@
             return isToday ? '今天 17:00' : '明天 17:00';
         }
 
+        function isAnchorLimitTask(task) {
+            return task?.commentStyle === 'anchor-html' || task?.commentStyle === 'anchor-prefer';
+        }
+
         function getTaskDailyCount(task) {
             const periodStart = getDailyPeriodStart();
             const isCurrentPeriod = Number(task?.dailyPeriodStart || 0) === periodStart;
             if (!isCurrentPeriod) return 0;
-            const isAnchorLimit = task?.commentStyle === 'anchor-html';
-            return isAnchorLimit
+            return isAnchorLimitTask(task)
                 ? Number(task?.dailyAnchorSuccessCount || 0)
                 : Number(task?.dailyPublishedCount || 0);
         }
@@ -461,7 +464,7 @@
             if (Number(task?.maxPublishes) <= 0) return '不限量';
             const dailyCount = getTaskDailyCount(task);
             const resetLabel = getNextDailyResetLabel();
-            return task?.commentStyle === 'anchor-html'
+            return isAnchorLimitTask(task)
                 ? `每日锚文本 ${dailyCount}/${task.maxPublishes} · 重置 ${resetLabel}`
                 : `每日发布 ${dailyCount}/${task.maxPublishes} · 重置 ${resetLabel}`;
         }

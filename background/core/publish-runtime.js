@@ -25,7 +25,8 @@ const PublishRuntime = {
     },
 
     getPublishLimitMetric(task, state = {}) {
-        const isAnchorLimit = task?.commentStyle === 'anchor-html';
+        // 锚文本相关模式（严格 anchor-html 或 优先 anchor-prefer）都按 anchor success 计数
+        const isAnchorLimit = task?.commentStyle === 'anchor-html' || task?.commentStyle === 'anchor-prefer';
         return {
             isAnchorLimit,
             count: isAnchorLimit
@@ -158,7 +159,7 @@ const PublishRuntime = {
             ? Number(previousState.sessionAnchorSuccessCount || 0)
             : 0;
 
-        const isAnchorLimit = task?.commentStyle === 'anchor-html';
+        const isAnchorLimit = task?.commentStyle === 'anchor-html' || task?.commentStyle === 'anchor-prefer';
         const dailyLimitCount = ctx.getTaskDailyLimitCount(task);
 
         if (
@@ -633,9 +634,11 @@ const PublishRuntime = {
         }
 
         if (Number(ctx.getState().targetLimitCount || 0) > 0) {
+            const sessionTaskStyle = ctx.getState().currentTask?.commentStyle || '';
+            const sessionIsAnchorLimit = sessionTaskStyle === 'anchor-html' || sessionTaskStyle === 'anchor-prefer';
             ctx.updateState({
                 currentLimitCount: dailyLimitCount,
-                limitType: (ctx.getState().currentTask?.commentStyle === 'anchor-html') ? 'anchor-success' : 'published',
+                limitType: sessionIsAnchorLimit ? 'anchor-success' : 'published',
                 sessionPublishedCount,
                 sessionAnchorSuccessCount
             });
