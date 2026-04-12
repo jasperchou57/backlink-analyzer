@@ -18,6 +18,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const homePanel = document.getElementById('panel-home');
     const tabNav = document.getElementById('tab-nav');
+
+    // 首页卡片是纯 HTML 内容，不依赖任何后台数据，立即显示
+    // 避免等待 6+ 次 sendMessage 串行 round-trip 才看到内容
+    homePanel?.classList.add('active');
+    tabNav?.classList.add('hidden');
     const btnHome = document.getElementById('btn-home');
     const btnEnterBacklink = document.getElementById('btn-enter-backlink');
     const btnEnterMarketing = document.getElementById('btn-enter-marketing');
@@ -612,28 +617,41 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     // === 初始化数据 ===
-    try {
-        const resp = await chrome.runtime.sendMessage({ action: 'getStats' });
-        if (resp && resp.stats) {
-            updateStats(resp.stats);
-        }
-    } catch { }
+    // 首页已经显示，下面这些数据加载不再阻塞用户交互。
+    // 全部并行触发，不阻塞 UI；getDomainIntel / refreshMarketingWorkspace 等
+    // 当前不在的 tab 不需要立刻加载，留给切 tab 时再补。
 
-    const collectState = await StorageHelper.getCollectState();
-    if (collectState.isCollecting || collectState.domain || collectState.myDomain) {
-        document.getElementById('domain-input').value = collectState.domain || '';
-        document.getElementById('my-domain-input').value = collectState.myDomain || '';
-    }
-    await refreshContinuousDiscoveryState();
+    // 同步操作先跑（不需要 await）
+    taskPanel.updatePublishWorkspaceView();
     taskPanel.refreshWorkflowLibrary();
     refreshPublishStats();
-    await refreshDomainIntel();
-    await taskPanel.refreshPublishState();
-    await marketingPanel.refreshMarketingAutomationState();
-    taskPanel.refreshTasks();
-    await marketingPanel.refreshMarketingWorkspace();
-    await switchWorkspace('home');
     resourcePanel?.ensureListObserver();
+
+    // 异步操作并行触发，谁先回来谁先渲染
+    Promise.allSettled([
+        chrome.runtime.sendMessage({ action: 'getStats' }).then((resp) => {
+            if (resp?.stats) updateStats(resp.stats);
+        }),
+        StorageHelper.getCollectState().then((collectState) => {
+            if (collectState.isCollecting || collectState.domain || collectState.myDomain) {
+                const domainInput = document.getElementById('domain-input');
+                const myDomainInput = document.getElementById('my-domain-input');
+                if (domainInput) domainInput.value = collectState.domain || '';
+                if (myDomainInput) myDomainInput.value = collectState.myDomain || '';
+            }
+        }),
+        refreshContinuousDiscoveryState(),
+        taskPanel.refreshPublishState(),
+        marketingPanel.refreshMarketingAutomationState(),
+        Promise.resolve().then(() => taskPanel.refreshTasks())
+    ]).catch(() => {});
+
+    // 重数据延迟到下一个 idle / 切 tab 时再加载，不阻塞首屏
+    // refreshDomainIntel 数据量大，refreshMarketingWorkspace 不在主页用
+    setTimeout(() => {
+        refreshDomainIntel().catch(() => {});
+        marketingPanel.refreshMarketingWorkspace().catch(() => {});
+    }, 200);
 
     // === 定时轮询最新状态（每 2 秒） ===
     setInterval(async () => {
