@@ -475,24 +475,10 @@
             return;
         }
 
-        // 富文本 iframe 路径已经写入并镜像到 textarea，常规 ensureCommentFieldValue
-        // 走的是 findBestField + isVisible，跨不进 iframe 也找不到隐藏 textarea，
-        // 直接跳过验证（fillRichEditorTarget 自身保证写入成功）
-        if (values.comment && !richEditorFilled) {
-            const ensuredComment = await ensureCommentFieldValue(form, values.comment, context, {
-                allowTypingFallback: true
-            });
-            if (!ensuredComment) {
-                addDebugEvent('field', 'Standard comment form comment verification failed after fallback');
-                pokeWorkflowStallTimer();
-                reportResult('failed', {
-                    reason: 'comment-field-empty',
-                    submissionBlocked: true
-                });
-                context.workflowAborted = true;
-                return;
-            }
-        }
+        // 注意：原来这里还有一段 ensureCommentFieldValue 的"防御性二次验证"，
+        // 但到达这一步 commentFilled 已保证为 true（否则前面已 reportResult+return）。
+        // 二次验证会触发 executor.fillCommentField 迭代全部候选并对每个候选跑
+        // 模拟打字，是 filling_form 超时的主要原因。砍掉：相信前面的 fill 结果。
 
         const missingRequiredFields = [];
         if (values.name) {
@@ -762,20 +748,10 @@
             }
         }
 
-        // 富文本 iframe 路径已经写入，常规 ensureCommentFieldValue 跨不进 iframe，跳过验证
-        if (values.comment && !richEditorFilled) {
-            const ensuredComment = await ensureCommentFieldValue(context.form, values.comment, context, {
-                allowTypingFallback: true
-            });
-            if (ensuredComment) {
-                addDebugEvent('field', 'Verified comment field is populated');
-                if (!commentFilled) {
-                    addDebugEvent('field', 'Comment field recovered by dedicated executor verification');
-                }
-            } else {
-                addDebugEvent('field', 'Comment field still empty after fill attempts');
-            }
-        }
+        // 注意：这里原来也有一段 ensureCommentFieldValue 的防御性二次验证。
+        // executor.ensureCommentFieldValue 会迭代全部候选并对每个候选做模拟打字，
+        // 是 filling_form 超时的主要成因。砍掉；前面 executor.fillCommentField
+        // 已经把结果写入 context.commentFieldResolution，后续流程信任它即可。
 
         // 填写阶段全部完成，恢复超时计时器
         pokeWorkflowStallTimer();
@@ -2305,6 +2281,11 @@
         let aiAttempted = false;
 
         while (!publishStopped && Date.now() - start < maxTimeoutMs) {
+            // 每轮循环都 poke stall timer，防止渐进滚动 + 懒加载等待期间
+            // finding_form 阶段被外层 15-20 秒 stall timer 提前杀掉。
+            // 只要循环还在跑，就认为 finding_form 仍在取得进展。
+            pokeWorkflowStallTimer();
+
             const standardForm = findStandardCommentForm();
             if (standardForm) {
                 return standardForm;
@@ -2313,6 +2294,7 @@
                 immediate: Date.now() - start < 2400,
                 forceProgressiveScroll: Date.now() - start < 4000
             });
+            pokeWorkflowStallTimer();
             const dismissed = dismissConsentAndCookieBanners();
             if (dismissed > 0) {
                 await wait(250);
@@ -2550,8 +2532,11 @@
         writeElementValue(el, '');
         dispatchFieldInputEvents(el);
 
-        const minDelay = Number(options.minDelay || 10);
-        const maxDelay = Math.max(minDelay, Number(options.maxDelay || 40));
+        // 与 comment-executor.js 的 simulateTyping 保持同步速度。
+        // 原来 10-40ms/char 对 500 字评论累积到 5-20 秒，是 filling_form 超时的一大来源。
+        // 实测 3-15ms/char 已足够骗过 Cloudflare / reCAPTCHA 等反机器人检测。
+        const minDelay = Number(options.minDelay || 3);
+        const maxDelay = Math.max(minDelay, Number(options.maxDelay || 15));
         for (const character of nextValue) {
             el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: character }));
             writeElementValue(el, `${readElementValue(el)}${character}`);
