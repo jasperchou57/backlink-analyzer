@@ -1971,10 +1971,12 @@ async function fetchAnalyzeAll(links) {
                 const result = await fetchAnalyzePage(link);
                 if (result && result.opportunities.length > 0) {
                     const details = result.details || [];
-                    const anchorCount = Number(result.commentAnchorCount || 0);
-                    const hasComments = details.includes('has-existing-comments');
 
-                    // 硬拒绝 #1：分析已明确给出硬阻断（评论关闭/登录/验证码）
+                    // 只保留"硬阻断"过滤（分析时已明确无法发布）。
+                    // 之前额外加的两条依赖 commentAnchorCount 的过滤因为
+                    // html-comment-detection 的正则 bug 导致 anchorCount 几乎
+                    // 永远是 0，误杀了大量可发资源。
+                    // 原则改回："大胆收，让发布流程作为真相源验证"。
                     const hasHardBlocker =
                         details.includes('login-required')
                         || details.includes('comment-closed')
@@ -1983,23 +1985,6 @@ async function fetchAnalyzeAll(links) {
                         || result.commentsClosed === true
                         || result.hasCaptcha === true;
                     if (hasHardBlocker) {
-                        collectState.stats.analyzed++;
-                        collectState.stats.inQueue = Math.max(collectState.stats.inQueue - 1, 0);
-                        broadcastStats();
-                        continue;
-                    }
-
-                    // 硬拒绝 #2：有评论区但评论里 0 条带链接 → 站主大概率删链接
-                    if (hasComments && anchorCount === 0) {
-                        collectState.stats.analyzed++;
-                        collectState.stats.inQueue = Math.max(collectState.stats.inQueue - 1, 0);
-                        broadcastStats();
-                        continue;
-                    }
-
-                    // 硬拒绝 #3：既不是 directPublishReady，也没有锚链证据 → weak 池不够强
-                    // 避免把一大批勉强像评论页但实际发不出去的页面灌进主队列
-                    if (!result.directPublishReady && anchorCount === 0) {
                         collectState.stats.analyzed++;
                         collectState.stats.inQueue = Math.max(collectState.stats.inQueue - 1, 0);
                         broadcastStats();
