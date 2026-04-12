@@ -328,6 +328,15 @@
         </div>
 
         <div class="settings-section">
+          <h4>🧹 队列清理</h4>
+          <div style="font-size:11px;color:#8891a8;margin-bottom:8px">
+            一次性扫描现有资源：edu/gov/社交媒体域名、评论已关闭、登录/验证码、历史连续失败的资源会被标记为"不可发布"并踢出队列。commentAnchorCount≥3 的高质量资源会加排序权重。不会删除数据。
+          </div>
+          <button class="btn-test" id="btn-cleanup-queue">🧹 清理当前队列</button>
+          <div class="test-result" id="cleanup-result"></div>
+        </div>
+
+        <div class="settings-section">
           <h4>🧪 发布调试</h4>
           <label class="settings-toggle">
             <input type="checkbox" id="set-publish-debug" ${settings.publishDebugMode ? 'checked' : ''}>
@@ -446,6 +455,30 @@
                 resultEl.className = 'test-result success';
             } else {
                 resultEl.textContent = '✗ ' + result.message;
+                resultEl.className = 'test-result error';
+            }
+        });
+
+        overlay.querySelector('#btn-cleanup-queue').addEventListener('click', async () => {
+            const resultEl = overlay.querySelector('#cleanup-result');
+            resultEl.textContent = '清理中...';
+            resultEl.className = 'test-result';
+            try {
+                const result = await chrome.runtime.sendMessage({ action: 'cleanupResourceQueue' });
+                if (result?.success) {
+                    const c = result.counts || {};
+                    const reasons = Object.entries(result.reasonStats || {})
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([r, n]) => `${r}: ${n}`)
+                        .join('、');
+                    resultEl.innerHTML = `✓ 总计 ${c.total}，新下架 ${c.markedUnpublishable}，已下架 ${c.alreadyUnpublishable}，加权 ${c.boosted}，保留 ${c.kept}${reasons ? `<br>原因：${reasons}` : ''}`;
+                    resultEl.className = 'test-result success';
+                } else {
+                    resultEl.textContent = '✗ ' + (result?.message || '清理失败');
+                    resultEl.className = 'test-result error';
+                }
+            } catch (e) {
+                resultEl.textContent = '✗ ' + (e?.message || '清理失败');
                 resultEl.className = 'test-result error';
             }
         });

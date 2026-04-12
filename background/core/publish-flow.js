@@ -23,7 +23,8 @@ function getTaskDailyLimitCount(task) {
     const periodStart = getDailyPeriodStart();
     const isCurrentPeriod = Number(task?.dailyPeriodStart || 0) === periodStart;
     if (!isCurrentPeriod) return 0;
-    const isAnchorLimit = task?.commentStyle === 'anchor-html';
+    // 锚文本相关模式（严格或优先）都按 anchor success 计数
+    const isAnchorLimit = task?.commentStyle === 'anchor-html' || task?.commentStyle === 'anchor-prefer';
     return isAnchorLimit
         ? Number(task?.dailyAnchorSuccessCount || 0)
         : Number(task?.dailyPublishedCount || 0);
@@ -46,7 +47,8 @@ async function incrementTaskDailyPublishCount(taskId, { published = false, ancho
             dailyAnchorSuccessCount: prevAnchor + (anchorSuccess ? 1 : 0)
         };
     });
-    const isAnchorLimit = result?.commentStyle === 'anchor-html';
+    // 锚文本相关模式（严格或优先）都返回 anchor success 数
+    const isAnchorLimit = result?.commentStyle === 'anchor-html' || result?.commentStyle === 'anchor-prefer';
     return isAnchorLimit
         ? Number(result?.dailyAnchorSuccessCount || 0)
         : Number(result?.dailyPublishedCount || 0);
@@ -177,6 +179,10 @@ function canPublishResourceForTask(resource, task) {
     if (getResourcePool(resource) === RESOURCE_POOLS.QUARANTINE) {
         return false;
     }
+    // 资源级硬下架状态：永远跳过
+    if (resource?.status === 'unpublishable') {
+        return false;
+    }
 
     const historyEntry = getResourcePublishHistoryEntry(resource, getTaskPublishTarget(task));
     if (!historyEntry) return true;
@@ -188,17 +194,45 @@ function canPublishResourceForTask(resource, task) {
         return !!failureRecovery.retryable;
     }
 
-    return !['published', 'skipped', 'failed'].includes(historyEntry.lastStatus);
+    return !['published', 'skipped', 'failed', 'unpublishable'].includes(historyEntry.lastStatus);
 }
 
 function isRateLimitReason(reason = '') {
     return String(reason || '').toLowerCase() === 'comment_rate_limited';
 }
 
+// 硬原因：资源永远不可发，踢出队列。区别于软原因（临时问题，允许重试）
+const HARD_UNPUBLISHABLE_REASONS = new Set([
+    'comments-closed',
+    'login-required',
+    'captcha-blocked'
+]);
+
+// 软原因：临时问题，给 1-2 次重试机会后进入冷却，不永久下架
+const SOFT_RETRYABLE_REASONS = new Set([
+    'publish-runtime-timeout',
+    'submit-confirm-timeout',
+    'comment-form-not-found', // D+E 三级兜底都失败后上报，可能是页面慢加载
+    'network-error',
+    'tab-closed'
+]);
+
 function getPublishFailureRecoveryPolicy(publishMeta = {}, historyEntry = null) {
     const reason = compactText(publishMeta?.submissionBlockReason || '').toLowerCase();
     const failedAttempts = Number(historyEntry?.attempts?.failed || 0);
     const maxAttempts = Number(PUBLISH_STRATEGY.RETRYABLE_FAILURE_MAX_ATTEMPTS || 0) || 3;
+
+    // 显式硬标记：content script 直接告诉后台"这个资源永远不可发"
+    if (publishMeta?.unpublishable === true) {
+        return {
+            retryable: false,
+            terminalStatus: 'unpublishable',
+            reason: reason || 'unpublishable',
+            cooldownMs: 0,
+            failedAttempts,
+            maxAttempts
+        };
+    }
 
     if (publishMeta?.websiteRetryExhausted) {
         return {
@@ -233,14 +267,28 @@ function getPublishFailureRecoveryPolicy(publishMeta = {}, historyEntry = null) 
         };
     }
 
-    if (reason === 'publish-runtime-timeout' || reason === 'submit-confirm-timeout') {
+    // 硬原因：永久不可发，踢出队列
+    if (HARD_UNPUBLISHABLE_REASONS.has(reason)) {
         return {
-            retryable: failedAttempts < maxAttempts,
-            terminalStatus: 'failed',
+            retryable: false,
+            terminalStatus: 'unpublishable',
             reason,
-            cooldownMs: Number(PUBLISH_STRATEGY.RETRYABLE_FAILURE_COOLDOWN_MS || 0) || 0,
+            cooldownMs: 0,
             failedAttempts,
             maxAttempts
+        };
+    }
+
+    // 软原因：允许有限次重试，超过阈值后冷却但不永久下架
+    if (SOFT_RETRYABLE_REASONS.has(reason)) {
+        const softMaxAttempts = 2;
+        return {
+            retryable: failedAttempts < softMaxAttempts,
+            terminalStatus: 'failed',
+            reason,
+            cooldownMs: 6 * 60 * 60 * 1000, // 6 小时冷却后可再试
+            failedAttempts,
+            maxAttempts: softMaxAttempts
         };
     }
 
@@ -827,15 +875,41 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
     const scriptFiles = ensurePublishContentScripts(workflowScriptFiles);
     const styleFiles = workflow?.styles?.length ? workflow.styles : ['content/comment-publisher.css'];
 
-    await chrome.scripting.executeScript({
-        target: { tabId },
-        files: scriptFiles
-    });
-    if (styleFiles.length > 0) {
-        await chrome.scripting.insertCSS({
-            target: { tabId },
-            files: styleFiles
+    // 给 executeScript 加 8 秒超时，防止页面无响应导致永久挂起
+    const withTimeout = (promise, ms, label) => Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms))
+    ]);
+
+    try {
+        await withTimeout(
+            chrome.scripting.executeScript({
+                target: { tabId },
+                files: scriptFiles
+            }),
+            8000,
+            'executeScript'
+        );
+        if (styleFiles.length > 0) {
+            await withTimeout(
+                chrome.scripting.insertCSS({
+                    target: { tabId },
+                    files: styleFiles
+                }),
+                3000,
+                'insertCSS'
+            );
+        }
+    } catch (e) {
+        // 脚本注入失败/超时，立刻启动看门狗确保兜底跳走
+        schedulePublishWatchdog(task.id, {
+            stage: 'dispatch',
+            resourceId: resource.id,
+            currentUrl: resource.url,
+            sessionId: session.sessionId || '',
+            timeoutMs: 5000  // 5 秒后强制跳过
         });
+        throw new Error(`脚本注入失败: ${e.message}`);
     }
 
     await chrome.tabs.sendMessage(tabId, {
@@ -867,8 +941,11 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
             },
             siteTemplate: templateHint || null
         }
+    }).catch(() => {
+        // sendMessage 失败不应阻塞看门狗启动
     });
 
+    // 看门狗必须启动，确保即使脚本卡住也能兜底跳走
     schedulePublishWatchdog(task.id, {
         stage: 'dispatch',
         resourceId: resource.id,

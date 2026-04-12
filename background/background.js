@@ -120,8 +120,8 @@ const MARKETING_STRATEGY = {
 };
 
 const PUBLISH_WATCHDOG = {
-    DISPATCH_MS: 45000,
-    SUBMISSION_MS: 25000
+    DISPATCH_MS: 35000,
+    SUBMISSION_MS: 20000
 };
 
 const PUBLISH_STAGE_WATCHDOG_MS = {
@@ -131,7 +131,7 @@ const PUBLISH_STAGE_WATCHDOG_MS = {
     form_detected: 12000,
     generating_comment: 15000,
     comment_ready: 10000,
-    filling_form: 18000,
+    filling_form: 50000,
     form_filled: 10000,
     pre_submit: 10000,
     submitting: 20000
@@ -381,7 +381,70 @@ function handleAlarmEvent(alarm) {
     }
     if (alarm.name.startsWith('marketing-refresh:')) {
         handleMarketingRefreshAlarm(alarm.name.slice('marketing-refresh:'.length)).catch(() => {});
+        return;
     }
+    // 发布看门狗 alarm 兜底（Service Worker 休眠后 setTimeout 丢失时的最后防线）
+    if (alarm.name.startsWith('publish-watchdog-')) {
+        const taskId = alarm.name.slice('publish-watchdog-'.length);
+        handlePublishWatchdogAlarm(taskId).catch((e) => {
+            console.error('[Watchdog Alarm] Error:', e);
+        });
+        return;
+    }
+}
+
+async function handlePublishWatchdogAlarm(taskId) {
+    if (!taskId) return;
+
+    // 如果 setTimeout 看门狗已经处理过了，alarm 不重复处理
+    if (publishWatchdogs.has(taskId)) return;
+
+    await ensurePublishSessionsLoaded();
+    const session = getPublishSessionState(taskId);
+    if (!session.isPublishing || session.awaitingManualContinue) return;
+
+    const activeResourceId = session.queue?.[session.currentIndex]?.id || '';
+    if (!activeResourceId) return;
+
+    // 读取 alarm 元数据
+    const metaKey = `watchdog-meta-${taskId}`;
+    const metaData = await chrome.storage.session.get(metaKey);
+    const meta = metaData[metaKey] || {};
+    await chrome.storage.session.remove(metaKey).catch(() => {});
+
+    await Logger.error('发布看门狗 Alarm 兜底触发（Service Worker 曾休眠）', {
+        taskId,
+        resourceId: activeResourceId,
+        currentUrl: session.currentUrl || meta.currentUrl || ''
+    });
+
+    // 向 Tab 弹提示
+    try {
+        const tabId = session.currentTabId;
+        if (tabId) {
+            await chrome.scripting.executeScript({
+                target: { tabId },
+                func: (msg) => {
+                    const overlay = document.createElement('div');
+                    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:999998;';
+                    const toast = document.createElement('div');
+                    toast.innerHTML = '<div style="font-size:28px;margin-bottom:8px;">⚠️</div><div style="font-size:18px;font-weight:600;line-height:1.5;">' + msg.replace(/</g,'&lt;') + '</div><div style="font-size:13px;color:rgba(255,255,255,0.7);margin-top:10px;">3 秒后自动继续...</div>';
+                    toast.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#dc2626;color:white;padding:30px 40px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.4);text-align:center;min-width:320px;max-width:500px;';
+                    document.body.appendChild(overlay);
+                    document.body.appendChild(toast);
+                    setTimeout(() => { overlay.remove(); toast.remove(); }, 3000);
+                },
+                args: ['发布失败：页面长时间无响应（已自动恢复）']
+            });
+            await new Promise(r => setTimeout(r, 3200));
+        }
+    } catch {}
+
+    await handleCommentAction(activeResourceId, 'failed', taskId, {
+        reportedVia: 'alarm-watchdog',
+        submissionBlocked: true,
+        submissionBlockReason: 'service-worker-sleep-recovery'
+    }, session.sessionId || '');
 }
 
 function handleWindowRemoved(windowId) {
@@ -442,6 +505,18 @@ function handleTabUpdated(tabId, changeInfo) {
         if (session.isPublishing && !session.awaitingManualContinue) {
             const activeResource = session.queue?.[session.currentIndex];
             if (!activeResource) return;
+
+            // 只有在表单已提交（commentSubmitting 已收到）后才触发导航验证
+            // 避免页面初次加载时误判为失败
+            const currentStage = session.currentStage || '';
+            if (!currentStage || currentStage === 'dispatch' || currentStage === 'waiting_lease') {
+                return;
+            }
+            // 还在填写阶段（content script 仍在工作），不要触发导航验证
+            if (['bootstrap', 'preflight', 'finding_form', 'form_detected', 'generating_comment',
+                 'comment_ready', 'filling_form', 'form_filled', 'pre_submit'].includes(currentStage)) {
+                return;
+            }
 
             // 注入验证脚本：检查评论是否真的出现在页面上
             chrome.scripting.executeScript({
@@ -613,12 +688,31 @@ function clearPublishWatchdog(taskId) {
         clearTimeout(timer);
         publishWatchdogs.delete(taskId);
     }
+    // 同时清除 alarm 兜底
+    chrome.alarms.clear(`publish-watchdog-${taskId}`).catch(() => {});
 }
 
 function schedulePublishWatchdog(taskId, options = {}) {
     if (!taskId || !options.resourceId) return;
 
     clearPublishWatchdog(taskId);
+
+    // 用 chrome.alarms 做硬性兜底（不受 Service Worker 休眠影响）
+    // alarm 比 setTimeout 多 15 秒，给 setTimeout 优先触发的机会
+    const alarmDelayMs = Math.max(30000, (Number(options.timeoutMs || 0) || PUBLISH_WATCHDOG.DISPATCH_MS) + 15000);
+    chrome.alarms.create(`publish-watchdog-${taskId}`, {
+        delayInMinutes: alarmDelayMs / 60000
+    });
+    // 保存 alarm 元数据供 onAlarm 回调使用
+    chrome.storage.session.set({
+        [`watchdog-meta-${taskId}`]: {
+            resourceId: options.resourceId,
+            stage: options.stage || 'dispatch',
+            currentUrl: options.currentUrl || '',
+            sessionId: options.sessionId || '',
+            createdAt: Date.now()
+        }
+    }).catch(() => {});
 
     const stage = options.stage || 'dispatch';
     const timeoutMs = Number(options.timeoutMs || 0) || (stage === 'submission' ? PUBLISH_WATCHDOG.SUBMISSION_MS : PUBLISH_WATCHDOG.DISPATCH_MS);
@@ -648,6 +742,30 @@ function schedulePublishWatchdog(taskId, options = {}) {
                 currentUrl
             });
 
+            // 向当前 Tab 注入并显示超时提示
+            try {
+                const session2 = getPublishSessionState(taskId);
+                const tabId2 = session2.currentTabId;
+                if (tabId2) {
+                    const timeoutMsg = `发布失败：操作超时（${stage === 'submission' ? '提交后等待确认超时' : '页面响应太慢'}）`;
+                    await chrome.scripting.executeScript({
+                        target: { tabId: tabId2 },
+                        func: (msg) => {
+                            const overlay = document.createElement('div');
+                            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:999998;';
+                            const toast = document.createElement('div');
+                            toast.innerHTML = '<div style="font-size:28px;margin-bottom:8px;">⚠️</div><div style="font-size:18px;font-weight:600;line-height:1.5;">' + msg.replace(/</g,'&lt;') + '</div><div style="font-size:13px;color:rgba(255,255,255,0.7);margin-top:10px;">3 秒后自动继续...</div>';
+                            toast.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#dc2626;color:white;padding:30px 40px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.4);text-align:center;min-width:320px;max-width:500px;';
+                            document.body.appendChild(overlay);
+                            document.body.appendChild(toast);
+                            setTimeout(() => { overlay.remove(); toast.remove(); }, 3000);
+                        },
+                        args: [timeoutMsg]
+                    });
+                    await new Promise(r => setTimeout(r, 3200));
+                }
+            } catch {}
+
             await handleCommentAction(resourceId, 'failed', taskId, {
                 reportedVia: 'watchdog',
                 watchdogStage: stage,
@@ -656,7 +774,10 @@ function schedulePublishWatchdog(taskId, options = {}) {
                     ? 'submit-confirm-timeout'
                     : 'publish-runtime-timeout'
             }, sessionId);
-        } catch {}
+        } catch (e) {
+            console.error('[Watchdog] handleCommentAction failed:', e);
+            await Logger.error('看门狗处理失败', { taskId, resourceId, error: e.message });
+        }
     }, timeoutMs);
 
     publishWatchdogs.set(taskId, timer);
@@ -932,7 +1053,7 @@ function handleNetworkSignal(signal) {
     if (signal.type === 'moderation') {
         Logger.info('网络层检测到评论进入审核队列', { url: signal.url, source: signal.source });
     } else if (signal.type === 'rejected') {
-        Logger.warn('网络层检测到评论被拒绝', { url: signal.url, source: signal.source });
+        Logger.error('网络层检测到评论被拒绝', { url: signal.url, source: signal.source });
     } else if (signal.type === 'confirmed') {
         Logger.info('网络层确认评论提交成功', { url: signal.url, source: signal.source });
     }
@@ -1076,6 +1197,7 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
             return { success: true };
         },
         clearAllData: async () => await clearResourceWorkspace(),
+        cleanupResourceQueue: async () => await cleanupResourceQueue(),
         testAiConnection: () => AIEngine.testConnection(),
         getAIUsageStats: async () => ({ success: true, stats: await AIEngine.getUsageStats() }),
         resetAIUsageStats: async () => {
@@ -1577,6 +1699,44 @@ function mergeBacklinks(backlinksBySource = collectState.backlinks, options = {}
 }
 
 // ============================================================
+// URL 前置过滤：砍掉明显不可用的资源
+// ============================================================
+
+const LOW_QUALITY_PATH_PATTERNS = /\/(category|tag|author|search|feed|page\/\d+|attachment|wp-admin|wp-login|wp-content|wp-includes|xmlrpc|trackback|embed)\//i;
+const LOW_QUALITY_QUERY_PATTERNS = /[?&](s|search|q|preview|replytocom)=/i;
+const LOW_QUALITY_DOMAIN_SUFFIXES = /\.(gov|edu|mil)$/i;
+const SOCIAL_MEDIA_DOMAINS = /^(facebook|twitter|x|instagram|linkedin|youtube|tiktok|pinterest|reddit|quora|medium|tumblr|flickr|vimeo|t\.co)\./i;
+
+function isLowQualityCollectUrl(url) {
+    if (!url) return true;
+    try {
+        const parsed = new URL(url.startsWith('http') ? url : 'https://' + url);
+        const hostname = parsed.hostname.replace(/^www\./, '').toLowerCase();
+        const pathname = parsed.pathname.toLowerCase();
+
+        // 域名级过滤
+        if (LOW_QUALITY_DOMAIN_SUFFIXES.test(hostname)) return true;
+        if (SOCIAL_MEDIA_DOMAINS.test(hostname)) return true;
+
+        // 路径特征过滤
+        if (LOW_QUALITY_PATH_PATTERNS.test(pathname)) return true;
+
+        // 查询参数过滤
+        if (LOW_QUALITY_QUERY_PATTERNS.test(parsed.search)) return true;
+
+        // 首页/根路径（无具体文章）
+        if (pathname === '/' || pathname === '') return true;
+
+        // 文件扩展名过滤（非 HTML）
+        if (/\.(pdf|jpg|jpeg|png|gif|svg|zip|mp3|mp4|css|js|xml|json|rss|atom)$/i.test(pathname)) return true;
+
+        return false;
+    } catch {
+        return true;
+    }
+}
+
+// ============================================================
 // Fetch 批量分析
 // ============================================================
 
@@ -1584,10 +1744,17 @@ async function buildAnalysisTargets(links) {
     const directPages = [];
     const domainSeeds = [];
     const seenTargets = new Set();
+    let filteredCount = 0;
 
     for (const link of [...links].sort((a, b) => getAnalysisSeedScore(b) - getAnalysisSeedScore(a))) {
         const normalized = normalizeUrlBg(link.url);
         if (!normalized || seenTargets.has(normalized)) continue;
+
+        // URL 前置过滤
+        if (link.candidateType === 'backlink-page' && isLowQualityCollectUrl(link.url)) {
+            filteredCount++;
+            continue;
+        }
 
         if (link.candidateType === 'backlink-page' || link.candidateType === 'hybrid') {
             if (directPages.length >= ANALYSIS_STRATEGY.DIRECT_PAGE_LIMIT) continue;
@@ -1602,6 +1769,10 @@ async function buildAnalysisTargets(links) {
         if (link.candidateType === 'ref-domain' && domainSeeds.length < ANALYSIS_STRATEGY.DOMAIN_SEED_LIMIT) {
             domainSeeds.push(link);
         }
+    }
+
+    if (filteredCount > 0) {
+        Logger.collect(`前置过滤: 跳过 ${filteredCount} 个低质量 URL（分类页/标签页/搜索页等）`);
     }
 
     const drilledPages = await expandDomainSeeds(domainSeeds, seenTargets);
@@ -1779,6 +1950,42 @@ async function fetchAnalyzeAll(links) {
             try {
                 const result = await fetchAnalyzePage(link);
                 if (result && result.opportunities.length > 0) {
+                    const details = result.details || [];
+                    const anchorCount = Number(result.commentAnchorCount || 0);
+                    const hasComments = details.includes('has-existing-comments');
+
+                    // 硬拒绝 #1：分析已明确给出硬阻断（评论关闭/登录/验证码）
+                    const hasHardBlocker =
+                        details.includes('login-required')
+                        || details.includes('comment-closed')
+                        || details.includes('captcha')
+                        || result.requiresLoginToPost === true
+                        || result.commentsClosed === true
+                        || result.hasCaptcha === true;
+                    if (hasHardBlocker) {
+                        collectState.stats.analyzed++;
+                        collectState.stats.inQueue = Math.max(collectState.stats.inQueue - 1, 0);
+                        broadcastStats();
+                        continue;
+                    }
+
+                    // 硬拒绝 #2：有评论区但评论里 0 条带链接 → 站主大概率删链接
+                    if (hasComments && anchorCount === 0) {
+                        collectState.stats.analyzed++;
+                        collectState.stats.inQueue = Math.max(collectState.stats.inQueue - 1, 0);
+                        broadcastStats();
+                        continue;
+                    }
+
+                    // 硬拒绝 #3：既不是 directPublishReady，也没有锚链证据 → weak 池不够强
+                    // 避免把一大批勉强像评论页但实际发不出去的页面灌进主队列
+                    if (!result.directPublishReady && anchorCount === 0) {
+                        collectState.stats.analyzed++;
+                        collectState.stats.inQueue = Math.max(collectState.stats.inQueue - 1, 0);
+                        broadcastStats();
+                        continue;
+                    }
+
                     await saveResource(result);
                 }
             } catch {}
@@ -1816,7 +2023,8 @@ function analyzeHtml(html, url, link) {
         hasUrlField: !!result.hasUrlField,
         resourceClass: result.resourceClass || '',
         frictionLevel: result.frictionLevel || '',
-        directPublishReady: !!result.directPublishReady
+        directPublishReady: !!result.directPublishReady,
+        commentAnchorCount: Number(result.commentAnchorCount || 0)
     };
 }
 
@@ -1877,6 +2085,98 @@ async function getStoredResources() {
 
 async function writeResourcesToStorage(resources = []) {
     return await resourceStore.writeResources(resources);
+}
+
+/**
+ * 一次性清理：用现有字段硬筛选资源队列。
+ * - edu/gov/社交媒体域名 → 下架
+ * - 评论区存在但无表单（评论已关闭的强指示）→ 下架
+ * - commentsClosed / requiresLogin 字段 = true → 下架
+ * - 历史连续失败 ≥3 次且从未成功 → 下架
+ * - 历史发布原因命中 HARD_UNPUBLISHABLE_REASONS → 下架
+ * - commentAnchorCount ≥3 → 加 boost 标签（不下架，只排序加权）
+ */
+async function cleanupResourceQueue() {
+    const resources = await getStoredResources();
+    const counts = {
+        total: resources.length,
+        markedUnpublishable: 0,
+        alreadyUnpublishable: 0,
+        boosted: 0,
+        kept: 0
+    };
+    const reasonStats = {};
+
+    const nextResources = resources.map((resource) => {
+        if (!resource) return resource;
+        if (resource.status === 'unpublishable') {
+            counts.alreadyUnpublishable++;
+            return resource;
+        }
+
+        const domain = getDomainBg(resource.url || '') || '';
+        const reasons = [];
+
+        if (domain && FrontierScheduler.isUnwantedDomain(domain)) {
+            reasons.push('unwanted-domain');
+        }
+
+        if (resource.hasExistingComments === true && resource.hasCommentForm === false) {
+            reasons.push('comments-closed-inferred');
+        }
+        if (resource.commentsClosed === true) reasons.push('comments-closed');
+        if (resource.requiresLogin === true) reasons.push('login-required');
+
+        const historyEntries = Object.values(resource.publishHistory || {});
+        for (const entry of historyEntries) {
+            const failed = Number(entry?.attempts?.failed || 0);
+            const published = Number(entry?.attempts?.published || 0);
+            if (failed >= 3 && published === 0) {
+                reasons.push('chronic-failure');
+                break;
+            }
+            const blockReason = String(entry?.publishMeta?.submissionBlockReason || '').toLowerCase();
+            if (['comments-closed', 'login-required', 'captcha-blocked'].includes(blockReason)) {
+                reasons.push(`historical-${blockReason}`);
+                break;
+            }
+        }
+
+        if (reasons.length > 0) {
+            counts.markedUnpublishable++;
+            reasons.forEach((r) => {
+                reasonStats[r] = (reasonStats[r] || 0) + 1;
+            });
+            return {
+                ...resource,
+                status: 'unpublishable',
+                publishMeta: {
+                    ...(resource.publishMeta || {}),
+                    unpublishableReason: reasons.join(','),
+                    cleanupMarkedAt: new Date().toISOString()
+                }
+            };
+        }
+
+        const anchorCount = Number(resource.commentAnchorCount || 0);
+        if (anchorCount >= 3) {
+            counts.boosted++;
+            return {
+                ...resource,
+                details: Array.from(new Set([...(resource.details || []), 'anchor-count-boost']))
+            };
+        }
+
+        counts.kept++;
+        return resource;
+    });
+
+    const stored = await writeResourcesToStorage(nextResources);
+    syncResourceOpportunityStats(stored);
+    broadcastStats();
+    autoPublishDispatch.schedule('resource-cleanup', 1500);
+
+    return { success: true, counts, reasonStats };
 }
 
 async function performStorageMaintenance() {

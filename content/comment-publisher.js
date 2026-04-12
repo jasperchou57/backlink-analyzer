@@ -7,6 +7,9 @@
     if (window.__commentPublisherLoaded) return;
     window.__commentPublisherLoaded = true;
 
+    // 暴露 pokeWorkflowStallTimer 到 window，供 comment-executor.js 等模块调用
+    window.pokeWorkflowStallTimer = function () {};  // 占位，armWorkflowStallTimer 初始化后会被覆盖
+
     let currentResourceId = null;
     let currentTaskId = null;
     let currentSessionId = null;
@@ -69,8 +72,8 @@
             formPollMs: 400,
             aiFormTimeoutMs: 0,
             aiCommentTimeoutMs: 0,
-            submitDelayMs: 700,
-            workflowStallTimeoutMs: 9000
+            submitDelayMs: 2500,
+            workflowStallTimeoutMs: 15000
         },
         hybrid: {
             id: 'hybrid',
@@ -81,8 +84,8 @@
             formPollMs: 700,
             aiFormTimeoutMs: 2200,
             aiCommentTimeoutMs: 0,
-            submitDelayMs: 900,
-            workflowStallTimeoutMs: 14000
+            submitDelayMs: 3000,
+            workflowStallTimeoutMs: 20000
         },
         ai: {
             id: 'ai',
@@ -93,22 +96,22 @@
             formPollMs: 900,
             aiFormTimeoutMs: 3000,
             aiCommentTimeoutMs: 4500,
-            submitDelayMs: 1200,
-            workflowStallTimeoutMs: 18000
+            submitDelayMs: 3500,
+            workflowStallTimeoutMs: 25000
         }
     };
 
     const WORKFLOW_STAGE_TIMEOUTS = {
-        bootstrap: { fast: 9000, hybrid: 12000, ai: 15000 },
-        preflight: { fast: 7000, hybrid: 10000, ai: 12000 },
-        finding_form: { fast: 7000, hybrid: 10000, ai: 14000 },
-        form_detected: { fast: 6000, hybrid: 8000, ai: 10000 },
-        generating_comment: { fast: 4000, hybrid: 5000, ai: 7000 },
-        comment_ready: { fast: 4000, hybrid: 5000, ai: 7000 },
-        filling_form: { fast: 12000, hybrid: 16000, ai: 22000 },
-        form_filled: { fast: 4500, hybrid: 6000, ai: 8000 },
-        pre_submit: { fast: 5000, hybrid: 7000, ai: 9000 },
-        submitting: { fast: 10000, hybrid: 12000, ai: 15000 }
+        bootstrap: { fast: 12000, hybrid: 15000, ai: 18000 },
+        preflight: { fast: 10000, hybrid: 12000, ai: 15000 },
+        finding_form: { fast: 12000, hybrid: 15000, ai: 20000 },
+        form_detected: { fast: 8000, hybrid: 10000, ai: 12000 },
+        generating_comment: { fast: 6000, hybrid: 8000, ai: 10000 },
+        comment_ready: { fast: 6000, hybrid: 8000, ai: 10000 },
+        filling_form: { fast: 45000, hybrid: 55000, ai: 65000 },
+        form_filled: { fast: 8000, hybrid: 10000, ai: 12000 },
+        pre_submit: { fast: 8000, hybrid: 10000, ai: 12000 },
+        submitting: { fast: 15000, hybrid: 18000, ai: 20000 }
     };
 
     function isStrictAnchorCommentStyle(value) {
@@ -148,6 +151,29 @@
             await wait(300);
         }
 
+        // 拦截浏览器原生 alert/confirm 弹窗，注入到页面上下文（main world）
+        // content script 的覆盖只影响 isolated world，不影响页面 JS 触发的 alert
+        if (!window.__blaAlertIntercepted) {
+            window.__blaAlertIntercepted = true;
+            const script = document.createElement('script');
+            script.textContent = `
+                (function() {
+                    if (window.__blaAlertBlocked) return;
+                    window.__blaAlertBlocked = true;
+                    window.alert = function(msg) {
+                        console.log('[BLA] 拦截页面 alert:', msg);
+                    };
+                    var origConfirm = window.confirm;
+                    window.confirm = function(msg) {
+                        console.log('[BLA] 拦截页面 confirm:', msg);
+                        return true;
+                    };
+                })();
+            `;
+            (document.head || document.documentElement).appendChild(script);
+            script.remove();
+        }
+
         fillCommentInProgress = true;
         currentResourceId = data.resourceId;
         currentTaskId = data.taskId;
@@ -155,6 +181,7 @@
         currentDebugMode = !!data.debugMode;
         currentDebugInfo = { mode: data.mode || 'semi-auto', actions: [] };
         publishStopped = false;
+        window.__blaPublishStopped = false;
         publishResultReported = false;
         clearAutoSubmitTimer();
         clearSubmissionFallbackTimer();
@@ -211,6 +238,19 @@
         addDebugEvent('field', `Execution profile: ${context.execution.id}`);
 
         try {
+            // 硬信号预检：评论已关闭 / 必须登录 / 验证码 → 直接标为永久不可发，踢出队列
+            const hardSignal = detectHardUnpublishableSignal();
+            if (hardSignal) {
+                addDebugEvent('field', `Hard unpublishable signal: ${hardSignal}`);
+                reportResult('failed', {
+                    reason: hardSignal,
+                    submissionBlocked: true,
+                    submissionBlockReason: hardSignal,
+                    unpublishable: true
+                });
+                return;
+            }
+
             if (await maybeExecuteStandardCommentFastFlow(context)) {
                 return;
             }
@@ -218,9 +258,41 @@
         } catch (e) {
             console.log('[BLA] 工作流执行失败:', e);
             addDebugEvent('field', `Workflow failed: ${e.message}`);
-            reportResult('failed');
+            // 工作流内部失败前再查一次硬信号（可能进入页面后才检测到）
+            const lateHardSignal = detectHardUnpublishableSignal();
+            let reason;
+            let unpublishable = false;
+            if (lateHardSignal) {
+                reason = lateHardSignal;
+                unpublishable = true;
+            } else if (/form not found/i.test(e.message)) {
+                reason = 'comment-form-not-found';
+            } else {
+                reason = e.message || 'unknown';
+            }
+            reportResult('failed', {
+                reason,
+                submissionBlocked: true,
+                submissionBlockReason: reason,
+                unpublishable
+            });
         } finally {
             fillCommentInProgress = false;
+        }
+    }
+
+    function detectHardUnpublishableSignal() {
+        try {
+            const detection = getCommentFormDetection();
+            if (!detection?.detectPageCommentCapabilities) return '';
+            const caps = detection.detectPageCommentCapabilities(document);
+            if (caps?.commentsClosed) return 'comments-closed';
+            if (caps?.requiresLogin) return 'login-required';
+            if (caps?.hasCaptcha) return 'captcha-blocked';
+            return '';
+        } catch (e) {
+            console.log('[BLA] detectHardUnpublishableSignal 失败:', e);
+            return '';
         }
     }
 
@@ -344,6 +416,9 @@
             { timeoutMs: estimateFormFillTimeoutMs(context, values) }
         );
 
+        // 整个填写阶段暂停超时计时器
+        pokeWorkflowStallTimer();
+
         const standardFlow = getStandardCommentFlow();
         const standardFill = standardFlow?.fillStandardCommentForm
             ? await standardFlow.fillStandardCommentForm(form, values)
@@ -368,6 +443,7 @@
 
         if (!commentFilled && values.comment) {
             addDebugEvent('field', 'Standard comment form comment field could not be verified');
+            pokeWorkflowStallTimer();
             reportResult('failed', {
                 reason: 'comment-field-empty',
                 submissionBlocked: true
@@ -382,6 +458,7 @@
             });
             if (!ensuredComment) {
                 addDebugEvent('field', 'Standard comment form comment verification failed after fallback');
+                pokeWorkflowStallTimer();
                 reportResult('failed', {
                     reason: 'comment-field-empty',
                     submissionBlocked: true
@@ -434,6 +511,9 @@
                 execution: context.execution
             });
         }
+
+        // 标准表单填写完成，恢复超时计时器
+        pokeWorkflowStallTimer();
     }
 
     async function executeGenerateCommentStep(step, context) {
@@ -519,6 +599,7 @@
             try {
                 const pageContent = getPageContent();
                 addDebugEvent('field', 'Generating comment with AI');
+                pokeWorkflowStallTimer(); // 正在请求 AI，重置超时
                 const result = await sendRuntimeMessageWithTimeout({
                     action: 'aiGenerateComment',
                     pageTitle: context.pageTitle,
@@ -526,6 +607,7 @@
                     targetUrl: context.anchorOptions.anchorUrl || context.values.website,
                     options: context.anchorOptions
                 }, context.execution.aiCommentTimeoutMs, 'AI comment generation');
+                pokeWorkflowStallTimer(); // AI 响应完成，重置超时
                 if (compactText(result?.comment || '')) {
                     context.comment = result.comment;
                 }
@@ -582,6 +664,9 @@
             '正在填写评论表单',
             { timeoutMs: estimateFormFillTimeoutMs(context, values) }
         );
+
+        // 填写阶段开始，重置超时（不暂停，用 poke 保活）
+        pokeWorkflowStallTimer();
         const allowedFields = Array.isArray(step.fields) && step.fields.length > 0
             ? step.fields
             : ['comment', 'name', 'email', 'website'];
@@ -643,6 +728,9 @@
                 addDebugEvent('field', 'Comment field still empty after fill attempts');
             }
         }
+
+        // 填写阶段全部完成，恢复超时计时器
+        pokeWorkflowStallTimer();
         updateWorkflowProgress(context, 'form_filled', '评论表单已填写完成');
     }
 
@@ -1231,7 +1319,14 @@
             return;
         }
 
-        const submitBtn = findSubmitButton(form, context.aiFormInfo);
+        let submitBtn = findSubmitButton(form, context.aiFormInfo);
+
+        // 规则找不到提交按钮时，调 AI 识别
+        if (!submitBtn) {
+            addDebugEvent('field', 'Rule-based submit button not found, trying AI detection');
+            submitBtn = await findSubmitButtonWithAI(form);
+        }
+
         currentPublishMeta = {
             ...(currentPublishMeta || {}),
             submitSelector: submitBtn ? describeElementForMeta(submitBtn) : (currentPublishMeta?.submitSelector || '')
@@ -1258,8 +1353,55 @@
         }
 
         clearSubmissionFallbackTimer();
-        submissionFallbackTimer = setTimeout(() => reportResult('submitted', { reportedVia: 'timeout-fallback' }), 8000);
+
+        // 监听网络拦截信号（来自 network-inspector-bridge.js）
+        let networkSignalReceived = false;
+        const networkSignalHandler = (event) => {
+            const detail = event.detail;
+            if (!detail || !detail.type || networkSignalReceived) return;
+            networkSignalReceived = true;
+            clearSubmissionFallbackTimer();
+            window.removeEventListener('__bla_network_signal', networkSignalHandler);
+
+            if (detail.type === 'confirmed') {
+                reportResult('submitted', { reportedVia: 'network-confirmed', networkSignal: detail.type });
+            } else if (detail.type === 'moderation') {
+                reportResult('submitted', { reportedVia: 'network-moderation', networkSignal: detail.type, reviewPending: true });
+            } else if (detail.type === 'rejected') {
+                reportResult('failed', { reportedVia: 'network-rejected', networkSignal: detail.type, submissionBlocked: true, submissionBlockReason: 'network-rejected' });
+            } else if (detail.type === 'success') {
+                reportResult('submitted', { reportedVia: 'network-success', networkSignal: detail.type });
+            }
+        };
+        window.addEventListener('__bla_network_signal', networkSignalHandler);
+
+        // 8 秒超时兜底：如果没收到网络信号，走原有逻辑
+        submissionFallbackTimer = setTimeout(() => {
+            window.removeEventListener('__bla_network_signal', networkSignalHandler);
+            if (!networkSignalReceived) {
+                reportResult('submitted', { reportedVia: 'timeout-fallback' });
+            }
+        }, 8000);
     }
+
+    const FAILURE_REASON_CN = {
+        'comment-form-not-found': '找不到评论表单（可能需要滚动到底部或表单被隐藏）',
+        'comment-field-empty': '评论框无法填入内容',
+        'submit-trigger-failed': '找不到提交按钮或无法点击',
+        'workflow-stall-timeout': '操作超时（页面响应太慢）',
+        'duplicate-comment-detected': '该页面已经发过相同评论',
+        'anchor-mode-unavailable': '该页面不支持锚文本链接',
+        'comment-only-form': '该评论区不支持留链接',
+        'network-rejected': '评论被网站拒绝（可能触发了反垃圾）',
+        'publish-runtime-timeout': '发布超时（页面加载太慢）',
+        'submit-confirm-timeout': '提交后等待确认超时',
+        'timeout-bootstrap': '页面加载太慢，无法初始化',
+        'timeout-preflight': '无法定位评论区（页面可能太长或评论区被隐藏）',
+        'timeout-finding_form': '找不到评论表单（可能被懒加载或 JS 动态渲染）',
+        'timeout-filling_form': '表单填写超时（字段无法填入）',
+        'timeout-generating_comment': 'AI 评论生成超时',
+        'timeout-submitting': '提交后等待响应超时'
+    };
 
     function reportResult(result, extraMeta = {}) {
         if (publishResultReported) {
@@ -1272,6 +1414,17 @@
         clearWorkflowStallTimer();
         const startedAt = currentPublishMeta?.publishStartedAt || '';
         const durationMs = startedAt ? Math.max(0, Date.now() - new Date(startedAt).getTime()) : 0;
+
+        // 跳过或失败时显示中文提示
+        if (result === 'skipped' || result === 'failed') {
+            const reason = extraMeta.reason || extraMeta.submissionBlockReason || extraMeta.terminalFailureReason || '';
+            const blockReason = extraMeta.submissionBlockReason || '';
+            // 优先匹配更具体的 submissionBlockReason（如 timeout-bootstrap）
+            const reasonText = FAILURE_REASON_CN[blockReason] || FAILURE_REASON_CN[reason] || reason || '未知原因';
+            const statusText = result === 'skipped' ? '已跳过' : '发布失败';
+            showFailureToast(`${statusText}：${reasonText}`);
+        }
+
         chrome.runtime.sendMessage({
             action: 'commentAction',
             resourceId: currentResourceId,
@@ -1281,6 +1434,53 @@
             meta: { ...(currentPublishMeta || {}), durationMs, ...(extraMeta || {}) }
         });
     }
+
+    function showFailureToast(message) {
+        const existing = document.getElementById('bla-failure-toast');
+        if (existing) existing.remove();
+        const existingOverlay = document.getElementById('bla-failure-overlay');
+        if (existingOverlay) existingOverlay.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'bla-failure-overlay';
+        overlay.style.cssText = `
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.5); z-index: 999998;
+        `;
+
+        const toast = document.createElement('div');
+        toast.id = 'bla-failure-toast';
+        toast.innerHTML = `
+            <div style="font-size: 28px; margin-bottom: 8px;">⚠️</div>
+            <div style="font-size: 18px; font-weight: 600; line-height: 1.5;">${message.replace(/</g, '&lt;')}</div>
+            <div style="font-size: 13px; color: rgba(255,255,255,0.7); margin-top: 10px;">3 秒后自动继续...</div>
+        `;
+        toast.style.cssText = `
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            z-index: 999999; background: #dc2626; color: white;
+            padding: 30px 40px; border-radius: 16px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+            text-align: center; min-width: 320px; max-width: 500px;
+        `;
+
+        document.body.appendChild(overlay);
+        document.body.appendChild(toast);
+
+        setTimeout(() => {
+            overlay.style.opacity = '0';
+            toast.style.opacity = '0';
+            overlay.style.transition = 'opacity 0.3s';
+            toast.style.transition = 'opacity 0.3s';
+            setTimeout(() => { overlay.remove(); toast.remove(); }, 300);
+        }, 3000);
+    }
+
+    // 监听来自后台的失败/跳过通知（后台直接跳过时 content script 的 reportResult 不会触发）
+    chrome.runtime.onMessage.addListener((msg) => {
+        if (msg.action === 'showPublishFailure' && msg.message) {
+            showFailureToast(msg.message);
+        }
+    });
 
     async function triggerSubmitAction(form, submitBtn) {
         const readySubmitBtn = await waitForSubmitButtonReady(submitBtn);
@@ -1408,6 +1608,10 @@
         }
     }
 
+    // 保存当前超时参数，供 poke 时重新启动
+    let _stallTimerContext = null;
+    let _stallTimerTimeoutMs = 0;
+
     function armWorkflowStallTimer(context, overrideTimeoutMs = null) {
         if (!context || context.mode !== 'full-auto' || currentDebugMode) {
             return;
@@ -1416,17 +1620,73 @@
         const timeoutMs = Number(overrideTimeoutMs || 0)
             || Number(context.execution?.workflowStallTimeoutMs || 0)
             || WORKFLOW_STALL_TIMEOUT_MS;
+        _stallTimerContext = context;
+        _stallTimerTimeoutMs = timeoutMs;
+        _startStallTimeout(timeoutMs);
+    }
+
+    function _startStallTimeout(timeoutMs) {
         workflowStallTimer = setTimeout(() => {
             workflowStallTimer = null;
             if (publishStopped) return;
-            addDebugEvent('field', 'Workflow stalled before submit; aborting current resource');
+            const currentStage = currentPublishMeta?.workflowStage || 'unknown';
+            const stageReasons = {
+                'bootstrap': '页面加载太慢，无法初始化',
+                'preflight': '无法定位评论区（页面可能太长或评论区被隐藏）',
+                'finding_form': '找不到评论表单（可能被懒加载或 JS 动态渲染）',
+                'form_detected': '表单已找到但无法交互',
+                'generating_comment': 'AI 评论生成超时',
+                'comment_ready': '评论内容准备超时',
+                'filling_form': '表单填写超时（字段无法填入）',
+                'form_filled': '表单填写后验证超时',
+                'pre_submit': '提交前准备超时',
+                'submitting': '提交后等待响应超时'
+            };
+            addDebugEvent('field', `Workflow stalled at ${currentStage}; aborting current resource`);
             reportResult('failed', {
                 reason: 'workflow-stall-timeout',
                 terminalFailureReason: 'workflow_stall_timeout',
-                submissionBlocked: true
+                submissionBlocked: true,
+                submissionBlockReason: `timeout-${currentStage}`
             });
         }, timeoutMs);
     }
+
+    /**
+     * 活动心跳：只要插件还在干活（打字、填字段、等 AI），就重置超时计时器。
+     * 只有真正卡死不动时才会超时。
+     */
+    function pokeWorkflowStallTimer() {
+        if (!workflowStallTimer || !_stallTimerContext) return;
+        clearTimeout(workflowStallTimer);
+        _startStallTimeout(_stallTimerTimeoutMs);
+    }
+
+    /**
+     * 暂停超时计时器（打字期间调用）。
+     * 打字过程中不允许超时触发，因为正在打字说明一切正常。
+     */
+    function pauseWorkflowStallTimer() {
+        if (workflowStallTimer) {
+            clearTimeout(workflowStallTimer);
+            // 不清空 workflowStallTimer 引用，这样 resume 时知道之前有计时器
+        }
+    }
+
+    /**
+     * 恢复超时计时器（打字完成后调用）。
+     */
+    function resumeWorkflowStallTimer() {
+        if (_stallTimerContext && _stallTimerTimeoutMs > 0) {
+            clearWorkflowStallTimer();
+            _startStallTimeout(_stallTimerTimeoutMs);
+        }
+    }
+
+    // 暴露到 window，供 comment-executor.js 调用
+    window.pokeWorkflowStallTimer = pokeWorkflowStallTimer;
+    window.pauseWorkflowStallTimer = pauseWorkflowStallTimer;
+    window.resumeWorkflowStallTimer = resumeWorkflowStallTimer;
 
     function getStageTimeoutMs(context, stage = '') {
         const profileId = compactText(context?.execution?.id || 'ai') || 'ai';
@@ -1901,10 +2161,11 @@
         const timeoutMs = Number(options.timeoutMs || 0) || 20000;
         const pollMs = Number(options.pollMs || 0) || 1200;
         const aiTimeoutMs = Number(options.aiTimeoutMs || 0) || 3000;
+        const maxTimeoutMs = timeoutMs + 10000; // 硬性上限，防止无限循环
         const start = Date.now();
         let aiAttempted = false;
 
-        while (!publishStopped && Date.now() - start < timeoutMs) {
+        while (!publishStopped && Date.now() - start < maxTimeoutMs) {
             const standardForm = findStandardCommentForm();
             if (standardForm) {
                 return standardForm;
@@ -1958,6 +2219,50 @@
             }
 
             await wait(pollMs);
+        }
+
+        // 最后一搏 #1：页面上只有一个"像样的"带 textarea 表单 → 直接用
+        // 规则打分把所有候选都判负时救回来（常见于非标准评论系统）
+        try {
+            const allForms = Array.from(document.querySelectorAll('form')).filter((f) => {
+                if (!formHasInteractiveFields(f)) return false;
+                if (!f.querySelector('textarea, [contenteditable="true"], .ql-editor, .ProseMirror, .mce-content-body')) return false;
+                const sig = `${f.id || ''} ${f.className || ''} ${f.getAttribute?.('action') || ''}`.toLowerCase();
+                if (/search|login|signin|register/.test(sig)) return false;
+                return true;
+            });
+            if (allForms.length === 1) {
+                addDebugEvent('field', 'Last-ditch: using sole textarea form on page');
+                return allForms[0];
+            }
+        } catch (e) {
+            console.log('[BLA] Last-ditch textarea scan failed:', e);
+        }
+
+        // 最后一搏 #2：强制 AI 兜底一次（即使执行档位默认关 AI）
+        // 规则完全失败时，一次 AI 调用换一个资源比直接放弃更划算
+        if (!aiAttempted && !publishStopped) {
+            try {
+                const formAreaHtml = getCommentAreaHtml();
+                if (formAreaHtml) {
+                    addDebugEvent('field', 'Last-ditch AI form extraction');
+                    const aiInfo = await sendRuntimeMessageWithTimeout({
+                        action: 'aiExtractForm',
+                        html: formAreaHtml
+                    }, Math.max(aiTimeoutMs, 3500), 'AI form extraction (last-ditch)');
+                    context.aiFormInfo = aiInfo || context.aiFormInfo;
+                    if (aiInfo?.hasForm && aiInfo.formSelector) {
+                        const aiForm = document.querySelector(aiInfo.formSelector);
+                        if (aiForm && formHasInteractiveFields(aiForm)) {
+                            addDebugEvent('field', `Last-ditch AI located form: ${aiInfo.formSelector}`);
+                            return aiForm;
+                        }
+                    }
+                }
+            } catch (e) {
+                console.log('[BLA] Last-ditch AI 兜底失败:', e);
+                addDebugEvent('field', `Last-ditch AI failed: ${e.message}`);
+            }
         }
 
         return null;
@@ -2017,10 +2322,12 @@
     function findSubmitButton(form, aiFormInfo) {
         const candidates = [];
 
+        // 1. AI 已识别的提交按钮选择器
         if (aiFormInfo?.submitSelector) {
             candidates.push(form.querySelector(aiFormInfo.submitSelector) || document.querySelector(aiFormInfo.submitSelector));
         }
 
+        // 2. CSS 选择器规则匹配
         const selectorCandidates = [
             'button[type="submit"]',
             'input[type="submit"]',
@@ -2035,6 +2342,7 @@
             candidates.push(form.querySelector(selector));
         });
 
+        // 3. 关键词文字匹配
         const textButtons = Array.from(form.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'))
             .filter((el) => {
                 if (!isVisible(el)) return false;
@@ -2045,7 +2353,43 @@
             });
         candidates.push(...textButtons);
 
-        return candidates.find(Boolean) || null;
+        const ruleResult = candidates.find(Boolean);
+        if (ruleResult) return ruleResult;
+
+        // 4. 规则都找不到时，用表单内唯一可见按钮兜底
+        const allVisibleButtons = Array.from(form.querySelectorAll('button, input[type="submit"], input[type="button"]'))
+            .filter((el) => isVisible(el) && !el.disabled);
+        if (allVisibleButtons.length === 1) {
+            addDebugEvent('field', `Submit button found by single-button fallback: ${describeElementForMeta(allVisibleButtons[0])}`);
+            return allVisibleButtons[0];
+        }
+
+        return null;
+    }
+
+    /**
+     * AI 识别提交按钮（当规则找不到时调用）
+     * 截取表单 HTML 发给 AI，让 AI 返回提交按钮的 CSS 选择器
+     */
+    async function findSubmitButtonWithAI(form) {
+        if (!form) return null;
+        try {
+            const formHtml = form.outerHTML.substring(0, 3000);
+            const result = await sendRuntimeMessageWithTimeout({
+                action: 'aiExtractForm',
+                html: formHtml
+            }, 3500, 'AI submit button detection');
+            if (result?.submitSelector) {
+                const btn = form.querySelector(result.submitSelector) || document.querySelector(result.submitSelector);
+                if (btn && isVisible(btn)) {
+                    addDebugEvent('field', `Submit button found by AI: ${result.submitSelector}`);
+                    return btn;
+                }
+            }
+        } catch (e) {
+            addDebugEvent('field', `AI submit detection failed: ${e.message}`);
+        }
+        return null;
     }
 
     function wait(ms) {
@@ -2178,7 +2522,13 @@
             if (!contextText) return;
             if (isNotificationCheckbox(contextText)) return;
 
-            if (/(not a spammer|not spam|anti spam|anti-spam|human|robot|i am human|i'm human|confirm[^.]*spammer|confirm[^.]*human|agree[^.]*spammer|agree[^.]*human)/.test(contextText)) {
+            // 反垃圾复选框（英文）
+            const isAntiSpam = /(not a spammer|not spam|anti spam|anti-spam|human|robot|i am human|i'm human|confirm[^.]*spammer|confirm[^.]*human|agree[^.]*spammer|agree[^.]*human)/.test(contextText);
+
+            // 隐私/数据保护/同意复选框（多语言）
+            const isPrivacyConsent = /(datenschutz|privacy|daten.*schutz|datenschutzbestimmungen|datenschutzerklärung|privacidad|protección de datos|politique de confidentialité|protezione dei dati|privacybeleid|gegevensbescherming|política de privacidade|polityka prywatności|gizlilik|zasady|gdpr|rgpd|dsgvo|cookie|consent|i agree|i accept|agree to|accept the|akzeptier|accepteer|acepto|accetto|j'accepte|zgadzam|kabul|同意|接受|同意する|동의|согласен|أوافق|隐私|privacy policy|terms|条款)/.test(contextText);
+
+            if (isAntiSpam || isPrivacyConsent) {
                 setCheckboxValue(checkbox, true);
                 markDebugElement(checkbox, 'checkbox');
                 addDebugEvent('checkbox', `Checked "${truncateText(contextText, 80)}"`);
@@ -2187,7 +2537,7 @@
         });
 
         if (currentDebugMode && checkedCount === 0) {
-            addDebugEvent('checkbox', 'No anti-spam checkbox matched by rules');
+            addDebugEvent('checkbox', 'No anti-spam/privacy checkbox matched by rules');
         }
     }
 
