@@ -439,8 +439,11 @@
             addDebugEvent('field', 'Standard comment form direct-filled');
         }
 
-        // 富文本 iframe 路径：原生 textarea 被 TinyMCE/CKEditor 隐藏，常规填写无法触达
-        if (!commentFilled && values.comment) {
+        // 富文本 iframe 路径必须无条件运行 —— 即使 standardFlow 声称
+        // commentFilled=true，那个 fill 也只是写到了隐藏 textarea，TinyMCE
+        // 提交时会用 iframe 内容覆盖 textarea，导致提交空评论。
+        // 必须在 standardFlow 之后（且无视 commentFilled）写到 iframe body。
+        if (values.comment) {
             const richTarget = findRichEditorTargetInForm(form);
             if (richTarget && fillRichEditorTarget(richTarget, values.comment)) {
                 commentFilled = true;
@@ -738,7 +741,29 @@
             });
         }
 
+        // 富文本 iframe 路径必须无条件运行（TinyMCE/CKEditor），写到 iframe body
+        // 否则即使前面 fill 链"成功"，也只是把值写到了隐藏 textarea，提交时会被
+        // TinyMCE 用 iframe 内容覆盖。详见 fillStandardCommentFormDirectly 的注释。
+        let richEditorFilled = false;
         if (values.comment) {
+            const richTarget = findRichEditorTargetInForm(context.form);
+            if (richTarget && fillRichEditorTarget(richTarget, values.comment)) {
+                commentFilled = true;
+                richEditorFilled = true;
+                currentPublishMeta = {
+                    ...(currentPublishMeta || {}),
+                    commentFieldVerified: true,
+                    commentEditorType: 'rich-iframe',
+                    commentFieldSelector: 'iframe[contenteditable]',
+                    commentFillStrategy: 'rich-iframe',
+                    formSignature: buildFormSignature(context.form) || currentPublishMeta?.formSignature || ''
+                };
+                addDebugEvent('field', 'Rich editor iframe (TinyMCE/CKEditor) filled directly (workflow path)');
+            }
+        }
+
+        // 富文本 iframe 路径已经写入，常规 ensureCommentFieldValue 跨不进 iframe，跳过验证
+        if (values.comment && !richEditorFilled) {
             const ensuredComment = await ensureCommentFieldValue(context.form, values.comment, context, {
                 allowTypingFallback: true
             });
