@@ -1218,6 +1218,7 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
         },
         clearAllData: async () => await clearResourceWorkspace(),
         cleanupResourceQueue: async () => await cleanupResourceQueue(),
+        getPublishDiagnostics: async () => await getPublishDiagnostics(),
         testAiConnection: () => AIEngine.testConnection(),
         getAIUsageStats: async () => ({ success: true, stats: await AIEngine.getUsageStats() }),
         resetAIUsageStats: async () => {
@@ -2217,6 +2218,111 @@ async function cleanupResourceQueue() {
     autoPublishDispatch.schedule('resource-cleanup', 1500);
 
     return { success: true, counts, reasonStats };
+}
+
+/**
+ * 发布诊断：扫描当前所有资源和发布历史，给出
+ * - 资源状态分布
+ * - 失败原因 top 榜
+ * - 最近失败的具体例子
+ * 帮用户一眼看清到底是"没发"、"发了都失败"、还是"发成功率低"
+ */
+async function getPublishDiagnostics() {
+    const resources = await getStoredResources();
+    const tasks = await TaskStore.getTasks();
+
+    const statusCounts = {};
+    const reasonCounts = {};
+    const recentFailures = [];
+    let totalAttempts = 0;
+    let totalPublished = 0;
+    let totalFailed = 0;
+    let totalSkipped = 0;
+    let totalAnchorVerified = 0;
+
+    for (const resource of resources) {
+        const status = String(resource?.status || 'pending');
+        statusCounts[status] = (statusCounts[status] || 0) + 1;
+
+        // 统计资源级别的 publishMeta 里的原因
+        const topReason = String(resource?.publishMeta?.submissionBlockReason || resource?.publishMeta?.terminalFailureReason || '').toLowerCase();
+        if (topReason && (status === 'failed' || status === 'unpublishable' || status === 'skipped')) {
+            reasonCounts[topReason] = (reasonCounts[topReason] || 0) + 1;
+        }
+
+        // 从 publishHistory 聚合每次尝试
+        const history = Object.values(resource?.publishHistory || {});
+        for (const entry of history) {
+            const attempts = entry?.attempts || {};
+            totalPublished += Number(attempts.published || 0);
+            totalFailed += Number(attempts.failed || 0);
+            totalSkipped += Number(attempts.skipped || 0);
+            totalAttempts += Number(attempts.published || 0) + Number(attempts.failed || 0) + Number(attempts.skipped || 0);
+
+            if (entry?.publishMeta?.anchorVisible) totalAnchorVerified++;
+
+            const entryReason = String(entry?.publishMeta?.submissionBlockReason || entry?.publishMeta?.terminalFailureReason || '').toLowerCase();
+            if (entryReason && entry?.lastStatus === 'failed') {
+                reasonCounts[entryReason] = (reasonCounts[entryReason] || 0) + 1;
+                if (recentFailures.length < 20) {
+                    recentFailures.push({
+                        url: resource?.url || '',
+                        status: entry?.lastStatus || '',
+                        reason: entryReason,
+                        lastAttemptAt: entry?.lastAttemptAt || '',
+                        domain: getDomainBg(resource?.url || '') || ''
+                    });
+                }
+            }
+        }
+    }
+
+    // 按原因数量排序，取 top 10
+    const topFailureReasons = Object.entries(reasonCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([reason, count]) => ({ reason, count }));
+
+    // 按时间倒序最近失败
+    recentFailures.sort((a, b) => String(b.lastAttemptAt).localeCompare(String(a.lastAttemptAt)));
+
+    // 任务级别统计
+    const taskStats = (tasks || [])
+        .filter((t) => t?.taskType === 'publish' || t?.workflowId === 'blog-comment-backlink')
+        .map((t) => ({
+            id: t.id,
+            name: t.name || t.website || '',
+            commentStyle: t.commentStyle || '',
+            mode: t.mode || '',
+            dailyPublishedCount: Number(t.dailyPublishedCount || 0),
+            dailyAnchorSuccessCount: Number(t.dailyAnchorSuccessCount || 0),
+            maxPublishes: Number(t.maxPublishes || 0)
+        }));
+
+    const successRate = totalAttempts > 0
+        ? ((totalPublished / totalAttempts) * 100).toFixed(1) + '%'
+        : 'n/a';
+    const anchorSuccessRate = totalPublished > 0
+        ? ((totalAnchorVerified / totalPublished) * 100).toFixed(1) + '%'
+        : 'n/a';
+
+    return {
+        success: true,
+        totalResources: resources.length,
+        statusCounts,
+        historyTotals: {
+            totalAttempts,
+            totalPublished,
+            totalFailed,
+            totalSkipped,
+            totalAnchorVerified,
+            successRate,
+            anchorSuccessRate
+        },
+        topFailureReasons,
+        recentFailures: recentFailures.slice(0, 15),
+        taskStats
+    };
 }
 
 async function performStorageMaintenance() {
