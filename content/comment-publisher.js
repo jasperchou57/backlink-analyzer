@@ -425,6 +425,8 @@
             : null;
 
         let commentFilled = !!standardFill?.commentFilled;
+        let richEditorFilled = false;
+
         if (commentFilled) {
             currentPublishMeta = {
                 ...(currentPublishMeta || {}),
@@ -435,6 +437,24 @@
                 formSignature: standardFill?.formSignature || buildFormSignature(form) || currentPublishMeta?.formSignature || ''
             };
             addDebugEvent('field', 'Standard comment form direct-filled');
+        }
+
+        // 富文本 iframe 路径：原生 textarea 被 TinyMCE/CKEditor 隐藏，常规填写无法触达
+        if (!commentFilled && values.comment) {
+            const richTarget = findRichEditorTargetInForm(form);
+            if (richTarget && fillRichEditorTarget(richTarget, values.comment)) {
+                commentFilled = true;
+                richEditorFilled = true;
+                currentPublishMeta = {
+                    ...(currentPublishMeta || {}),
+                    commentFieldVerified: true,
+                    commentEditorType: 'rich-iframe',
+                    commentFieldSelector: 'iframe[contenteditable]',
+                    commentFillStrategy: 'rich-iframe',
+                    formSignature: buildFormSignature(form) || currentPublishMeta?.formSignature || ''
+                };
+                addDebugEvent('field', 'Rich editor iframe (TinyMCE/CKEditor) filled directly');
+            }
         }
 
         if (!commentFilled && values.comment) {
@@ -452,7 +472,10 @@
             return;
         }
 
-        if (values.comment) {
+        // 富文本 iframe 路径已经写入并镜像到 textarea，常规 ensureCommentFieldValue
+        // 走的是 findBestField + isVisible，跨不进 iframe 也找不到隐藏 textarea，
+        // 直接跳过验证（fillRichEditorTarget 自身保证写入成功）
+        if (values.comment && !richEditorFilled) {
             const ensuredComment = await ensureCommentFieldValue(form, values.comment, context, {
                 allowTypingFallback: true
             });
@@ -1143,6 +1166,97 @@
         writeElementValue(el, value);
         dispatchFieldInputEvents(el);
         dispatchFieldChangeEvents(el);
+    }
+
+    // ===  富文本编辑器 (TinyMCE / CKEditor) iframe 处理 ===
+    // 这类编辑器把原生 textarea 隐藏掉（display:none），真正的可编辑区在 iframe 内部。
+    // 常规 form.querySelector 跨不进 iframe，导致评论字段完全找不到。
+    function inspectIframeAsRichEditor(iframe, hiddenTextarea = null) {
+        try {
+            const doc = iframe.contentDocument || iframe.contentWindow?.document;
+            if (!doc) return null;
+            const body = doc.body;
+            if (!body) return null;
+            const isEditor =
+                body.isContentEditable
+                || body.classList?.contains('mce-content-body')
+                || body.id === 'tinymce'
+                || !!doc.querySelector?.('[contenteditable="true"]');
+            if (!isEditor) return null;
+            // TinyMCE 4: iframe id 是 <textareaId>_ifr
+            if (!hiddenTextarea && iframe.id && iframe.id.endsWith('_ifr')) {
+                const baseId = iframe.id.replace(/_ifr$/, '');
+                const ta = document.getElementById(baseId);
+                if (ta instanceof HTMLTextAreaElement) hiddenTextarea = ta;
+            }
+            // 富文本 body 可能是 iframe.body 的子节点
+            const editable = body.isContentEditable ? body : doc.querySelector('[contenteditable="true"]');
+            return { iframe, body: editable || body, hiddenTextarea };
+        } catch {
+            return null;
+        }
+    }
+
+    function findRichEditorTargetInForm(form) {
+        if (!form) return null;
+        // 1. 表单内直接找 iframe（TinyMCE 5/6 把 iframe 包在 .tox-tinymce 内）
+        const iframes = form.querySelectorAll('iframe');
+        for (const iframe of iframes) {
+            const target = inspectIframeAsRichEditor(iframe);
+            if (target) return target;
+        }
+        // 2. TinyMCE 4 经典模式：表单内有隐藏 <textarea id="comment">，
+        //    iframe 在文档其他位置，id 为 "comment_ifr"
+        const textareas = form.querySelectorAll('textarea');
+        for (const ta of textareas) {
+            if (!ta.id) continue;
+            const iframe = document.getElementById(`${ta.id}_ifr`);
+            if (iframe instanceof HTMLIFrameElement) {
+                const target = inspectIframeAsRichEditor(iframe, ta);
+                if (target) return target;
+            }
+        }
+        return null;
+    }
+
+    function fillRichEditorTarget(target, value) {
+        if (!target?.body) return false;
+        try {
+            const text = String(value || '');
+            const looksLikeHtml = /<[a-z][^>]*>/i.test(text);
+            const html = looksLikeHtml
+                ? text
+                : text.split(/\n\n+/)
+                    .map((paragraph) => `<p>${paragraph.replace(/\n/g, '<br>')}</p>`)
+                    .join('');
+
+            target.body.innerHTML = html;
+
+            // iframe 内部的 input/change/keyup 让编辑器内部 MutationObserver/handler 触发
+            try {
+                target.body.dispatchEvent(new Event('input', { bubbles: true }));
+                target.body.dispatchEvent(new Event('change', { bubbles: true }));
+                target.body.dispatchEvent(new Event('keyup', { bubbles: true }));
+            } catch {}
+
+            // 镜像到隐藏 textarea，保证 form submit 时服务端能拿到值
+            if (target.hiddenTextarea) {
+                try {
+                    const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+                    if (descriptor?.set) {
+                        descriptor.set.call(target.hiddenTextarea, text);
+                    } else {
+                        target.hiddenTextarea.value = text;
+                    }
+                    target.hiddenTextarea.dispatchEvent(new Event('input', { bubbles: true }));
+                    target.hiddenTextarea.dispatchEvent(new Event('change', { bubbles: true }));
+                } catch {}
+            }
+            return true;
+        } catch (e) {
+            console.log('[BLA] fillRichEditorTarget 失败:', e);
+            return false;
+        }
     }
 
     async function ensureCommentFieldValue(form, comment, contextOrOptions = {}, extraOptions = {}) {
