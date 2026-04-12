@@ -178,6 +178,43 @@
         let score = 0;
 
         if (isVisible(form)) score += 20;
+
+        // 强正向信号：符合任一即视为"很可能是评论表单"，软化负向惩罚避免误杀
+        // 比如 WordPress 主题里 <form id="commentform"> 的父节点可能带 class "sidebar-newsletter"，
+        // 老的硬 -100 会直接废掉整个真实评论表单
+        const hasStrongCommentSignal =
+            /comment|respond|reply|wp-comments-post|commentform/.test(signature)
+            || !!form.closest('#comments, #respond, .comments-area, .comment-respond, .comment-form')
+            || !!form.querySelector('textarea[name="comment" i], textarea#comment, textarea[name*="comment" i], textarea[name*="reply" i], textarea[name*="message" i]');
+
+        // 负向排除：订阅/搜索/登录/联系表单
+        if (/subscribe|newsletter|signup|sign-up|sign_up|mailchimp|mailpoet|sendinblue|convertkit|optinmonster|popup|login|signin|sign-in|register|contact|search|mc-embedded|mc4wp/i.test(signature)) {
+            score -= hasStrongCommentSignal ? 40 : 120;
+        }
+        const formAction = (form.getAttribute?.('action') || '').toLowerCase();
+        if (/subscribe|newsletter|signup|mailchimp|sendinblue|convertkit|list-manage|campaign-archive/i.test(formAction)) {
+            score -= hasStrongCommentSignal ? 40 : 120;
+        }
+        // 只有邮箱字段没有 textarea 的表单，大概率是订阅/登录
+        // （但现代评论系统可能用 contenteditable 而不是 textarea，留救援空间）
+        if (!form.querySelector('textarea, [contenteditable="true"], .ql-editor, .ProseMirror') &&
+            form.querySelector('input[type="email"], input[name*="email" i], input[placeholder*="email" i]') &&
+            !form.querySelector('input[name="author"], input[name="name"], input#author')) {
+            score -= hasStrongCommentSignal ? 30 : 80;
+        }
+        // 文字内容排除：下载/订阅/发送类表单
+        if (/(send now|download|get the link|subscribe|sign up|join now|get access|get started|free download|lead magnet|opt.?in|get your|grab your)/i.test(text) &&
+            !/(comment|reply|leave a reply|leave a comment|评论|留言)/i.test(text)) {
+            score -= hasStrongCommentSignal ? 30 : 80;
+        }
+        // 没有 textarea 且输入框数量 <= 2 的小表单（典型是搜索框/订阅框）
+        if (!form.querySelector('textarea, [contenteditable="true"]')) {
+            const inputCount = form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"])').length;
+            if (inputCount <= 2 && !/(comment|respond|reply|wp-comments-post)/i.test(signature)) {
+                score -= hasStrongCommentSignal ? 20 : 60;
+            }
+        }
+
         if (/comment|respond|reply/.test(signature)) score += 35;
         if (/wp-comments-post/.test(signature)) score += 30;
         if (/(deja un comentario|leave a comment|leave a reply|发表评论|发表回复|reply|comentario|reactie|laisser un commentaire|message)/.test(text)) score += 25;
@@ -268,12 +305,36 @@
             }
         });
 
-        return Array.from(candidates.entries())
+        const sorted = Array.from(candidates.entries())
             .filter(([form]) => formHasInteractiveFields(form))
-            .sort((left, right) => right[1] - left[1])[0]?.[0] || null;
+            .sort((left, right) => right[1] - left[1]);
+
+        // 一级：正分表单（常规路径）
+        const positive = sorted.find(([, score]) => score > 0);
+        if (positive) return positive[0];
+
+        // 二级：分数轻度为负但带 textarea / 富文本编辑器（被负向关键词误伤的救援）
+        const rescued = sorted.find(([form, score]) =>
+            score > -50
+            && form.querySelector('textarea, [contenteditable="true"], .ql-editor, .ProseMirror, .mce-content-body')
+        );
+        if (rescued) return rescued[0];
+
+        // 三级：任意带 textarea + 提交按钮的表单（最后兜底，保证有评论框的页面不被直接放弃）
+        const lastResort = sorted.find(([form]) =>
+            form.querySelector('textarea')
+            && findBasicSubmitButton(form)
+            && !/search/.test(compactText(`${form.id || ''} ${form.className || ''}`).toLowerCase())
+        );
+        return lastResort ? lastResort[0] : null;
     }
 
-    function pageShowsExistingCommentBodyAnchors(root = globalScope.document) {
+    /**
+     * 统计评论正文里带链接的评论数量（去重按评论块）
+     * 返回数字而非布尔值，用于评估站点对链接的容忍度
+     * ≥3 条带链接评论 = 站主不删链接，发布成功率高
+     */
+    function countCommentBodyAnchors(root = globalScope.document) {
         const excludedSelectors = [
             '.comment-author',
             '.fn',
@@ -297,6 +358,9 @@
         ].join(', ');
 
         const anchors = Array.from(root.querySelectorAll(selectors));
+        const seenCommentBlocks = new Set();
+        let count = 0;
+
         for (const anchor of anchors) {
             if (!(anchor instanceof HTMLAnchorElement)) continue;
             const href = compactText(anchor.getAttribute('href') || '');
@@ -304,12 +368,21 @@
             if (!href || /^#|^(javascript|mailto|tel):/i.test(href)) continue;
             if (anchor.closest(excludedSelectors)) continue;
             if (text.length < 2) continue;
-            const block = anchor.closest('.comment-content, .comment-body, li.comment, article.comment, .comment, p, div');
-            const blockText = compactText(block?.textContent || '');
+            const block = anchor.closest('.comment-content, .comment-body, li.comment, article.comment, .comment');
+            if (!block) continue;
+            const blockText = compactText(block.textContent || '');
             if (blockText.length < 24) continue;
-            return true;
+            // 同一条评论里的多个链接只算一次
+            if (seenCommentBlocks.has(block)) continue;
+            seenCommentBlocks.add(block);
+            count++;
         }
-        return false;
+        return count;
+    }
+
+    // 保持向后兼容
+    function pageShowsExistingCommentBodyAnchors(root = globalScope.document) {
+        return countCommentBodyAnchors(root) > 0;
     }
 
     function pageAllowsHtmlLinks(form, root = globalScope.document) {
@@ -382,7 +455,8 @@
             requiresLogin: false,
             commentsClosed: false,
             resourceClass: '',
-            frictionLevel: ''
+            frictionLevel: '',
+            commentAnchorCount: 0
         };
 
         const pageText = compactText(root.body?.textContent || root.documentElement?.textContent || '').toLowerCase();
@@ -400,6 +474,10 @@
         const existingCommentNodes = root.querySelectorAll('.comment-list > *, .comment-body, li.comment, .comment-content, ol.commentlist > li, .comments-area .comment');
         const hasExistingComments = existingCommentNodes.length > 0;
         result.hasExistingComments = hasExistingComments;
+
+        // 统计评论正文里带链接的评论数量（哥飞标准第3条：≥3条带链接 = 站主不删链接）
+        const anchorCount = countCommentBodyAnchors(root);
+        result.commentAnchorCount = anchorCount;
 
         result.requiresLogin = loginRequired;
         result.commentsClosed = commentsClosed;
@@ -508,6 +586,7 @@
         buildFormSignature,
         scoreCommentForm,
         findRuleBasedCommentForm,
+        countCommentBodyAnchors,
         pageAllowsHtmlLinks,
         getRuntimeSupportedInlineModes,
         detectPageCommentCapabilities
