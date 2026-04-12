@@ -1,8 +1,8 @@
 const PublishRuntime = {
-    TAB_PRIME_DELAY_MS: 2000,
+    TAB_PRIME_DELAY_MS: 3500,
     COMMENT_SECTION_HASH: 'comments',
-    SUCCESS_REVIEW_DELAY_MS: 4200,
-    PENDING_REVIEW_DELAY_MS: 6200,
+    SUCCESS_REVIEW_DELAY_MS: 6000,
+    PENDING_REVIEW_DELAY_MS: 8000,
 
     createSessionId() {
         if (globalThis.crypto?.randomUUID) {
@@ -352,6 +352,18 @@ const PublishRuntime = {
                 return;
             }
 
+            // 检查页面是否加载成功（白屏/错误页/无法访问）
+            try {
+                const tabInfo = await chrome.tabs.get(tab.id);
+                const tabUrl = tabInfo?.url || '';
+                if (!tabUrl || tabUrl === 'about:blank' || tabUrl.startsWith('chrome-error://')) {
+                    throw new Error('页面加载失败（无法访问或服务器无响应）');
+                }
+            } catch (tabErr) {
+                if (tabErr.message.includes('页面加载失败')) throw tabErr;
+                throw new Error('页面标签已关闭或无法访问');
+            }
+
             await ctx.sendPublishToTab(tab.id, resource, task, workflow, settings);
         } catch (error) {
             ctx.releasePublishLease?.({
@@ -359,6 +371,30 @@ const PublishRuntime = {
                 resourceId: resource.id
             });
             await ctx.logger.error(`发布失败: ${resource.url}`, { error: error.message });
+
+            // 向当前 Tab 注入并显示失败提示（不依赖 content script 已加载）
+            try {
+                const tabId = ctx.getState().currentTabId;
+                if (tabId) {
+                    const failMsg = `发布失败：${error.message || '页面无法加载或脚本注入失败'}`;
+                    await chrome.scripting.executeScript({
+                        target: { tabId },
+                        func: (msg) => {
+                            const overlay = document.createElement('div');
+                            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:999998;';
+                            const toast = document.createElement('div');
+                            toast.innerHTML = '<div style="font-size:28px;margin-bottom:8px;">⚠️</div><div style="font-size:18px;font-weight:600;line-height:1.5;">' + msg.replace(/</g,'&lt;') + '</div><div style="font-size:13px;color:rgba(255,255,255,0.7);margin-top:10px;">3 秒后自动继续...</div>';
+                            toast.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#dc2626;color:white;padding:30px 40px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.4);text-align:center;min-width:320px;max-width:500px;';
+                            document.body.appendChild(overlay);
+                            document.body.appendChild(toast);
+                            setTimeout(() => { overlay.remove(); toast.remove(); }, 3000);
+                        },
+                        args: [failMsg]
+                    });
+                    await new Promise(r => setTimeout(r, 3200));
+                }
+            } catch {}
+
             await ctx.updateResourceStatus(resource.id, 'failed');
             ctx.updateState({ currentIndex: ctx.getState().currentIndex + 1 });
             await this.dispatchQueue(ctx);

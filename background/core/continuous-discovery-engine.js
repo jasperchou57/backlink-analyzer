@@ -4,13 +4,35 @@ const ContinuousDiscoveryEngine = {
             return { skipped: true };
         }
 
+        // 如果 frontier 里已经有待处理的域名，说明之前已经跑过种子采集
+        // 直接标记为已初始化，跳过重复采集
+        await ctx.ensureDomainIntelLoaded();
+        const seedDomain = ctx.getContinuousSeedDomain();
+        const myDomain = ctx.getContinuousMyDomain();
+        const frontier = ctx.getDomainEntry ? null : null; // 用下面的方式检查
+        let hasPendingDomains = false;
+        try {
+            const stateView = await ctx.getContinuousDiscoveryStateView();
+            hasPendingDomains = (stateView.pendingDomains || 0) > 0;
+        } catch {}
+
+        if (hasPendingDomains) {
+            await ctx.logger.collect(`种子网站已有 frontier 数据，跳过重复采集`);
+            await ctx.updateContinuousDiscoveryState({
+                seedInitialized: true,
+                currentDomain: '',
+                lastMessage: '种子网站已初始化，继续处理发现池'
+            });
+            return { skipped: true };
+        }
+
         await ctx.updateContinuousDiscoveryState({
-            currentDomain: ctx.getContinuousSeedDomain(),
-            lastMessage: `正在初始化种子网站 ${ctx.getContinuousSeedDomain()}`
+            currentDomain: seedDomain,
+            lastMessage: `正在初始化种子网站 ${seedDomain}`
         });
         await ctx.startCollect(
-            ctx.getContinuousSeedDomain(),
-            ctx.getContinuousMyDomain(),
+            seedDomain,
+            myDomain,
             ctx.getContinuousSources()
         );
         await ctx.updateContinuousDiscoveryState({

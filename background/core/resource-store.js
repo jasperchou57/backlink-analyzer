@@ -144,6 +144,7 @@
                 publishedAt: resource.publishedAt || '',
                 aiClassified: resource.aiClassified ? true : undefined,
                 gefeiSeed: resource.gefeiSeed ? true : undefined,
+                commentAnchorCount: Number(resource.commentAnchorCount || 0) || undefined,
                 publishMeta: sanitizePublishMetaForStorage(resource.publishMeta || {}),
                 publishHistory: sanitizePublishHistoryForStorage(resource.publishHistory || {})
             });

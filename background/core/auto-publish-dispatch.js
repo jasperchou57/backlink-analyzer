@@ -168,13 +168,25 @@ const AutoPublishDispatch = {
                     manualFocusTaskId: effectiveManualFocusTaskId
                 });
 
+                // 一次只启动一个任务，避免多个任务并发执行
+                // 如果当前已经有任务在跑，本次不再启动新任务
+                if (activeTaskIdSet.size > 0) {
+                    return {
+                        success: false,
+                        code: 'task_already_active',
+                        message: '已有发布任务在执行，不再并发启动新任务。',
+                        activeTaskIds: [...activeTaskIdSet]
+                    };
+                }
+
                 const startedTaskIds = [];
                 const failedResults = [];
+                // 只取最高分的一个候选启动
                 for (const candidate of candidates) {
                     const result = await startPublish(candidate.task, { autoDispatch: true });
                     if (result?.success) {
                         startedTaskIds.push(candidate.task.id || '');
-                        continue;
+                        break; // 启动一个就停止，不并发
                     }
                     failedResults.push({
                         taskId: candidate.task.id || '',

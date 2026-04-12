@@ -686,11 +686,14 @@
                         ? Math.min(100, Math.round((((sessionState.currentIndex || 0) + (isActivePublish ? 1 : 0)) / sessionState.total) * 100))
                         : 0;
                     const hasSessionLimit = Number(sessionState?.targetLimitCount || 0) > 0;
-                    const sessionLimitLabel = sessionState?.limitType === 'anchor-success'
-                        ? '今日成功锚文本'
-                        : '今日成功发布';
+                    const isAnchorLimitType = sessionState?.limitType === 'anchor-success'
+                        || task?.commentStyle === 'anchor-html'
+                        || task?.commentStyle === 'anchor-prefer';
+                    const sessionLimitLabel = isAnchorLimitType ? '今日成功锚文本' : '今日成功发布';
+                    // 始终用后端按日期自动重置的 currentLimitCount，不用历史累计的 anchorSuccess
+                    const sessionLimitDisplayCount = Number(sessionState?.currentLimitCount || 0);
                     const sessionLimitProgressPercent = hasSessionLimit
-                        ? Math.min(100, Math.round((Number(sessionState?.currentLimitCount || 0) / Number(sessionState?.targetLimitCount || 1)) * 100))
+                        ? Math.min(100, Math.round((sessionLimitDisplayCount / Number(sessionState?.targetLimitCount || 1)) * 100))
                         : queueProgressPercent;
                     const sessionAttemptCount = sessionState?.total
                         ? Math.min((sessionState.currentIndex || 0) + (isActivePublish ? 1 : 0), sessionState.total)
@@ -699,7 +702,7 @@
                     const taskQueuePendingCount = Math.max(0, Number(publishOverview.direct || 0));
                     const taskQueueProcessedCount = Math.max(0, taskQueueTotalCount - taskQueuePendingCount);
                     const sessionStatusText = hasSessionLimit
-                        ? `${sessionLimitLabel} ${Number(sessionState?.currentLimitCount || 0)} / ${Number(sessionState?.targetLimitCount || 0)}`
+                        ? `${sessionLimitLabel} ${sessionLimitDisplayCount} / ${Number(sessionState?.targetLimitCount || 0)}`
                         : (taskQueueTotalCount > 0 ? `待发布进度 ${taskQueueProcessedCount} / ${taskQueueTotalCount}` : (sessionState?.total ? `${sessionAttemptCount} / ${sessionState.total}` : '未启动'));
                     const sessionSecondaryText = hasSessionLimit
                         ? (taskQueueTotalCount > 0 ? `待发布进度 ${taskQueueProcessedCount} / ${taskQueueTotalCount}` : (sessionState?.total ? `当前轮队列 ${sessionAttemptCount} / ${sessionState.total}` : ''))
@@ -715,7 +718,7 @@
                                     <span class="task-publish-lbl">待发布</span>
                                 </div>
                                 <div class="task-publish-stat">
-                                    <span class="task-publish-num green">${publishOverview.published}</span>
+                                    <span class="task-publish-num green">${publishOverview.anchorSubmitted > 0 ? publishOverview.anchorSubmitted : publishOverview.published}</span>
                                     <span class="task-publish-lbl">已发布</span>
                                 </div>
                                 <div class="task-publish-stat">

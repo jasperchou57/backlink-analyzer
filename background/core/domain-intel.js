@@ -388,21 +388,24 @@ const DomainIntel = {
             }
         }
 
-        async function getDomainIntelView() {
+        async function getDomainIntelView(options = {}) {
             await ensureLoaded();
-            const items = [...cache.frontier]
-                .map((entry) => ({
-                    ...entry,
-                    profile: cache.profiles[entry.domain] || {}
-                }))
+            const limit = Number(options.limit || 200);
+            const allItems = [...cache.frontier]
                 .sort((a, b) => (b.qualityScore || 0) - (a.qualityScore || 0) || String(b.lastSeenAt || '').localeCompare(String(a.lastSeenAt || '')));
 
             const stats = {
-                total: items.length,
-                profiled: items.filter((item) => item.profile?.profiledAt).length,
-                expanded: items.filter((item) => item.status === 'expanded').length,
-                commentDiscovered: items.filter((item) => (item.commentMentions || 0) > 0).length
+                total: allItems.length,
+                profiled: allItems.filter((item) => cache.profiles[item.domain]?.profiledAt).length,
+                expanded: allItems.filter((item) => item.status === 'expanded').length,
+                commentDiscovered: allItems.filter((item) => (item.commentMentions || 0) > 0).length
             };
+
+            // 只传前 N 个给 popup，避免超过 Chrome 64MB 消息限制
+            const items = allItems.slice(0, limit).map((entry) => ({
+                ...entry,
+                profile: cache.profiles[entry.domain] || {}
+            }));
 
             return { items, stats };
         }

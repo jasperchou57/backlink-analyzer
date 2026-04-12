@@ -244,6 +244,11 @@ function getResourcePublishRankingScore(resource = {}, task = {}, siteTemplates 
     if (hasUrlField) score += 1100;
     if (hasInlineSubmitForm) score += 1700;
     if (hasCaptcha) score -= 2800;
+    // 评论正文带链接数量越多 = 站主对链接容忍度越高 = 优先发布
+    const commentAnchorCount = Number(resource.commentAnchorCount || 0);
+    if (commentAnchorCount >= 3) score += 3200;        // ≥3 条带链接评论，高优先级
+    else if (commentAnchorCount >= 1) score += 1200;   // 1-2 条，中等优先级
+    // 0 条不加分也不减分
     score += Math.min(templateScore, 80) * 120;
     score += Math.min(discoveryEdgeCount, 8) * 90;
     score += Number(sourceEvidence.commentObserved || 0) * 240;

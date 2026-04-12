@@ -176,7 +176,7 @@ const TaskManager = {
             seedDomain: normalizedDomain ? `https://${normalizedDomain}/` : '',
             myDomain: normalizedMyDomain ? `https://${normalizedMyDomain}/` : '',
             sources: normalizedSources,
-            seedInitialized: (seedChanged || pendingFrontierDomains === 0) ? false : !!current.seedInitialized,
+            seedInitialized: seedChanged ? false : !!current.seedInitialized,
             currentDomain: '',
             phase: 'queued',
             phaseLabel: '准备启动',

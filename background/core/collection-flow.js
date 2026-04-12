@@ -284,6 +284,17 @@ async function extractCommenterDomains(html, context = {}) {
             !domain.includes('google.com') &&
             !domain.includes('facebook.com') &&
             !domain.includes('twitter.com') &&
+            !domain.includes('instagram.com') &&
+            !domain.includes('linkedin.com') &&
+            !domain.includes('youtube.com') &&
+            !domain.includes('tiktok.com') &&
+            !domain.includes('pinterest.com') &&
+            !domain.includes('reddit.com') &&
+            !domain.includes('medium.com') &&
+            !domain.includes('tumblr.com') &&
+            !/\.edu$/i.test(domain) &&
+            !/\.gov$/i.test(domain) &&
+            !/\.mil$/i.test(domain) &&
             !collectState.discoveredDomains.has(domain)) {
             collectState.discoveredDomains.add(domain);
             newlyDiscovered.push({

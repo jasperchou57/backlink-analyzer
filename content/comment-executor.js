@@ -326,8 +326,9 @@
         focusElement(el);
         writeCommentValue(el, '', { preferHtmlWrite: false });
 
-        const minDelay = Number(options.minDelay || 8);
-        const maxDelay = Math.max(minDelay, Number(options.maxDelay || 18));
+        const minDelay = Number(options.minDelay || 3);
+        const maxDelay = Math.max(minDelay, Number(options.maxDelay || 8));
+        let charCount = 0;
         for (const char of nextValue) {
             el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: char }));
             if (el.tagName?.toLowerCase() === 'textarea') {
@@ -337,8 +338,14 @@
                 dispatchInputEvents(el);
             }
             el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: char }));
+            charCount++;
+            // 每 10 个字符重置一次超时计时器，防止打字过程中被超时中断
+            if (charCount % 10 === 0 && typeof globalScope.pokeWorkflowStallTimer === 'function') {
+                globalScope.pokeWorkflowStallTimer();
+            }
             await wait(Math.floor(minDelay + Math.random() * (maxDelay - minDelay + 1)));
         }
+
     }
 
     function valueLooksVerified(el, expectedValue, options = {}) {
@@ -386,32 +393,31 @@
     }
 
     async function applyCommentToCandidate(candidate, comment, options = {}) {
-        const strategy = resolveStrategy(candidate, comment, options.execution || {});
         const hasAnchorHtml = /<a\b[^>]*href\s*=/i.test(String(comment || ''));
-        const strategyOrder = strategy === 'typing' ? ['typing', 'direct'] : ['direct', 'typing'];
 
-        for (const mode of strategyOrder) {
-            if (mode === 'typing' && candidate.editorType !== 'textarea' && hasAnchorHtml) {
-                continue;
-            }
+        // 策略：先用 direct 模式快速填入（不逐字打字），验证成功就完成
+        // 只有 direct 失败才回退到模拟打字
+        focusElement(candidate.element);
+        writeCommentValue(candidate.element, comment, {
+            preferHtmlWrite: hasAnchorHtml && candidate.editorType !== 'textarea'
+        });
+        if (valueLooksVerified(candidate.element, comment, options)) {
+            blurElement(candidate.element);
+            return buildResult(candidate, 'direct', true, options.candidateCount);
+        }
 
+        // direct 失败，尝试模拟打字（跳过不支持打字的锚文本场景）
+        if (!(candidate.editorType !== 'textarea' && hasAnchorHtml)) {
             focusElement(candidate.element);
-            if (mode === 'typing') {
-                await simulateTyping(candidate.element, comment, options);
-            } else {
-                writeCommentValue(candidate.element, comment, {
-                    preferHtmlWrite: hasAnchorHtml && candidate.editorType !== 'textarea'
-                });
-            }
-
+            await simulateTyping(candidate.element, comment, options);
             if (valueLooksVerified(candidate.element, comment, options)) {
                 blurElement(candidate.element);
-                return buildResult(candidate, mode, true, options.candidateCount);
+                return buildResult(candidate, 'typing', true, options.candidateCount);
             }
         }
 
         blurElement(candidate.element);
-        return buildResult(candidate, strategy, false, options.candidateCount);
+        return buildResult(candidate, 'direct', false, options.candidateCount);
     }
 
     async function fillCommentField(form, comment, options = {}) {

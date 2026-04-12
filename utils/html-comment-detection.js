@@ -135,12 +135,28 @@
             return null;
         }
 
+        // ── 统计评论正文里带链接的评论数量（哥飞标准第3条）────
+
+        let commentAnchorCount = 0;
+        const commentBodyPattern = /class="[^"]*comment[-_]?(content|body|text)[^"]*"[^>]*>([\s\S]*?)<\/div>/gi;
+        let cbMatch;
+        while ((cbMatch = commentBodyPattern.exec(text)) !== null) {
+            const commentHtml = cbMatch[2] || '';
+            // 排除作者链接区域，只看评论正文里的链接
+            if (/<a\s[^>]*href\s*=\s*["']https?:\/\/[^"']+["'][^>]*>[^<]{2,}<\/a>/i.test(commentHtml)) {
+                commentAnchorCount++;
+            }
+        }
+
         // ── 构建资源信号 ─────────────────────────────────────
 
         const pageTitle = text.match(/<title[^>]*>(.*?)<\/title>/i)?.[1]?.trim()?.substring(0, 100) || '';
         const details = ['wordpress', 'inline-submit-form', 'website-field'];
         if (hasExistingComments) {
             details.push('has-existing-comments');
+        }
+        if (commentAnchorCount >= 3) {
+            details.push('comment-links-verified');
         }
         const linkModes = ['website-field'];
 
@@ -174,7 +190,8 @@
             commentsClosed: false,
             resourceClass: 'blog-comment',
             frictionLevel: 'low',
-            directPublishReady: true
+            directPublishReady: true,
+            commentAnchorCount
         };
     }
 

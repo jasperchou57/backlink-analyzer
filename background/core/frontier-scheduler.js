@@ -73,6 +73,32 @@ const FrontierScheduler = {
         entry.crawlDepth = Math.max(entry.crawlDepth || 0, depth);
     },
 
+    /**
+     * 判断域名是否因连续失败而应被跳过
+     * 条件：blockedPublishCount >= 3 且 publishSuccessCount == 0 且已经分析过足够多次
+     */
+    shouldSkipDomain(entry) {
+        if (!entry) return false;
+        const blocked = Number(entry.blockedPublishCount || 0);
+        const success = Number(entry.publishSuccessCount || 0);
+        const analyzed = Number(entry.commentOpportunityCount || 0) + blocked;
+
+        // 至少有 3 次失败记录，且从未成功过，且已分析过至少 3 次
+        if (blocked >= 3 && success === 0 && analyzed >= 3) return true;
+
+        return false;
+    },
+
+    /**
+     * 不值得递归分析的域名（.edu/.gov/社交媒体等）
+     */
+    isUnwantedDomain(domain) {
+        if (!domain) return true;
+        if (/\.(edu|gov|mil)$/i.test(domain)) return true;
+        if (/^(facebook|twitter|x|instagram|linkedin|youtube|tiktok|pinterest|reddit|medium|tumblr|flickr|vimeo|t\.co|gravatar|wordpress\.com|blogger\.com)\./i.test(domain)) return true;
+        return false;
+    },
+
     getNextPendingEntry(frontier = [], options = {}) {
         const seedDomain = options.seedDomain || '';
         const myDomain = options.myDomain || '';
@@ -81,7 +107,12 @@ const FrontierScheduler = {
             .filter((entry) => {
                 if (!entry?.domain) return false;
                 if (entry.domain === seedDomain || entry.domain === myDomain) return false;
-                return (entry.crawlStatus || 'pending') === 'pending';
+                if ((entry.crawlStatus || 'pending') !== 'pending') return false;
+                // 跳过不值得分析的域名
+                if (this.isUnwantedDomain(entry.domain)) return false;
+                // 跳过连续失败的域名
+                if (this.shouldSkipDomain(entry)) return false;
+                return true;
             })
             .sort((a, b) => {
                 const depthDiff = (a.crawlDepth || 0) - (b.crawlDepth || 0);
