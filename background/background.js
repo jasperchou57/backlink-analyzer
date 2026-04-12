@@ -418,27 +418,16 @@ async function handlePublishWatchdogAlarm(taskId) {
         currentUrl: session.currentUrl || meta.currentUrl || ''
     });
 
-    // 向 Tab 弹提示
-    try {
-        const tabId = session.currentTabId;
-        if (tabId) {
-            await chrome.scripting.executeScript({
-                target: { tabId },
-                func: (msg) => {
-                    const overlay = document.createElement('div');
-                    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:999998;';
-                    const toast = document.createElement('div');
-                    toast.innerHTML = '<div style="font-size:28px;margin-bottom:8px;">⚠️</div><div style="font-size:18px;font-weight:600;line-height:1.5;">' + msg.replace(/</g,'&lt;') + '</div><div style="font-size:13px;color:rgba(255,255,255,0.7);margin-top:10px;">3 秒后自动继续...</div>';
-                    toast.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#dc2626;color:white;padding:30px 40px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.4);text-align:center;min-width:320px;max-width:500px;';
-                    document.body.appendChild(overlay);
-                    document.body.appendChild(toast);
-                    setTimeout(() => { overlay.remove(); toast.remove(); }, 3000);
-                },
-                args: ['发布失败：页面长时间无响应（已自动恢复）']
-            });
+    // 注入提示，2 秒硬超时；卡死则强制重置 tab
+    const tabId = session.currentTabId;
+    if (tabId) {
+        const toastShown = await tryShowFailureToastInTab(tabId, '发布失败：页面长时间无响应（已自动恢复）', 2000);
+        if (toastShown) {
             await new Promise(r => setTimeout(r, 3200));
+        } else {
+            await resetHungTab(tabId);
         }
-    } catch {}
+    }
 
     await handleCommentAction(activeResourceId, 'failed', taskId, {
         reportedVia: 'alarm-watchdog',
@@ -692,6 +681,46 @@ function clearPublishWatchdog(taskId) {
     chrome.alarms.clear(`publish-watchdog-${taskId}`).catch(() => {});
 }
 
+// 在 tab 里显示一个红色 toast，但带 2 秒硬超时
+// 用于看门狗超时时通知用户。如果 tab 卡死（"页面无响应"），不浪费时间等，直接跳过
+async function tryShowFailureToastInTab(tabId, msg, injectTimeoutMs = 2000) {
+    if (!tabId) return false;
+    try {
+        await Promise.race([
+            chrome.scripting.executeScript({
+                target: { tabId },
+                func: (m) => {
+                    const overlay = document.createElement('div');
+                    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:999998;';
+                    const toast = document.createElement('div');
+                    toast.innerHTML = '<div style="font-size:28px;margin-bottom:8px;">⚠️</div><div style="font-size:18px;font-weight:600;line-height:1.5;">' + m.replace(/</g, '&lt;') + '</div><div style="font-size:13px;color:rgba(255,255,255,0.7);margin-top:10px;">3 秒后自动继续...</div>';
+                    toast.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#dc2626;color:white;padding:30px 40px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.4);text-align:center;min-width:320px;max-width:500px;';
+                    document.body.appendChild(overlay);
+                    document.body.appendChild(toast);
+                    setTimeout(() => { overlay.remove(); toast.remove(); }, 3000);
+                },
+                args: [msg]
+            }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('toast-inject-timeout')), injectTimeoutMs))
+        ]);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+// 卡死的 tab 强制重置：navigate 到 about:blank 让 Chrome 杀掉旧 renderer，
+// 下一个资源派发时再 navigate 到新 URL 就能顺利加载
+async function resetHungTab(tabId) {
+    if (!tabId) return;
+    try {
+        await Promise.race([
+            chrome.tabs.update(tabId, { url: 'about:blank' }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('tab-reset-timeout')), 2500))
+        ]);
+    } catch {}
+}
+
 function schedulePublishWatchdog(taskId, options = {}) {
     if (!taskId || !options.resourceId) return;
 
@@ -742,29 +771,20 @@ function schedulePublishWatchdog(taskId, options = {}) {
                 currentUrl
             });
 
-            // 向当前 Tab 注入并显示超时提示
-            try {
-                const session2 = getPublishSessionState(taskId);
-                const tabId2 = session2.currentTabId;
-                if (tabId2) {
-                    const timeoutMsg = `发布失败：操作超时（${stage === 'submission' ? '提交后等待确认超时' : '页面响应太慢'}）`;
-                    await chrome.scripting.executeScript({
-                        target: { tabId: tabId2 },
-                        func: (msg) => {
-                            const overlay = document.createElement('div');
-                            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:999998;';
-                            const toast = document.createElement('div');
-                            toast.innerHTML = '<div style="font-size:28px;margin-bottom:8px;">⚠️</div><div style="font-size:18px;font-weight:600;line-height:1.5;">' + msg.replace(/</g,'&lt;') + '</div><div style="font-size:13px;color:rgba(255,255,255,0.7);margin-top:10px;">3 秒后自动继续...</div>';
-                            toast.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#dc2626;color:white;padding:30px 40px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.4);text-align:center;min-width:320px;max-width:500px;';
-                            document.body.appendChild(overlay);
-                            document.body.appendChild(toast);
-                            setTimeout(() => { overlay.remove(); toast.remove(); }, 3000);
-                        },
-                        args: [timeoutMsg]
-                    });
+            // 向当前 Tab 注入红色 toast 提示，但带 2 秒硬超时
+            // 如果 tab 卡死（Chrome "页面无响应"），跳过 toast 直接进入失败处理
+            const sessionForTab = getPublishSessionState(taskId);
+            const hungTabId = sessionForTab.currentTabId;
+            if (hungTabId) {
+                const timeoutMsg = `发布失败：操作超时（${stage === 'submission' ? '提交后等待确认超时' : '页面响应太慢'}）`;
+                const toastShown = await tryShowFailureToastInTab(hungTabId, timeoutMsg, 2000);
+                if (toastShown) {
                     await new Promise(r => setTimeout(r, 3200));
+                } else {
+                    // tab 没响应，强制重置释放卡死的 renderer
+                    await resetHungTab(hungTabId);
                 }
-            } catch {}
+            }
 
             await handleCommentAction(resourceId, 'failed', taskId, {
                 reportedVia: 'watchdog',
