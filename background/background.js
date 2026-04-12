@@ -2115,18 +2115,52 @@ async function cleanupResourceQueue() {
         }
 
         const domain = getDomainBg(resource.url || '') || '';
+        const details = Array.isArray(resource.details) ? resource.details : [];
+        const detailsSet = new Set(details);
         const reasons = [];
 
+        // 1. 不值得分析的域名
         if (domain && FrontierScheduler.isUnwantedDomain(domain)) {
             reasons.push('unwanted-domain');
         }
 
+        // 2. 硬阻断信号（采集时写进 details 的 blockers）
+        if (detailsSet.has('login-required')) reasons.push('login-required');
+        if (detailsSet.has('comment-closed')) reasons.push('comments-closed');
+        if (detailsSet.has('captcha')) reasons.push('captcha-blocked');
+
+        // 3. 运行时字段（发布时 detectPageCommentCapabilities 写入，老数据大多没有）
         if (resource.hasExistingComments === true && resource.hasCommentForm === false) {
             reasons.push('comments-closed-inferred');
         }
         if (resource.commentsClosed === true) reasons.push('comments-closed');
-        if (resource.requiresLogin === true) reasons.push('login-required');
+        if (resource.requiresLogin === true || resource.requiresLoginToPost === true) {
+            reasons.push('login-required');
+        }
+        if (resource.hasCaptcha === true) reasons.push('captcha-blocked');
 
+        // 4. 弱资源组合：weak 类 + 非 directPublishReady + 0 锚链 + 0 linkMode
+        //    = 没有任何强信号，且没有任何留链通道，几乎肯定发不了
+        const anchorCount = Number(resource.commentAnchorCount || 0);
+        const resourceClass = String(resource.resourceClass || '').toLowerCase();
+        const isWeakClass = resourceClass === 'weak';
+        const hasDirectPublish = resource.directPublishReady === true;
+        const linkModes = Array.isArray(resource.linkModes) ? resource.linkModes : [];
+        if (isWeakClass && !hasDirectPublish && anchorCount === 0 && linkModes.length === 0) {
+            reasons.push('weak-no-signal');
+        }
+
+        // 5. 核心元素缺失：连 textarea 都没找到 → 没地方写评论
+        if (detailsSet.has('no-textarea') && anchorCount === 0) {
+            reasons.push('no-textarea');
+        }
+
+        // 6. 没有任何 opportunities = 完全没地方留链
+        if (!Array.isArray(resource.opportunities) || resource.opportunities.length === 0) {
+            reasons.push('no-opportunity');
+        }
+
+        // 7. 历史连续失败或历史硬阻断
         const historyEntries = Object.values(resource.publishHistory || {});
         for (const entry of historyEntries) {
             const failed = Number(entry?.attempts?.failed || 0);
@@ -2144,7 +2178,8 @@ async function cleanupResourceQueue() {
 
         if (reasons.length > 0) {
             counts.markedUnpublishable++;
-            reasons.forEach((r) => {
+            const dedupedReasons = Array.from(new Set(reasons));
+            dedupedReasons.forEach((r) => {
                 reasonStats[r] = (reasonStats[r] || 0) + 1;
             });
             return {
@@ -2152,18 +2187,18 @@ async function cleanupResourceQueue() {
                 status: 'unpublishable',
                 publishMeta: {
                     ...(resource.publishMeta || {}),
-                    unpublishableReason: reasons.join(','),
+                    unpublishableReason: dedupedReasons.join(','),
                     cleanupMarkedAt: new Date().toISOString()
                 }
             };
         }
 
-        const anchorCount = Number(resource.commentAnchorCount || 0);
+        // 高质量加权：≥3 条带链接评论
         if (anchorCount >= 3) {
             counts.boosted++;
             return {
                 ...resource,
-                details: Array.from(new Set([...(resource.details || []), 'anchor-count-boost']))
+                details: Array.from(new Set([...details, 'anchor-count-boost']))
             };
         }
 
