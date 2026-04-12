@@ -103,8 +103,13 @@
 
             const activeFilter = document.querySelector('.res-filter.active');
             const filter = activeFilter ? activeFilter.dataset.filter : 'all';
-            const allResources = await storageHelper.getResources();
+            const rawResources = await storageHelper.getResources();
             if (requestId !== refreshRequestId) return;
+
+            // 全局过滤：被清理或硬失败下架的资源所有 tab 都不显示
+            const allResources = (rawResources || []).filter(
+                (resource) => String(resource?.status || '') !== 'unpublishable'
+            );
 
             const directPublishTask = {
                 workflowId: 'blog-comment-backlink',
