@@ -400,6 +400,8 @@
     }
 
     function isPublishCandidateForTask(resource, task = {}) {
+        // 已被清理或运行时硬失败的资源，所有调用方都不该再把它当作候选
+        if (String(resource?.status || '') === 'unpublishable') return false;
         if (resourceIsCommentOnly(resource)) return false;
 
         const workflowId = task?.workflowId || '';
