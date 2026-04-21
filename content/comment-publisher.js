@@ -13,6 +13,7 @@
     let currentResourceId = null;
     let currentTaskId = null;
     let currentSessionId = null;
+    let currentAttemptId = '';
     let currentDebugMode = false;
     let currentDebugInfo = null;
     let publishStopped = false;
@@ -23,6 +24,30 @@
     let workflowStallTimer = null;
     let currentPublishMeta = null;
     const WORKFLOW_STALL_TIMEOUT_MS = 18000;
+
+    /**
+     * 黑匣子事件记录器：通过 runtime.sendMessage 把 content script 层的事件发给后台落库。
+     * 不阻塞主流程，发送失败静默忽略。
+     * 字段 schema 见 background.js 的 normalizePublishEventEntry。
+     */
+    function logPublishEvent(event, data = {}) {
+        try {
+            chrome.runtime.sendMessage({
+                action: 'publishEvent',
+                event: {
+                    ts: Date.now(),
+                    attemptId: currentAttemptId,
+                    layer: 'content',
+                    stage: currentPublishMeta?.workflowStage || '',
+                    event: String(event || 'unknown'),
+                    taskId: currentTaskId || '',
+                    resourceId: currentResourceId || '',
+                    url: (typeof location !== 'undefined' && location.href) || '',
+                    data: data && typeof data === 'object' ? data : {}
+                }
+            }).catch(() => {});
+        } catch {}
+    }
 
     const NUMBER_WORDS = {
         zero: 0,
@@ -178,6 +203,7 @@
         currentResourceId = data.resourceId;
         currentTaskId = data.taskId;
         currentSessionId = data.sessionId || null;
+        currentAttemptId = data.attemptId || '';
         currentDebugMode = !!data.debugMode;
         currentDebugInfo = { mode: data.mode || 'semi-auto', actions: [] };
         publishStopped = false;
@@ -186,6 +212,15 @@
         clearAutoSubmitTimer();
         clearSubmissionFallbackTimer();
         clearWorkflowStallTimer();
+
+        logPublishEvent('workflow-start', {
+            mode: data.mode || 'semi-auto',
+            commentStyle: data.commentStyle || 'standard',
+            useAI: data.useAI !== false,
+            debugMode: currentDebugMode,
+            retryWithoutWebsite: !!data.retryWithoutWebsite,
+            websiteOmitted: !data.website
+        });
         // 新任务入口先 disarm，防止同 tab 复用时上一轮的 armed 状态残留
         try {
             window.dispatchEvent(new CustomEvent('__bla_inspect_disarm'));
@@ -246,6 +281,7 @@
             const hardSignal = detectHardUnpublishableSignal();
             if (hardSignal) {
                 addDebugEvent('field', `Hard unpublishable signal: ${hardSignal}`);
+                logPublishEvent('hard-signal-detected', { reason: hardSignal });
                 reportResult('failed', {
                     reason: hardSignal,
                     submissionBlocked: true,
@@ -255,7 +291,9 @@
                 return;
             }
 
-            if (await maybeExecuteStandardCommentFastFlow(context)) {
+            const fastFlowRan = await maybeExecuteStandardCommentFastFlow(context);
+            logPublishEvent('fast-flow-check', { ran: fastFlowRan });
+            if (fastFlowRan) {
                 return;
             }
             await executeWorkflow(context);
@@ -383,6 +421,7 @@
 
     async function executeFindFormStep(step, context) {
         updateWorkflowProgress(context, 'finding_form', '正在识别评论表单');
+        const findStartMs = Date.now();
         await primeCommentSectionSearch(context, { immediate: true, forceProgressiveScroll: true });
         context.form = await waitForCommentForm(context, {
             useAI: context.useAI && step.useAI !== false && context.execution.useAIForForm,
@@ -393,8 +432,17 @@
 
         if (!context.form) {
             addDebugEvent('field', 'Comment form not found');
+            logPublishEvent('find-form-result', {
+                found: false,
+                durationMs: Date.now() - findStartMs,
+                timeoutMs: context.execution.formTimeoutMs
+            });
             throw new Error('Comment form not found');
         }
+        logPublishEvent('find-form-result', {
+            found: true,
+            durationMs: Date.now() - findStartMs
+        });
 
         updateWorkflowProgress(context, 'form_detected', '已识别评论表单');
         prepareFormForInteraction(context.form);
@@ -1495,6 +1543,7 @@
         // 提交前最后护栏：确保富文本编辑器 body 真的有我们的评论。
         // 否则 TinyMCE 提交时会用 iframe body（空）覆盖 textarea，站点收到空评论。
         const richGuard = ensureRichEditorSynced(form, fallbackComment);
+        logPublishEvent('rich-editor-guard', { result: richGuard });
         if (richGuard === 'fill-failed') {
             addDebugEvent('field', 'Rich editor detected but could not be synced before submit');
             reportResult('failed', {
@@ -1532,6 +1581,11 @@
         }).catch(() => {});
 
         const triggered = await triggerSubmitAction(form, submitBtn);
+        logPublishEvent('submit-triggered', {
+            triggered,
+            hasSubmitBtn: !!submitBtn,
+            submitSelector: submitBtn ? describeElementForMeta(submitBtn) : ''
+        });
         if (!triggered) {
             addDebugEvent('field', 'Submit action could not be triggered');
             reportResult('failed', {
@@ -1552,6 +1606,12 @@
             clearSubmissionFallbackTimer();
             window.removeEventListener('__bla_network_signal', networkSignalHandler);
 
+            logPublishEvent('network-signal', {
+                type: detail.type,
+                source: detail.source || '',
+                url: detail.url || '',
+                status: detail.status
+            });
             if (detail.type === 'confirmed') {
                 reportResult('submitted', { reportedVia: 'network-confirmed', networkSignal: detail.type });
             } else if (detail.type === 'moderation') {
@@ -1606,6 +1666,15 @@
         try {
             window.dispatchEvent(new CustomEvent('__bla_inspect_disarm'));
         } catch {}
+        logPublishEvent('report-result', {
+            result,
+            reason: extraMeta?.reason || '',
+            reportedVia: extraMeta?.reportedVia || '',
+            submissionBlocked: !!extraMeta?.submissionBlocked,
+            submissionBlockReason: extraMeta?.submissionBlockReason || '',
+            reviewPending: !!extraMeta?.reviewPending,
+            unpublishable: !!extraMeta?.unpublishable
+        });
         const startedAt = currentPublishMeta?.publishStartedAt || '';
         const durationMs = startedAt ? Math.max(0, Date.now() - new Date(startedAt).getTime()) : 0;
 

@@ -884,6 +884,28 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
     const scriptFiles = ensurePublishContentScripts(workflowScriptFiles);
     const styleFiles = workflow?.styles?.length ? workflow.styles : ['content/comment-publisher.css'];
 
+    // 黑匣子：为这次 dispatch 分配 attemptId，贯穿 background / content 两层所有事件
+    const attemptId = createPublishAttemptId();
+    const eventBase = {
+        attemptId,
+        taskId: task?.id || '',
+        resourceId: resource?.id || '',
+        tabId,
+        url: resource?.url || ''
+    };
+    logPublishEvent('dispatch-start', {
+        ...eventBase,
+        data: {
+            workflowId: workflow?.id || '',
+            mode: task?.mode || 'semi-auto',
+            commentStyle: task?.commentStyle || 'standard',
+            retryWithoutWebsite: !!overrides.retryWithoutWebsite,
+            websiteOmitted: !websiteValue,
+            domainPolicyOmit: !!domainPolicy.omitWebsiteField,
+            templateHintAvoid: !!templateHint?.avoidWebsiteField
+        }
+    });
+
     // 给 executeScript 加 8 秒超时，防止页面无响应导致永久挂起
     const withTimeout = (promise, ms, label) => Promise.race([
         promise,
@@ -909,7 +931,12 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
                 'insertCSS'
             );
         }
+        logPublishEvent('scripts-injected', eventBase);
     } catch (e) {
+        logPublishEvent('scripts-inject-failed', {
+            ...eventBase,
+            data: { error: e?.message || String(e) }
+        });
         // 脚本注入失败/超时，立刻启动看门狗确保兜底跳走
         schedulePublishWatchdog(task.id, {
             stage: 'dispatch',
@@ -925,6 +952,7 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
         await chrome.tabs.sendMessage(tabId, {
             action: 'fillComment',
             data: {
+                attemptId,
                 name: task.name_commenter || settings.name || task.name || '',
                 email: task.email || settings.email || '',
                 website: websiteValue,
@@ -952,16 +980,25 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
                 siteTemplate: templateHint || null
             }
         });
+        logPublishEvent('fill-message-sent', eventBase);
     } catch (error) {
+        logPublishEvent('fill-message-failed', {
+            ...eventBase,
+            data: { error: error?.message || String(error) }
+        });
         throw new Error(`发送发布消息失败: ${error.message || 'unknown error'}`);
     }
+
+    // 把 attemptId 存进 session，供后续 watchdog / navigation-confirm / verifier 事件关联
+    updatePublishSessionState(task.id, { currentAttemptId: attemptId });
 
     // 看门狗必须启动，确保即使脚本卡住也能兜底跳走
     schedulePublishWatchdog(task.id, {
         stage: 'dispatch',
         resourceId: resource.id,
         currentUrl: resource.url,
-        sessionId: session.sessionId || ''
+        sessionId: session.sessionId || '',
+        attemptId
     });
 }
 
@@ -1025,7 +1062,8 @@ function classifyPostSubmitUrl(rawUrl = '') {
 
 async function finalizePendingSubmissionFromNavigation(taskId, tabId) {
     await ensurePublishSessionsLoaded();
-    const pending = getPublishSessionState(taskId).pendingSubmission;
+    const sessionSnapshot = getPublishSessionState(taskId);
+    const pending = sessionSnapshot.pendingSubmission;
     if (!pending || pending.tabId !== tabId) return;
 
     clearPublishWatchdog(taskId);
@@ -1038,7 +1076,17 @@ async function finalizePendingSubmissionFromNavigation(taskId, tabId) {
     } catch {}
 
     const classification = classifyPostSubmitUrl(postUrl);
+    const attemptId = sessionSnapshot.currentAttemptId || '';
+
     if (classification.blocked) {
+        logPublishEvent('navigation-confirm-blocked', {
+            attemptId,
+            taskId,
+            resourceId: pending.resourceId,
+            tabId,
+            url: postUrl,
+            data: { reason: classification.reason }
+        });
         // 跳转到 challenge/登录/错误页 → 评论肯定没发，标软可重试失败，
         // 走 SOFT_RETRYABLE 重试而不是一头扎进 'submitted' → verifier 再判错。
         await handleCommentAction(
@@ -1050,12 +1098,22 @@ async function finalizePendingSubmissionFromNavigation(taskId, tabId) {
                 reportedVia: 'navigation-confirm-blocked',
                 pageUrlAfterSubmit: postUrl,
                 submissionBlocked: true,
-                submissionBlockReason: 'publish-runtime-timeout'
+                submissionBlockReason: 'publish-runtime-timeout',
+                attemptId
             },
             pending.sessionId || ''
         );
         return;
     }
+
+    logPublishEvent('navigation-confirm-ok', {
+        attemptId,
+        taskId,
+        resourceId: pending.resourceId,
+        tabId,
+        url: postUrl,
+        data: {}
+    });
 
     await handleCommentAction(
         pending.resourceId,
@@ -1064,7 +1122,8 @@ async function finalizePendingSubmissionFromNavigation(taskId, tabId) {
         {
             ...(pending.meta || {}),
             reportedVia: 'navigation-confirm',
-            pageUrlAfterSubmit: postUrl
+            pageUrlAfterSubmit: postUrl,
+            attemptId
         },
         pending.sessionId || ''
     );

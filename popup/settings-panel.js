@@ -345,6 +345,14 @@
               <span class="settings-toggle-desc">开启后，即使任务是全自动，也会在提交前暂停。插件会高亮验证码/反垃圾复选框，并展示识别结果，方便你检查它是否正确过验证。</span>
             </span>
           </label>
+          <div style="font-size:11px;color:#8891a8;margin:10px 0 6px">
+            黑匣子事件日志：背景/内容脚本两层所有关键事件都按 attemptId 关联记录。卡死或误判时点"导出"把最近 2000 条事件存成 JSON，发给研发定位问题。
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn-test" id="btn-export-publish-events">📦 导出发布事件日志</button>
+            <button class="btn-test" id="btn-clear-publish-events" style="background:#3a2a2a;color:#ffcac0">🗑️ 清空</button>
+          </div>
+          <div class="test-result" id="publish-events-result"></div>
         </div>
 
         <button class="btn-save" id="btn-save-settings">${i18n.t('settings.save')}</button>
@@ -479,6 +487,50 @@
                 }
             } catch (e) {
                 resultEl.textContent = '✗ ' + (e?.message || '清理失败');
+                resultEl.className = 'test-result error';
+            }
+        });
+
+        overlay.querySelector('#btn-export-publish-events').addEventListener('click', async () => {
+            const resultEl = overlay.querySelector('#publish-events-result');
+            resultEl.textContent = '导出中...';
+            resultEl.className = 'test-result';
+            try {
+                const payload = await chrome.runtime.sendMessage({ action: 'exportPublishEventLog' });
+                if (!payload || !Array.isArray(payload.events)) {
+                    resultEl.textContent = '✗ 导出失败：无返回数据';
+                    resultEl.className = 'test-result error';
+                    return;
+                }
+                const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const ts = new Date().toISOString().replace(/[:.]/g, '-');
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `publish-events-${ts}.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(url), 5000);
+                resultEl.innerHTML = `✓ 已导出 ${payload.events.length} / ${payload.maxEvents} 条事件（extension v${payload.extensionVersion || '?'}）`;
+                resultEl.className = 'test-result success';
+            } catch (e) {
+                resultEl.textContent = '✗ ' + (e?.message || '导出失败');
+                resultEl.className = 'test-result error';
+            }
+        });
+
+        overlay.querySelector('#btn-clear-publish-events').addEventListener('click', async () => {
+            const resultEl = overlay.querySelector('#publish-events-result');
+            if (!confirm('确定清空黑匣子事件日志？之后再出问题就没有历史证据了。')) return;
+            resultEl.textContent = '清空中...';
+            resultEl.className = 'test-result';
+            try {
+                await chrome.runtime.sendMessage({ action: 'clearPublishEventLog' });
+                resultEl.textContent = '✓ 已清空';
+                resultEl.className = 'test-result success';
+            } catch (e) {
+                resultEl.textContent = '✗ ' + (e?.message || '清空失败');
                 resultEl.className = 'test-result error';
             }
         });

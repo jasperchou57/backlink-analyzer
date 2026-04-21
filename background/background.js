@@ -149,6 +149,146 @@ let publishSessions = TaskManager.createDefaultPublishSessions();
 let publishSessionsLoaded = false;
 const publishWatchdogs = new Map();
 const publishRetryTimers = new Map();
+
+// ─── 发布事件"黑匣子"记录器 ───
+// 结构化事件日志，跨 content / background 两层，通过 attemptId 关联一次发布的所有动作。
+// 卡死/误判问题时导出成 JSON 证据包用。环形缓冲区，超限丢最旧。
+const PUBLISH_EVENT_LOG_KEY = 'publishEventLog';
+const PUBLISH_EVENT_LOG_MAX = 2000;
+const PUBLISH_EVENT_FLUSH_DEBOUNCE_MS = 1500;
+let publishEventBuffer = [];
+let publishEventBufferLoaded = false;
+let publishEventBufferDirty = false;
+let publishEventFlushTimer = null;
+
+async function ensurePublishEventBufferLoaded() {
+    if (publishEventBufferLoaded) return;
+    try {
+        const data = await chrome.storage.local.get(PUBLISH_EVENT_LOG_KEY);
+        publishEventBuffer = Array.isArray(data?.[PUBLISH_EVENT_LOG_KEY]) ? data[PUBLISH_EVENT_LOG_KEY] : [];
+    } catch {
+        publishEventBuffer = [];
+    }
+    publishEventBufferLoaded = true;
+}
+
+function schedulePublishEventFlush() {
+    if (publishEventFlushTimer) return;
+    publishEventFlushTimer = setTimeout(async () => {
+        publishEventFlushTimer = null;
+        if (!publishEventBufferDirty) return;
+        publishEventBufferDirty = false;
+        try {
+            await chrome.storage.local.set({ [PUBLISH_EVENT_LOG_KEY]: publishEventBuffer });
+        } catch {}
+    }, PUBLISH_EVENT_FLUSH_DEBOUNCE_MS);
+}
+
+function appendPublishEventEntry(entry) {
+    publishEventBuffer.push(entry);
+    if (publishEventBuffer.length > PUBLISH_EVENT_LOG_MAX) {
+        publishEventBuffer.splice(0, publishEventBuffer.length - PUBLISH_EVENT_LOG_MAX);
+    }
+    publishEventBufferDirty = true;
+    schedulePublishEventFlush();
+}
+
+function normalizePublishEventEntry(raw = {}) {
+    return {
+        ts: Number(raw.ts) || Date.now(),
+        attemptId: String(raw.attemptId || ''),
+        layer: raw.layer === 'content' ? 'content' : 'bg',
+        stage: String(raw.stage || ''),
+        event: String(raw.event || 'unknown'),
+        taskId: String(raw.taskId || ''),
+        resourceId: String(raw.resourceId || ''),
+        tabId: Number.isFinite(Number(raw.tabId)) ? Number(raw.tabId) : null,
+        url: String(raw.url || ''),
+        data: raw.data && typeof raw.data === 'object' ? raw.data : {}
+    };
+}
+
+/**
+ * background 内部调用：记录一条发布事件。
+ * opts: { attemptId, stage, taskId, resourceId, tabId, url, data }
+ */
+function logPublishEvent(event, opts = {}) {
+    if (!publishEventBufferLoaded) {
+        // 缓冲还没加载，先入队，加载后再 flush
+        ensurePublishEventBufferLoaded().then(() => {
+            appendPublishEventEntry(normalizePublishEventEntry({
+                ts: Date.now(),
+                layer: 'bg',
+                event,
+                ...opts
+            }));
+        });
+        return;
+    }
+    appendPublishEventEntry(normalizePublishEventEntry({
+        ts: Date.now(),
+        layer: 'bg',
+        event,
+        ...opts
+    }));
+}
+
+/**
+ * content script 发来的事件经 runtime.sendMessage → 这里落库。
+ * 确保 tabId 从 sender 补全，layer 锁成 content。
+ */
+async function handlePublishEventFromContent(msg = {}, sender = {}) {
+    await ensurePublishEventBufferLoaded();
+    const raw = msg?.event || {};
+    appendPublishEventEntry(normalizePublishEventEntry({
+        ...raw,
+        layer: 'content',
+        tabId: raw.tabId ?? sender.tab?.id ?? null
+    }));
+}
+
+/**
+ * 一次性生成 attemptId。sendPublishToTab 时调一次，贯穿整条发布链路。
+ */
+function createPublishAttemptId() {
+    const rand = Math.random().toString(36).slice(2, 8);
+    return `att-${Date.now().toString(36)}-${rand}`;
+}
+
+async function exportPublishEventLog() {
+    await ensurePublishEventBufferLoaded();
+    // 先把未 flush 的写入，保证导出最新
+    if (publishEventBufferDirty && publishEventFlushTimer) {
+        clearTimeout(publishEventFlushTimer);
+        publishEventFlushTimer = null;
+        publishEventBufferDirty = false;
+        try {
+            await chrome.storage.local.set({ [PUBLISH_EVENT_LOG_KEY]: publishEventBuffer });
+        } catch {}
+    }
+    return {
+        exportedAt: new Date().toISOString(),
+        extensionVersion: chrome.runtime.getManifest?.()?.version || '',
+        totalEvents: publishEventBuffer.length,
+        maxEvents: PUBLISH_EVENT_LOG_MAX,
+        events: publishEventBuffer.slice()
+    };
+}
+
+async function clearPublishEventLog() {
+    await ensurePublishEventBufferLoaded();
+    publishEventBuffer = [];
+    publishEventBufferDirty = false;
+    if (publishEventFlushTimer) {
+        clearTimeout(publishEventFlushTimer);
+        publishEventFlushTimer = null;
+    }
+    try {
+        await chrome.storage.local.remove(PUBLISH_EVENT_LOG_KEY);
+    } catch {}
+    return { success: true };
+}
+// ─── 黑匣子记录器 END ───
 let autoPublishControlState = createDefaultAutoPublishControlState();
 let autoPublishControlLoaded = false;
 let resourceSignalNormalizationTimer = null;
@@ -412,6 +552,18 @@ async function handlePublishWatchdogAlarm(taskId) {
     const meta = metaData[metaKey] || {};
     await chrome.storage.session.remove(metaKey).catch(() => {});
 
+    logPublishEvent('alarm-watchdog-fired', {
+        attemptId: session.currentAttemptId || meta.attemptId || '',
+        taskId,
+        resourceId: activeResourceId,
+        url: session.currentUrl || meta.currentUrl || '',
+        data: {
+            hadPendingSubmit: !!session.pendingSubmission,
+            currentStage: session.currentStage || '',
+            currentStageAt: session.currentStageAt || ''
+        }
+    });
+
     await Logger.error('发布看门狗 Alarm 兜底触发（Service Worker 曾休眠）', {
         taskId,
         resourceId: activeResourceId,
@@ -498,6 +650,15 @@ function handleTabUpdated(tabId, changeInfo) {
     // 检查 pendingSubmission（表单已提交，等待页面跳转完成）
     const pendingTaskId = findPublishSessionTaskIdByPendingTab(tabId);
     if (pendingTaskId) {
+        const sess = getPublishSessionState(pendingTaskId);
+        logPublishEvent('tab-navigation-complete', {
+            attemptId: sess.currentAttemptId || '',
+            taskId: pendingTaskId,
+            resourceId: sess.pendingSubmission?.resourceId || '',
+            tabId,
+            url: changeInfo.url || sess.currentUrl || '',
+            data: { triggered: 'pending-submission' }
+        });
         finalizePendingSubmissionFromNavigation(pendingTaskId, tabId);
         return;
     }
@@ -798,6 +959,7 @@ function schedulePublishWatchdog(taskId, options = {}) {
             stage: options.stage || 'dispatch',
             currentUrl: options.currentUrl || '',
             sessionId: options.sessionId || '',
+            attemptId: options.attemptId || '',
             createdAt: Date.now()
         }
     }).catch(() => {});
@@ -807,6 +969,15 @@ function schedulePublishWatchdog(taskId, options = {}) {
     const resourceId = options.resourceId;
     const currentUrl = options.currentUrl || '';
     const sessionId = compactText(options.sessionId || '');
+    const attemptId = options.attemptId || getPublishSessionState(taskId)?.currentAttemptId || '';
+
+    logPublishEvent('watchdog-armed', {
+        attemptId,
+        taskId,
+        resourceId,
+        url: currentUrl,
+        data: { stage, timeoutMs, alarmDelayMs }
+    });
 
     const timer = setTimeout(async () => {
         publishWatchdogs.delete(taskId);
@@ -822,6 +993,19 @@ function schedulePublishWatchdog(taskId, options = {}) {
             if (sessionId && activeSessionId && sessionId !== activeSessionId) return;
             if (stage === 'dispatch' && activeResourceId !== resourceId) return;
             if (stage === 'submission' && pendingResourceId !== resourceId) return;
+
+            logPublishEvent('watchdog-fired', {
+                attemptId: session.currentAttemptId || attemptId,
+                taskId,
+                resourceId,
+                url: currentUrl,
+                data: {
+                    stage,
+                    hadPendingSubmit: !!session.pendingSubmission,
+                    currentStage: session.currentStage || '',
+                    currentStageAt: session.currentStageAt || ''
+                }
+            });
 
             await Logger.error('发布任务超时，已自动跳过当前资源', {
                 taskId,
@@ -1246,11 +1430,22 @@ async function handleCommentSubmittingMessage(msg = {}, sender = {}) {
             createdAt: Date.now()
         }
     });
+
+    logPublishEvent('pending-submission-set', {
+        attemptId: session.currentAttemptId || '',
+        taskId,
+        resourceId: msg.resourceId,
+        tabId: sender.tab?.id || session.currentTabId || null,
+        url: session.currentUrl || '',
+        data: { metaReportedVia: msg.meta?.reportedVia || '' }
+    });
+
     schedulePublishWatchdog(taskId, {
         stage: 'submission',
         resourceId: msg.resourceId,
         currentUrl: session.currentUrl,
-        sessionId: session.sessionId || ''
+        sessionId: session.sessionId || '',
+        attemptId: session.currentAttemptId || ''
     });
 }
 
@@ -1286,7 +1481,17 @@ async function handleCommentProgressMessage(msg = {}, sender = {}) {
         resourceId: msg.resourceId || activeResourceId,
         currentUrl: session.currentUrl,
         timeoutMs,
-        sessionId: session.sessionId || ''
+        sessionId: session.sessionId || '',
+        attemptId: session.currentAttemptId || ''
+    });
+
+    logPublishEvent('content-stage', {
+        attemptId: session.currentAttemptId || '',
+        stage: nextStage,
+        taskId,
+        resourceId: msg.resourceId || activeResourceId,
+        url: session.currentUrl || '',
+        data: { stageLabel: nextStageLabel, stageTimeoutMs: timeoutMs }
     });
 
     const nextState = getPublishSessionState(taskId);
@@ -1322,7 +1527,8 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
         networkSignal: (msg, sender) => handleNetworkSignal(msg.signal, sender),
         commentSubmitting: (msg, sender) => handleCommentSubmittingMessage(msg, sender),
         commentProgress: (msg, sender) => handleCommentProgressMessage(msg, sender),
-        republish: (msg) => republishResource(msg.resourceId, msg.taskId)
+        republish: (msg) => republishResource(msg.resourceId, msg.taskId),
+        publishEvent: (msg, sender) => handlePublishEventFromContent(msg, sender)
     },
     asyncActions: {
         startContinuousDiscovery: (msg) => startContinuousDiscovery(msg.domain, msg.myDomain, msg.sources),
@@ -1359,6 +1565,8 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
             await Logger.clear();
             return { success: true };
         },
+        exportPublishEventLog: async () => await exportPublishEventLog(),
+        clearPublishEventLog: async () => await clearPublishEventLog(),
         clearAllData: async () => await clearResourceWorkspace(),
         cleanupResourceQueue: async () => await cleanupResourceQueue(),
         getPublishDiagnostics: async () => await getPublishDiagnostics(),

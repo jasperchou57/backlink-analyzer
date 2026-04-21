@@ -421,6 +421,21 @@ const PublishRuntime = {
         const activeQueueIndex = Number(state.currentIndex || 0);
         const activeResourceId = state.queue?.[activeQueueIndex]?.id || '';
         if (activeResourceId && activeResourceId !== resourceId) {
+            if (typeof self !== 'undefined' && typeof self.logPublishEvent === 'function') {
+                self.logPublishEvent('handle-action-dropped', {
+                    attemptId: state.currentAttemptId || meta?.attemptId || '',
+                    taskId,
+                    resourceId,
+                    url: state.currentUrl || '',
+                    data: {
+                        reason: 'active-resource-mismatch',
+                        activeResourceId,
+                        queueIndex: activeQueueIndex,
+                        result,
+                        reportedVia: meta?.reportedVia || ''
+                    }
+                });
+            }
             return;
         }
 
@@ -430,7 +445,35 @@ const PublishRuntime = {
             && existingLock.resourceId === resourceId
             && Number(existingLock.queueIndex || 0) === activeQueueIndex
         ) {
+            if (typeof self !== 'undefined' && typeof self.logPublishEvent === 'function') {
+                self.logPublishEvent('handle-action-dropped', {
+                    attemptId: state.currentAttemptId || meta?.attemptId || '',
+                    taskId,
+                    resourceId,
+                    url: state.currentUrl || '',
+                    data: {
+                        reason: 'result-lock-held',
+                        lockResult: existingLock.result || '',
+                        incomingResult: result,
+                        reportedVia: meta?.reportedVia || ''
+                    }
+                });
+            }
             return;
+        }
+
+        if (typeof self !== 'undefined' && typeof self.logPublishEvent === 'function') {
+            self.logPublishEvent('handle-action-enter', {
+                attemptId: state.currentAttemptId || meta?.attemptId || '',
+                taskId,
+                resourceId,
+                url: state.currentUrl || '',
+                data: {
+                    result,
+                    reportedVia: meta?.reportedVia || '',
+                    hadPendingSubmit: !!state.pendingSubmission
+                }
+            });
         }
 
         ctx.updateState({
@@ -538,6 +581,26 @@ const PublishRuntime = {
                     policy: publishMeta.reviewPolicy || 'moderated'
                 });
             }
+            if (typeof self !== 'undefined' && typeof self.logPublishEvent === 'function') {
+                self.logPublishEvent('verifier-result', {
+                    attemptId: state.currentAttemptId || meta?.attemptId || '',
+                    taskId,
+                    resourceId,
+                    url: ctx.getState().currentUrl || '',
+                    data: {
+                        anchorVisible: !!verification?.anchorVisible,
+                        anchorCount: verification?.anchorCount || 0,
+                        anchorIsDofollow: !!verification?.anchorIsDofollow,
+                        anchorIsNofollow: !!verification?.anchorIsNofollow,
+                        anchorRel: verification?.anchorRel || '',
+                        commentLocated: !!verification?.commentLocated,
+                        reviewPending: !!verification?.reviewPending,
+                        submissionBlocked: !!verification?.submissionBlocked,
+                        submissionBlockReason: verification?.submissionBlockReason || '',
+                        pageUrl: verification?.pageUrl || ''
+                    }
+                });
+            }
             if (publishMeta.submissionBlocked) {
                 status = 'failed';
                 await ctx.logger.error('评论提交被站点拦截，已改判为失败', {
@@ -562,6 +625,18 @@ const PublishRuntime = {
                 status = 'failed';
                 publishMeta.submissionBlocked = true;
                 publishMeta.submissionBlockReason = publishMeta.submissionBlockReason || 'publish-runtime-timeout';
+                if (typeof self !== 'undefined' && typeof self.logPublishEvent === 'function') {
+                    self.logPublishEvent('provisional-guard-flipped', {
+                        attemptId: state.currentAttemptId || meta?.attemptId || '',
+                        taskId,
+                        resourceId,
+                        url: ctx.getState().currentUrl || '',
+                        data: {
+                            reportedVia,
+                            reason: publishMeta.submissionBlockReason
+                        }
+                    });
+                }
                 await ctx.logger.error('通道未直接确认且验证器未找到评论证据，改判为软可重试失败', {
                     url: ctx.getState().currentUrl,
                     reportedVia
@@ -704,6 +779,26 @@ const PublishRuntime = {
             ) {
                 publishMeta.statsStatus = 'failed';
             }
+        }
+
+        if (typeof self !== 'undefined' && typeof self.logPublishEvent === 'function') {
+            self.logPublishEvent('status-transition', {
+                attemptId: state.currentAttemptId || meta?.attemptId || '',
+                taskId,
+                resourceId,
+                url: ctx.getState().currentUrl || '',
+                data: {
+                    rawResult: publishMeta.rawResult || '',
+                    finalStatus: status,
+                    statsStatus: publishMeta.statsStatus,
+                    submissionBlockReason: publishMeta.submissionBlockReason || '',
+                    terminalFailureReason: publishMeta.terminalFailureReason || '',
+                    reviewPending: !!publishMeta.reviewPending,
+                    anchorVisible: !!publishMeta.anchorVisible,
+                    anchorIsDofollow: !!publishMeta.anchorIsDofollow,
+                    reportedVia: publishMeta.reportedVia || ''
+                }
+            });
         }
 
         await ctx.updateResourceStatus(resourceId, status, {
