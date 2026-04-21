@@ -396,9 +396,23 @@ const PublishRuntime = {
                 }
             } catch {}
 
-            await ctx.updateResourceStatus(resource.id, 'failed');
-            ctx.updateState({ currentIndex: ctx.getState().currentIndex + 1 });
-            await this.dispatchQueue(ctx);
+            const errorText = String(error?.message || '');
+            let submissionBlockReason = 'dispatch-message-failed';
+            if (errorText.includes('页面标签已关闭')) {
+                submissionBlockReason = 'tab-closed';
+            } else if (errorText.includes('页面加载失败')) {
+                submissionBlockReason = 'network-error';
+            } else if (errorText.includes('发送发布消息失败')) {
+                submissionBlockReason = 'dispatch-message-failed';
+            }
+
+            await this.handleAction(ctx, resource.id, 'failed', task.id, {
+                reportedVia: 'dispatch-error',
+                submissionBlocked: true,
+                submissionBlockReason,
+                dispatchError: errorText
+            });
+            return;
         }
     },
 
@@ -449,6 +463,7 @@ const PublishRuntime = {
         let status = statusMap[result] || result;
         const publishMeta = {
             ...(meta || {}),
+            rawResult: String(result || ''),
             commentStyle: meta.commentStyle || state.currentTask?.commentStyle || 'standard',
             anchorRequested: !!meta.anchorRequested,
             anchorInjected: !!meta.anchorInjected,
@@ -456,6 +471,32 @@ const PublishRuntime = {
             anchorUrl: meta.anchorUrl || state.currentTask?.anchorUrl || state.currentTask?.website || '',
             updatedAt: new Date().toISOString()
         };
+        const networkSignal = ctx.getLatestNetworkSignal?.({
+            taskId,
+            resourceId,
+            tabId: currentTabId,
+            url: state.currentUrl || '',
+            consume: true
+        }) || null;
+
+        if (networkSignal) {
+            publishMeta.networkSignal = networkSignal.type || '';
+            publishMeta.networkSignalSource = networkSignal.source || '';
+            publishMeta.networkSignalUrl = networkSignal.url || '';
+            publishMeta.networkSignalReceivedAt = networkSignal.receivedAt || Date.now();
+
+            if (networkSignal.type === 'rejected') {
+                status = 'failed';
+                publishMeta.submissionBlocked = true;
+                publishMeta.submissionBlockReason = publishMeta.submissionBlockReason || 'network-rejected';
+            } else if (status !== 'failed' && networkSignal.type === 'moderation') {
+                status = 'published';
+                publishMeta.reviewPending = true;
+                publishMeta.reviewPolicy = publishMeta.reviewPolicy || 'moderated';
+            } else if (status !== 'failed' && (networkSignal.type === 'confirmed' || networkSignal.type === 'success')) {
+                status = 'published';
+            }
+        }
 
         if (status === 'published' && ctx.getState().currentTabId) {
             const verification = await ctx.verifyPublishedAnchor(ctx.getState().currentTabId, {
@@ -473,8 +514,8 @@ const PublishRuntime = {
             publishMeta.commentLocationMethod = verification?.commentLocationMethod || '';
             publishMeta.commentLocatedExcerpt = verification?.commentExcerpt || '';
             publishMeta.websiteFieldBlockedFirstComment = !!verification?.websiteFieldBlockedFirstComment;
-            publishMeta.reviewPending = !!verification?.reviewPending;
-            publishMeta.reviewPolicy = verification?.reviewPolicy || '';
+            publishMeta.reviewPending = !!publishMeta.reviewPending || !!verification?.reviewPending;
+            publishMeta.reviewPolicy = publishMeta.reviewPolicy || verification?.reviewPolicy || '';
             publishMeta.websitePolicy = publishMeta.websiteFieldBlockedFirstComment
                 ? 'omit-first-comment-website'
                 : (publishMeta.websiteOmitted ? 'website-optional' : 'website-field');
@@ -607,15 +648,36 @@ const PublishRuntime = {
             }
         }
 
+        const submissionReason = String(
+            publishMeta.terminalFailureReason
+            || publishMeta.submissionBlockReason
+            || ''
+        ).trim().toLowerCase();
+        publishMeta.statsStatus = status;
+        if (publishMeta.rawResult === 'failed') {
+            if (status === 'pending' || status === 'unpublishable') {
+                publishMeta.statsStatus = 'failed';
+            } else if (
+                status === 'skipped'
+                && submissionReason
+                && !['duplicate_comment', 'website-field-blocked-exhausted'].includes(submissionReason)
+            ) {
+                publishMeta.statsStatus = 'failed';
+            }
+        }
+
         await ctx.updateResourceStatus(resourceId, status, {
             publishMeta,
             publishHistoryEntry: publishTarget.key ? { target: publishTarget } : null
         });
         await ctx.rememberPublishOutcome?.(currentResource || { id: resourceId, url: state.currentUrl || '' }, currentTask, status, publishMeta);
         await ctx.recordDomainPublishEvidence?.(currentResource?.url || state.currentUrl || '', status, publishMeta);
-        await ctx.logger.publish(`评论${result}: ${resourceId}`);
+        const finalStatusLog = publishMeta.rawResult && publishMeta.rawResult !== status
+            ? `评论最终状态: ${status}（原始结果: ${publishMeta.rawResult}）: ${resourceId}`
+            : `评论最终状态: ${status}: ${resourceId}`;
+        await ctx.logger.publish(finalStatusLog);
 
-        await ctx.updateTaskStats(taskId, resourceId, status, currentTask);
+        await ctx.updateTaskStats(taskId, resourceId, status, currentTask, publishMeta);
         await ctx.syncPublishLog(resourceId, status, currentTask);
 
         let sessionPublishedCount = Number(ctx.getState().sessionPublishedCount || 0);

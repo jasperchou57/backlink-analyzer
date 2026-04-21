@@ -214,7 +214,8 @@ const SOFT_RETRYABLE_REASONS = new Set([
     'submit-confirm-timeout',
     'comment-form-not-found', // D+E 三级兜底都失败后上报，可能是页面慢加载
     'network-error',
-    'tab-closed'
+    'tab-closed',
+    'dispatch-message-failed'
 ]);
 
 function getPublishFailureRecoveryPolicy(publishMeta = {}, historyEntry = null) {
@@ -365,10 +366,11 @@ function mergePublishHistoryEntry(existingEntry, target, status, publishMeta = {
     };
 }
 
-async function updateTaskPublishStats(taskId, resourceId, status, currentTask = {}) {
+async function updateTaskPublishStats(taskId, resourceId, status, currentTask = {}, publishMeta = {}) {
     if (!taskId) return;
     await TaskStore.updateTask(taskId, (task) => {
         const stats = task.stats || { total: 0, success: 0, skipped: 0, pending: 0, failed: 0 };
+        const statsStatus = String(publishMeta?.statsStatus || status || '').trim() || String(status || '').trim();
         const nextStats = {
             total: Number(stats.total || 0),
             success: Number(stats.success || 0),
@@ -377,11 +379,11 @@ async function updateTaskPublishStats(taskId, resourceId, status, currentTask = 
             failed: Number(stats.failed || 0)
         };
 
-        if (status !== 'pending') {
+        if (statsStatus !== 'pending') {
             nextStats.total++;
-            if (status === 'published') nextStats.success++;
-            else if (status === 'skipped') nextStats.skipped++;
-            else if (status === 'failed') nextStats.failed++;
+            if (statsStatus === 'published') nextStats.success++;
+            else if (statsStatus === 'skipped') nextStats.skipped++;
+            else if (statsStatus === 'failed') nextStats.failed++;
         }
 
         return {
@@ -461,6 +463,7 @@ function getPublishRuntimeContext(taskId) {
             if (!self.PublishMemory?.rememberPublishOutcome) return null;
             return await self.PublishMemory.rememberPublishOutcome({ resource, task, status, publishMeta });
         },
+        getLatestNetworkSignal: (options = {}) => getLatestNetworkSignal(options),
         setDomainPublishPolicy,
         isRateLimitReason,
         getFailureRecoveryPolicy: (publishMeta = {}, historyEntry = null) => (
@@ -912,38 +915,40 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
         throw new Error(`脚本注入失败: ${e.message}`);
     }
 
-    await chrome.tabs.sendMessage(tabId, {
-        action: 'fillComment',
-        data: {
-            name: task.name_commenter || settings.name || task.name || '',
-            email: task.email || settings.email || '',
-            website: websiteValue,
-            mode: task.mode || 'semi-auto',
-            resourceId: resource.id,
-            taskId: task.id,
-            sessionId: session.sessionId || '',
-            useAI: workflow?.defaults?.useAI !== false,
-            pageTitle: resource.pageTitle || '',
-            debugMode: !!settings.publishDebugMode,
-            workflow,
-            commentStyle: task.commentStyle || 'standard',
-            anchorKeyword: task.anchorKeyword || settings.anchorKeyword || '',
-            anchorUrl: task.anchorUrl || settings.anchorUrl || task.website || '',
-            retryWithoutWebsite: !!overrides.retryWithoutWebsite,
-            resource: {
-                id: resource.id,
-                url: resource.url,
+    try {
+        await chrome.tabs.sendMessage(tabId, {
+            action: 'fillComment',
+            data: {
+                name: task.name_commenter || settings.name || task.name || '',
+                email: task.email || settings.email || '',
+                website: websiteValue,
+                mode: task.mode || 'semi-auto',
+                resourceId: resource.id,
+                taskId: task.id,
+                sessionId: session.sessionId || '',
+                useAI: workflow?.defaults?.useAI !== false,
                 pageTitle: resource.pageTitle || '',
-                linkMethod: resource.linkMethod || '',
-                linkModes: resource.linkModes || [],
-                opportunities: resource.opportunities || [],
-                details: resource.details || []
-            },
-            siteTemplate: templateHint || null
-        }
-    }).catch(() => {
-        // sendMessage 失败不应阻塞看门狗启动
-    });
+                debugMode: !!settings.publishDebugMode,
+                workflow,
+                commentStyle: task.commentStyle || 'standard',
+                anchorKeyword: task.anchorKeyword || settings.anchorKeyword || '',
+                anchorUrl: task.anchorUrl || settings.anchorUrl || task.website || '',
+                retryWithoutWebsite: !!overrides.retryWithoutWebsite,
+                resource: {
+                    id: resource.id,
+                    url: resource.url,
+                    pageTitle: resource.pageTitle || '',
+                    linkMethod: resource.linkMethod || '',
+                    linkModes: resource.linkModes || [],
+                    opportunities: resource.opportunities || [],
+                    details: resource.details || []
+                },
+                siteTemplate: templateHint || null
+            }
+        });
+    } catch (error) {
+        throw new Error(`发送发布消息失败: ${error.message || 'unknown error'}`);
+    }
 
     // 看门狗必须启动，确保即使脚本卡住也能兜底跳走
     schedulePublishWatchdog(task.id, {

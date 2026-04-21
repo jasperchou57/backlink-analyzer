@@ -1490,11 +1490,12 @@
         };
         window.addEventListener('__bla_network_signal', networkSignalHandler);
 
-        // 8 秒超时兜底：如果没收到网络信号，走原有逻辑
+        // 8 秒后仍未收到网络信号时，不要默认判成功。
+        // 让导航确认、后台 verifier 或 watchdog 来给最终结论。
         submissionFallbackTimer = setTimeout(() => {
             window.removeEventListener('__bla_network_signal', networkSignalHandler);
             if (!networkSignalReceived) {
-                reportResult('submitted', { reportedVia: 'timeout-fallback' });
+                addDebugEvent('submit', 'No network signal after submit, waiting for navigation/verifier/watchdog');
             }
         }, 8000);
     }
@@ -2278,9 +2279,28 @@
         const aiTimeoutMs = Number(options.aiTimeoutMs || 0) || 3000;
         const maxTimeoutMs = timeoutMs + 10000; // 硬性上限，防止无限循环
         const start = Date.now();
+        const softDeadline = start + timeoutMs;
         let aiAttempted = false;
+        let timeoutExtendedLogged = false;
 
         while (!publishStopped && Date.now() - start < maxTimeoutMs) {
+            if (Date.now() >= softDeadline) {
+                const lastProgressAt = Number(context.commentSearchProgressAt || 0) || start;
+                const progressGraceMs = context.commentLongPageMode ? 5000 : 2500;
+                if (Date.now() - lastProgressAt > progressGraceMs) {
+                    break;
+                }
+                if (!timeoutExtendedLogged) {
+                    timeoutExtendedLogged = true;
+                    addDebugEvent(
+                        'field',
+                        context.commentLongPageMode
+                            ? 'Extended comment search on long page due to ongoing scroll/render progress'
+                            : 'Extended comment search due to ongoing page progress'
+                    );
+                }
+            }
+
             // 每轮循环都 poke stall timer，防止渐进滚动 + 懒加载等待期间
             // finding_form 阶段被外层 15-20 秒 stall timer 提前杀掉。
             // 只要循环还在跑，就认为 finding_form 仍在取得进展。

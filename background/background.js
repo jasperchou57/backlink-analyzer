@@ -1056,18 +1056,90 @@ function getContinuousMyDomain() {
 }
 
 // ─── 网络信号处理：来自 network-inspector-bridge.js ───
-let latestNetworkSignals = new Map(); // tabId → signal
+let latestNetworkSignals = new Map(); // lookup key -> enriched signal
 
-function handleNetworkSignal(signal) {
-    if (!signal || !signal.type) return;
-    // 存储最新信号，供 publish verification 时参考
-    const key = signal.url || 'unknown';
-    latestNetworkSignals.set(key, signal);
-    // 清理旧信号（保留最近 50 条）
-    if (latestNetworkSignals.size > 50) {
-        const oldest = latestNetworkSignals.keys().next().value;
-        latestNetworkSignals.delete(oldest);
+function buildNetworkSignalLookupKeys({
+    taskId = '',
+    resourceId = '',
+    tabId = null,
+    url = ''
+} = {}) {
+    const keys = [];
+    if (taskId && resourceId) keys.push(`resource:${taskId}:${resourceId}`);
+    if (taskId) keys.push(`task:${taskId}`);
+    if (Number.isInteger(tabId)) keys.push(`tab:${tabId}`);
+    if (url) keys.push(`url:${url}`);
+    return keys;
+}
+
+function pruneLatestNetworkSignals(maxEntries = 120) {
+    while (latestNetworkSignals.size > maxEntries) {
+        const oldestKey = latestNetworkSignals.keys().next().value;
+        latestNetworkSignals.delete(oldestKey);
     }
+}
+
+function clearLatestNetworkSignal(options = {}) {
+    const keys = buildNetworkSignalLookupKeys(options);
+    for (const key of keys) {
+        latestNetworkSignals.delete(key);
+    }
+}
+
+function getLatestNetworkSignal(options = {}) {
+    const keys = buildNetworkSignalLookupKeys(options);
+    let matched = null;
+    for (const key of keys) {
+        const entry = latestNetworkSignals.get(key);
+        if (entry) {
+            matched = entry;
+            break;
+        }
+    }
+    if (!matched) return null;
+
+    if (options.consume) {
+        for (const [key, entry] of latestNetworkSignals.entries()) {
+            if (entry?.signalId === matched.signalId) {
+                latestNetworkSignals.delete(key);
+            }
+        }
+    }
+    return matched;
+}
+
+async function handleNetworkSignal(signal, sender = {}) {
+    if (!signal || !signal.type) return;
+    await ensurePublishSessionsLoaded();
+
+    const tabId = sender.tab?.id ?? null;
+    const taskId = (tabId !== null)
+        ? (findPublishSessionTaskIdByPendingTab(tabId) || findPublishSessionTaskIdByCurrentTab(tabId) || '')
+        : '';
+    const session = taskId ? getPublishSessionState(taskId) : null;
+    const resourceId = session?.pendingSubmission?.resourceId
+        || session?.queue?.[session.currentIndex]?.id
+        || '';
+    const enrichedSignal = {
+        ...signal,
+        signalId: signal.signalId || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        taskId,
+        resourceId,
+        sessionId: compactText(session?.sessionId || ''),
+        tabId,
+        receivedAt: Date.now()
+    };
+
+    const keys = buildNetworkSignalLookupKeys({
+        taskId,
+        resourceId,
+        tabId,
+        url: signal.url || ''
+    });
+    for (const key of keys) {
+        latestNetworkSignals.set(key, enrichedSignal);
+    }
+    pruneLatestNetworkSignals();
 
     // 如果检测到 moderation 信号，记录日志
     if (signal.type === 'moderation') {
@@ -1079,11 +1151,6 @@ function handleNetworkSignal(signal) {
     }
 }
 
-function getLatestNetworkSignal(url) {
-    if (!url) return null;
-    return latestNetworkSignals.get(url) || null;
-}
-
 async function handleCommentSubmittingMessage(msg = {}, sender = {}) {
     await ensurePublishSessionsLoaded();
     const taskId = msg.taskId || findPublishSessionTaskIdByCurrentTab(sender.tab?.id) || '';
@@ -1092,6 +1159,11 @@ async function handleCommentSubmittingMessage(msg = {}, sender = {}) {
 
     clearPublishWatchdog(taskId);
     const session = getPublishSessionState(taskId);
+    clearLatestNetworkSignal({
+        taskId,
+        resourceId: msg.resourceId,
+        tabId: sender.tab?.id || session.currentTabId || null
+    });
     setPublishSessionState(taskId, {
         ...session,
         pendingSubmission: {
@@ -1176,7 +1248,7 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
         openFloatingPanel: () => openPanelWindow(),
         backlinkData: (msg) => handleBacklinkData(msg.source, msg.urls, msg.items || []),
         commentAction: (msg) => handleCommentAction(msg.resourceId, msg.result, msg.taskId, msg.meta || {}, msg.sessionId || ''),
-        networkSignal: (msg) => handleNetworkSignal(msg.signal),
+        networkSignal: (msg, sender) => handleNetworkSignal(msg.signal, sender),
         commentSubmitting: (msg, sender) => handleCommentSubmittingMessage(msg, sender),
         commentProgress: (msg, sender) => handleCommentProgressMessage(msg, sender),
         republish: (msg) => republishResource(msg.resourceId, msg.taskId)
