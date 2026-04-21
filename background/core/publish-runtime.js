@@ -509,6 +509,12 @@ const PublishRuntime = {
                 publishMeta.anchorVisible = !!verification?.anchorVisible;
                 publishMeta.anchorVerified = !!verification;
                 publishMeta.anchorVerification = verification || null;
+                // 新增：rel 归类字段。dofollow 才是真正的 SEO 价值。
+                // 老调用方只看 anchorVisible 仍然向前兼容，新指标看 anchorIsDofollow。
+                publishMeta.anchorRel = verification?.anchorRel || '';
+                publishMeta.anchorRelTokens = verification?.anchorRelTokens || [];
+                publishMeta.anchorIsNofollow = !!verification?.anchorIsNofollow;
+                publishMeta.anchorIsDofollow = !!verification?.anchorIsDofollow;
             }
             publishMeta.commentLocated = !!verification?.commentLocated;
             publishMeta.commentLocationMethod = verification?.commentLocationMethod || '';
@@ -538,6 +544,40 @@ const PublishRuntime = {
                     url: ctx.getState().currentUrl,
                     reason: publishMeta.submissionBlockReason || '',
                     pageUrl: publishMeta.pageUrlAfterSubmit || ''
+                });
+            }
+
+            // Provisional 通道护栏：watchdog / alarm / navigation-confirm 等通道并不是
+            // content script 主动确认"已提交"的信号，而是超时/导航推断。只有 verifier
+            // 找到证据（anchor / 评论块 / 审核提示）才能留 published；否则一律改软失败，
+            // 走 SOFT_RETRYABLE_REASONS 的有限重试路径。避免 SW 休眠后 alarm 先发 failed、
+            // 以及导航到未识别错误页被当成功的两类误判。
+            const reportedVia = String(publishMeta.reportedVia || '').toLowerCase();
+            const isProvisionalChannel = /^(watchdog|alarm-watchdog|navigation-confirm)/.test(reportedVia);
+            const verifierHasEvidence =
+                !!verification?.anchorVisible
+                || !!verification?.commentLocated
+                || !!verification?.reviewPending;
+            if (status === 'published' && isProvisionalChannel && !verifierHasEvidence && !publishMeta.submissionBlocked) {
+                status = 'failed';
+                publishMeta.submissionBlocked = true;
+                publishMeta.submissionBlockReason = publishMeta.submissionBlockReason || 'publish-runtime-timeout';
+                await ctx.logger.error('通道未直接确认且验证器未找到评论证据，改判为软可重试失败', {
+                    url: ctx.getState().currentUrl,
+                    reportedVia
+                });
+            }
+        } else if (status === 'published') {
+            // 没有 currentTabId → verifier 跑不起来。如果是 provisional 通道（watchdog/nav），
+            // 不能信任 published；改判 tab-closed 软可重试。
+            const reportedVia = String(publishMeta.reportedVia || '').toLowerCase();
+            if (/^(watchdog|alarm-watchdog|navigation-confirm)/.test(reportedVia)) {
+                status = 'failed';
+                publishMeta.submissionBlocked = true;
+                publishMeta.submissionBlockReason = publishMeta.submissionBlockReason || 'tab-closed';
+                await ctx.logger.error('Provisional 通道进入 published 但无 currentTabId，改判软失败', {
+                    url: ctx.getState().currentUrl,
+                    reportedVia
                 });
             }
         }
@@ -686,12 +726,17 @@ const PublishRuntime = {
 
         if (status === 'published') {
             sessionPublishedCount += 1;
-            if (publishMeta.anchorVisible) {
+            // Anchor 成功计数改成"有链接且不是 nofollow/ugc/sponsored"才算。
+            // 以前只看 anchorVisible，rel=nofollow 的评论被当成成功 → SEO KPI 失真。
+            // anchorIsDofollow 仅在 anchorRequested=true 时由 verifier 填充，
+            // 对非 anchor 模式任务此字段为 undefined，不影响现有流程。
+            const anchorCountsAsSuccess = !!publishMeta.anchorIsDofollow;
+            if (anchorCountsAsSuccess) {
                 sessionAnchorSuccessCount += 1;
             }
             dailyLimitCount = await ctx.incrementDailyPublishCount(
                 ctx.getState().currentTask?.id,
-                { published: true, anchorSuccess: !!publishMeta.anchorVisible }
+                { published: true, anchorSuccess: anchorCountsAsSuccess }
             );
         }
 

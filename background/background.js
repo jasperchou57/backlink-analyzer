@@ -415,12 +415,18 @@ async function handlePublishWatchdogAlarm(taskId) {
     await Logger.error('发布看门狗 Alarm 兜底触发（Service Worker 曾休眠）', {
         taskId,
         resourceId: activeResourceId,
-        currentUrl: session.currentUrl || meta.currentUrl || ''
+        currentUrl: session.currentUrl || meta.currentUrl || '',
+        hadPendingSubmit: !!session.pendingSubmission
     });
 
-    // 注入提示，2 秒硬超时；卡死则强制重置 tab
+    // 如果 pendingSubmission 还在（content script 已发 commentSubmitting 但未等到结果），
+    // 就让 verifier 做裁决：先按 'submitted' 进 handleAction，verifier 找到证据就保留
+    // published，找不到就被 publish-runtime.js 的 provisional 通道护栏改判软失败。
+    // 否则（提交还没启动）直接走软失败，走重试流。
+    const hadPendingSubmit = !!session.pendingSubmission;
     const tabId = session.currentTabId;
-    if (tabId) {
+    if (!hadPendingSubmit && tabId) {
+        // 未到提交阶段 → tab 卡死了，显示提示或强制重置
         const toastShown = await tryShowFailureToastInTab(tabId, '发布失败：页面长时间无响应（已自动恢复）', 2000);
         if (toastShown) {
             await new Promise(r => setTimeout(r, 3200));
@@ -429,11 +435,19 @@ async function handlePublishWatchdogAlarm(taskId) {
         }
     }
 
-    await handleCommentAction(activeResourceId, 'failed', taskId, {
-        reportedVia: 'alarm-watchdog',
-        submissionBlocked: true,
-        submissionBlockReason: 'service-worker-sleep-recovery'
-    }, session.sessionId || '');
+    if (hadPendingSubmit) {
+        await handleCommentAction(activeResourceId, 'submitted', taskId, {
+            reportedVia: 'alarm-watchdog',
+            watchdogStage: 'submission-alarm',
+            serviceWorkerSleepRecovery: true
+        }, session.sessionId || '');
+    } else {
+        await handleCommentAction(activeResourceId, 'failed', taskId, {
+            reportedVia: 'alarm-watchdog',
+            submissionBlocked: true,
+            submissionBlockReason: 'publish-runtime-timeout'
+        }, session.sessionId || '');
+    }
 }
 
 function handleWindowRemoved(windowId) {
@@ -519,22 +533,58 @@ function handleTabUpdated(tabId, changeInfo) {
                         window.scrollTo(0, document.body.scrollHeight);
                     }
 
+                    // 严格 URL 匹配（host 全等 + path 前缀）。
+                    // 以前 link.href.includes(websiteUrl) 会把 not-example.com 匹配到 example.com。
+                    const parseTarget = (raw) => {
+                        const value = String(raw || '').trim();
+                        if (!value) return null;
+                        try {
+                            const withScheme = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+                            const u = new URL(withScheme);
+                            const path = (u.pathname || '/').replace(/\/+$/, '') || '/';
+                            return {
+                                host: u.hostname.replace(/^www\./i, '').toLowerCase(),
+                                path: path.toLowerCase()
+                            };
+                        } catch { return null; }
+                    };
+                    const hrefHitsTarget = (href, target) => {
+                        if (!target) return false;
+                        try {
+                            const u = new URL(href, location.href);
+                            const host = u.hostname.replace(/^www\./i, '').toLowerCase();
+                            if (host !== target.host) return false;
+                            const path = (u.pathname || '/').replace(/\/+$/, '') || '/';
+                            if (target.path === '/' || !target.path) return true;
+                            if (path === target.path) return true;
+                            return path.startsWith(target.path + '/');
+                        } catch { return false; }
+                    };
+                    const target = parseTarget(websiteUrl);
+                    const nameNeedle = String(commenterName || '').trim().toLowerCase();
+                    // 短名字（<3 字符）不用做作者匹配，否则到处撞
+                    const nameNeedleSafe = nameNeedle.length >= 3 ? nameNeedle : '';
+
                     // 检查是否有我们的评论
                     const allComments = document.querySelectorAll('.comment-body, li.comment, .comment-content, .comment');
                     let found = false;
                     let reviewPending = false;
 
                     for (const c of allComments) {
-                        const text = (c.textContent || '').toLowerCase();
                         const links = c.querySelectorAll('a[href]');
                         for (const link of links) {
-                            if (websiteUrl && link.href.includes(websiteUrl.replace(/^https?:\/\//, '').replace(/\/$/, ''))) {
+                            if (hrefHitsTarget(link.getAttribute('href') || link.href || '', target)) {
                                 found = true;
                                 break;
                             }
                         }
-                        if (commenterName && text.includes(commenterName.toLowerCase())) {
-                            found = true;
+                        // 作者名只在 .comment-author/.fn/cite 里查，不再扫整块 textContent
+                        if (!found && nameNeedleSafe) {
+                            const authorEl = c.querySelector('.comment-author, .fn, cite, [itemprop="author"]');
+                            const authorText = (authorEl?.textContent || '').toLowerCase().trim();
+                            if (authorText && authorText.includes(nameNeedleSafe)) {
+                                found = true;
+                            }
                         }
                         if (found) break;
                     }
@@ -564,15 +614,24 @@ function handleTabUpdated(tabId, changeInfo) {
                     }, session.sessionId || '');
                 }
             }).catch(() => {
-                // 脚本注入失败，根据 URL 判断
+                // 脚本注入失败 = tab 不可访问 / 跨域 / 卡死。
+                // 以前靠 url.includes('#comment-') 来判断"大概成功"，但该 hash 到处都有
+                // （文章内的 comment 永久链接、分享卡片），严重虚报。
+                // 改成标记为软可重试失败，让发布流按 SOFT_RETRYABLE_REASONS 走 1-2 次重试。
                 chrome.tabs.get(tabId).then((tab) => {
-                    const url = tab?.url || '';
-                    const likelySuccess = url.includes('#comment-');
-                    handleCommentAction(activeResource.id, likelySuccess ? 'published' : 'failed', currentTaskId, {
+                    handleCommentAction(activeResource.id, 'failed', currentTaskId, {
                         reportedVia: 'tab-navigation-fallback',
-                        pageUrlAfterSubmit: url
+                        pageUrlAfterSubmit: tab?.url || '',
+                        submissionBlocked: true,
+                        submissionBlockReason: 'publish-runtime-timeout'
                     }, session.sessionId || '');
-                }).catch(() => {});
+                }).catch(() => {
+                    handleCommentAction(activeResource.id, 'failed', currentTaskId, {
+                        reportedVia: 'tab-navigation-fallback',
+                        submissionBlocked: true,
+                        submissionBlockReason: 'publish-runtime-timeout'
+                    }, session.sessionId || '');
+                });
             });
         }
     }
@@ -786,14 +845,26 @@ function schedulePublishWatchdog(taskId, options = {}) {
                 }
             }
 
-            await handleCommentAction(resourceId, 'failed', taskId, {
-                reportedVia: 'watchdog',
-                watchdogStage: stage,
-                submissionBlocked: true,
-                submissionBlockReason: stage === 'submission'
-                    ? 'submit-confirm-timeout'
-                    : 'publish-runtime-timeout'
-            }, sessionId);
+            // stage === 'submission' 只在 handleCommentSubmittingMessage 里派发，
+            // 含义是"content script 已 commentSubmitting，在等结果"。这时直接报 failed
+            // 会吞掉真发成功但 SW 休眠/网络慢导致迟到的结果。改成走 verifier：
+            //   - verifier 找到证据 → published 保留
+            //   - verifier 找不到或 submissionBlocked → 被 provisional 通道护栏改判软失败
+            // stage === 'dispatch' 则是 content script 还没进入提交阶段，超时真的是
+            // 页面卡死/脚本崩溃，直接软失败。
+            if (stage === 'submission') {
+                await handleCommentAction(resourceId, 'submitted', taskId, {
+                    reportedVia: 'watchdog',
+                    watchdogStage: stage
+                }, sessionId);
+            } else {
+                await handleCommentAction(resourceId, 'failed', taskId, {
+                    reportedVia: 'watchdog',
+                    watchdogStage: stage,
+                    submissionBlocked: true,
+                    submissionBlockReason: 'publish-runtime-timeout'
+                }, sessionId);
+            }
         } catch (e) {
             console.error('[Watchdog] handleCommentAction failed:', e);
             await Logger.error('看门狗处理失败', { taskId, resourceId, error: e.message });

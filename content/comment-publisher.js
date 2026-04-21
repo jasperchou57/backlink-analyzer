@@ -186,6 +186,10 @@
         clearAutoSubmitTimer();
         clearSubmissionFallbackTimer();
         clearWorkflowStallTimer();
+        // 新任务入口先 disarm，防止同 tab 复用时上一轮的 armed 状态残留
+        try {
+            window.dispatchEvent(new CustomEvent('__bla_inspect_disarm'));
+        } catch {}
         currentPublishMeta = {
             commentStyle: data.commentStyle || 'standard',
             anchorRequested: isAnyAnchorCommentStyle(data.commentStyle),
@@ -443,8 +447,9 @@
         // commentFilled=true，那个 fill 也只是写到了隐藏 textarea，TinyMCE
         // 提交时会用 iframe 内容覆盖 textarea，导致提交空评论。
         // 必须在 standardFlow 之后（且无视 commentFilled）写到 iframe body。
+        // 表单带 iframe 但首次识别失败时，等最多 2s 让 TinyMCE/CKEditor 完成异步初始化。
         if (values.comment) {
-            const richTarget = findRichEditorTargetInForm(form);
+            const richTarget = await waitForRichEditorReady(form);
             if (richTarget && fillRichEditorTarget(richTarget, values.comment)) {
                 commentFilled = true;
                 richEditorFilled = true;
@@ -730,9 +735,10 @@
         // 富文本 iframe 路径必须无条件运行（TinyMCE/CKEditor），写到 iframe body
         // 否则即使前面 fill 链"成功"，也只是把值写到了隐藏 textarea，提交时会被
         // TinyMCE 用 iframe 内容覆盖。详见 fillStandardCommentFormDirectly 的注释。
+        // 带 iframe 的表单首次识别不到编辑器时，等最多 2s 让它完成异步初始化。
         let richEditorFilled = false;
         if (values.comment) {
-            const richTarget = findRichEditorTargetInForm(context.form);
+            const richTarget = await waitForRichEditorReady(context.form);
             if (richTarget && fillRichEditorTarget(richTarget, values.comment)) {
                 commentFilled = true;
                 richEditorFilled = true;
@@ -1220,6 +1226,49 @@
         return null;
     }
 
+    /**
+     * 异步等待富文本编辑器就绪。
+     * 场景：TinyMCE/CKEditor 常被异步注入，首次 findRichEditorTargetInForm 时 iframe
+     * 已在 DOM 里但 contentDocument.body 还没标记 contenteditable，我们就跳过了 iframe
+     * 只写 textarea；而 TinyMCE 提交时会用 iframe.body（此时才是空）覆盖 textarea
+     * → 站点收到空评论。
+     * 只有表单确实有 iframe 时才等；无 iframe 的标准 WP 表单不会被拖慢。
+     */
+    async function waitForRichEditorReady(form, maxWaitMs = 2000, pollMs = 250) {
+        let target = findRichEditorTargetInForm(form);
+        if (target) return target;
+        if (!form?.querySelector('iframe')) return null;
+        const start = Date.now();
+        while (Date.now() - start < maxWaitMs) {
+            await wait(pollMs);
+            target = findRichEditorTargetInForm(form);
+            if (target) return target;
+        }
+        return null;
+    }
+
+    /**
+     * 提交前最后一道护栏：重新定位富文本编辑器，若 body 文本明显比预期短，
+     * 再填一次。返回：
+     *   - 'no-rich-editor'：表单没有 iframe 编辑器，走 textarea 就行
+     *   - 'ok'：body 已含我们的评论，不需要动
+     *   - 'refilled'：body 为空/缺失，已重新写入
+     *   - 'fill-failed'：识别到 iframe 编辑器但写入失败 → 调用方应该中止提交
+     */
+    function ensureRichEditorSynced(form, expectedComment) {
+        const target = findRichEditorTargetInForm(form);
+        if (!target) return 'no-rich-editor';
+        const bodyText = String(target.body?.textContent || '').trim();
+        const expectedLen = String(expectedComment || '').length;
+        // body 太短或为空（阈值：min(10, 预期长度/3)）→ 视为未同步，重填
+        const minAcceptable = Math.min(10, Math.max(3, Math.floor(expectedLen / 3)));
+        if (!bodyText || bodyText.length < minAcceptable) {
+            const ok = fillRichEditorTarget(target, expectedComment);
+            return ok ? 'refilled' : 'fill-failed';
+        }
+        return 'ok';
+    }
+
     function fillRichEditorTarget(target, value) {
         if (!target?.body) return false;
         try {
@@ -1418,6 +1467,15 @@
         if (publishStopped) return;
         updateWorkflowProgress(context, 'submitting', '正在提交评论');
 
+        // Arm network-inspector（只在这个窗口内、且 URL 匹配 form.action 的 POST 会被分析）。
+        // 以前 inspector 全生命周期拦任何 POST，3rd party 埋点响应会被误判成提交成功。
+        try {
+            const formAction = form?.getAttribute?.('action') || window.location.href;
+            window.dispatchEvent(new CustomEvent('__bla_inspect_arm', {
+                detail: { formAction }
+            }));
+        } catch {}
+
         const fallbackComment = compactText(context.comment || '')
             || generateFallbackComment(context.pageTitle, {
                 mode: 'standard',
@@ -1432,6 +1490,22 @@
                 submissionBlocked: true
             });
             return;
+        }
+
+        // 提交前最后护栏：确保富文本编辑器 body 真的有我们的评论。
+        // 否则 TinyMCE 提交时会用 iframe body（空）覆盖 textarea，站点收到空评论。
+        const richGuard = ensureRichEditorSynced(form, fallbackComment);
+        if (richGuard === 'fill-failed') {
+            addDebugEvent('field', 'Rich editor detected but could not be synced before submit');
+            reportResult('failed', {
+                reason: 'rich-editor-not-synced',
+                submissionBlocked: true,
+                submissionBlockReason: 'publish-runtime-timeout'
+            });
+            return;
+        }
+        if (richGuard === 'refilled') {
+            addDebugEvent('field', 'Rich editor body was empty before submit; re-filled');
         }
 
         let submitBtn = findSubmitButton(form, context.aiFormInfo);
@@ -1528,6 +1602,10 @@
         clearAutoSubmitTimer();
         clearSubmissionFallbackTimer();
         clearWorkflowStallTimer();
+        // Disarm network-inspector，确保本次结果定稿后不再吃任何迟到的 POST 响应。
+        try {
+            window.dispatchEvent(new CustomEvent('__bla_inspect_disarm'));
+        } catch {}
         const startedAt = currentPublishMeta?.publishStartedAt || '';
         const durationMs = startedAt ? Math.max(0, Date.now() - new Date(startedAt).getTime()) : 0;
 
@@ -1699,6 +1777,10 @@
         clearAutoSubmitTimer();
         clearSubmissionFallbackTimer();
         clearWorkflowStallTimer();
+        // 取消时 disarm 防止残留 armed 状态误吃后续 POST
+        try {
+            window.dispatchEvent(new CustomEvent('__bla_inspect_disarm'));
+        } catch {}
         addDebugEvent('field', 'Publish session stopped by user');
         removeDialog();
     }

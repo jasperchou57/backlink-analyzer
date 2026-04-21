@@ -257,14 +257,20 @@ function getPublishFailureRecoveryPolicy(publishMeta = {}, historyEntry = null) 
         };
     }
 
+    // comment_submission_blocked 以前被归为 terminal skipped，一次就永久下架。
+    // 但这个信号本身是 anchor-verifier 在 wp-comments-post.php 上 12.5s 内没找到 anchor
+    // 就判定的（见 anchor-verifier.js 的 submissionBlockedPatterns 最后一条兜底），
+    // 真实原因常常是：页面渲染慢、anchor 匹配被 rel/URL 误差漏掉、SPA 评论异步加载。
+    // 改成有限次重试的软失败（最多 2 次），6h 冷却后再试一次。
     if (reason === 'comment_submission_blocked') {
+        const softMaxAttempts = 2;
         return {
-            retryable: false,
-            terminalStatus: 'skipped',
+            retryable: failedAttempts < softMaxAttempts,
+            terminalStatus: 'failed',
             reason,
-            cooldownMs: 0,
+            cooldownMs: 6 * 60 * 60 * 1000,
             failedAttempts,
-            maxAttempts
+            maxAttempts: softMaxAttempts
         };
     }
 
@@ -981,6 +987,42 @@ function ensurePublishContentScripts(scriptFiles = []) {
     return nextFiles;
 }
 
+// 防御：提交后页面被重定向到 Cloudflare challenge / 登录墙 / 错误页时不能认为成功。
+// URL 关键字命中即判为软可重试失败。
+const NAVIGATION_CHALLENGE_URL_RE = new RegExp([
+    'cloudflare',
+    'cf[-_]chl',
+    'cf[-_]browser',
+    'challenge',
+    'ddos[-_]guard',
+    'just[-_]a[-_]moment',
+    'attention[-_]required',
+    'access[-_]denied',
+    '/403(?:[/?#]|$)',
+    '/404(?:[/?#]|$)',
+    '/500(?:[/?#]|$)',
+    'forbidden',
+    'captcha[-_]verify',
+    'hcaptcha[-_]verify',
+    'turnstile',
+    '/wp-login',
+    '/login(?:[/?#]|$)',
+    '/signin(?:[/?#]|$)',
+    '/sign[-_]in',
+    '/account/login',
+    '/users/sign_in',
+    'please[-_]wait'
+].join('|'), 'i');
+
+function classifyPostSubmitUrl(rawUrl = '') {
+    const url = String(rawUrl || '').toLowerCase();
+    if (!url) return { blocked: false };
+    if (NAVIGATION_CHALLENGE_URL_RE.test(url)) {
+        return { blocked: true, reason: 'navigation-challenge' };
+    }
+    return { blocked: false };
+}
+
 async function finalizePendingSubmissionFromNavigation(taskId, tabId) {
     await ensurePublishSessionsLoaded();
     const pending = getPublishSessionState(taskId).pendingSubmission;
@@ -988,13 +1030,41 @@ async function finalizePendingSubmissionFromNavigation(taskId, tabId) {
 
     clearPublishWatchdog(taskId);
     updatePublishSessionState(taskId, { pendingSubmission: null });
+
+    let postUrl = '';
+    try {
+        const tab = await chrome.tabs.get(tabId);
+        postUrl = tab?.url || '';
+    } catch {}
+
+    const classification = classifyPostSubmitUrl(postUrl);
+    if (classification.blocked) {
+        // 跳转到 challenge/登录/错误页 → 评论肯定没发，标软可重试失败，
+        // 走 SOFT_RETRYABLE 重试而不是一头扎进 'submitted' → verifier 再判错。
+        await handleCommentAction(
+            pending.resourceId,
+            'failed',
+            pending.taskId,
+            {
+                ...(pending.meta || {}),
+                reportedVia: 'navigation-confirm-blocked',
+                pageUrlAfterSubmit: postUrl,
+                submissionBlocked: true,
+                submissionBlockReason: 'publish-runtime-timeout'
+            },
+            pending.sessionId || ''
+        );
+        return;
+    }
+
     await handleCommentAction(
         pending.resourceId,
         'submitted',
         pending.taskId,
         {
             ...(pending.meta || {}),
-            reportedVia: 'navigation-confirm'
+            reportedVia: 'navigation-confirm',
+            pageUrlAfterSubmit: postUrl
         },
         pending.sessionId || ''
     );
