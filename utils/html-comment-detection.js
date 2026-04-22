@@ -85,6 +85,11 @@
             || h.includes('cloudflare-turnstile');
         // 注意：不检测泛 "captcha" 字符串，因为有些页面正文提到 captcha 但实际没有
 
+        // ── 数评论总数 ──────────────────────────────────────
+        // WP 每条评论都带 id="comment-<数字>"，比 class 名更稳不会被 widget 混淆
+        const commentIdMatches = text.match(/id="comment-\d+"/g);
+        const commentCount = commentIdMatches ? commentIdMatches.length : 0;
+
         // ── 判定逻辑 ─────────────────────────────────────────
 
         // 核心条件：WP站 + WP评论表单 + 标准字段 + URL字段 + 无阻断
@@ -111,6 +116,9 @@
             if (requiresLogin) blockers.push('login-required');
             if (commentsClosed) blockers.push('comment-closed');
             if (hasCaptcha) blockers.push('captcha');
+            // 评论总数 < 3：活跃度低信号。不作为主路径门槛，仅纳入 blockers
+            // 参与"差 ≤ 2 条"救援逻辑，相当于多一个 blocker 时才被排挤进冷池。
+            if (commentCount > 0 && commentCount < 3) blockers.push('fewer-than-3-comments');
 
             // 如果是 WP 站但被某个条件拦截了，仍然返回结果（放入待后续处理池）
             if (isWordPress && hasWpCommentForm && blockers.length <= 2) {
@@ -128,7 +136,8 @@
                     commentsClosed,
                     resourceClass: 'weak',
                     frictionLevel: 'high',
-                    directPublishReady: false
+                    directPublishReady: false,
+                    commentCount
                 };
             }
 
@@ -177,6 +186,11 @@
             details.push('has-email-field');
         }
 
+        // 评论总数 < 3 的站点打个标签（不下架），方便后续 cleanup 追溯
+        if (commentCount > 0 && commentCount < 3) {
+            details.push('fewer-than-3-comments');
+        }
+
         return {
             url,
             pageTitle,
@@ -191,7 +205,8 @@
             resourceClass: 'blog-comment',
             frictionLevel: 'low',
             directPublishReady: true,
-            commentAnchorCount
+            commentAnchorCount,
+            commentCount
         };
     }
 

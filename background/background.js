@@ -2456,8 +2456,9 @@ async function writeResourcesToStorage(resources = []) {
  * - commentsClosed / requiresLogin 字段 = true → 下架
  * - 历史连续失败 ≥3 次且从未成功 → 下架
  * - 历史发布原因命中 HARD_UNPUBLISHABLE_REASONS → 下架
- * - [新] moderation-only：所有 published 记录都 reviewPending=true → 下架（Google 爬不到）
- * - [新] duplicate-comment-terminal：历史里已有 duplicate_comment 终态 → 下架（我们发过了）
+ * - moderation-only：所有 published 记录都 reviewPending=true → 下架（Google 爬不到）
+ * - duplicate-comment-terminal：历史里已有 duplicate_comment 终态 → 下架（我们发过了）
+ * - [新] low-comment-count：commentCount ≥1 但 <3 且无已验证成功 → 下架（站点不活跃）
  * - commentAnchorCount ≥3 → 加 boost 标签（不下架，只排序加权）
  *
  * options.dryRun 为 true 时：只统计、不改任何数据。返回 reasonSamples 给 UI 预览用。
@@ -2572,6 +2573,14 @@ async function cleanupResourceQueue(options = {}) {
         });
         if (hasDuplicateTerminal) {
             reasons.push('duplicate-comment-terminal');
+        }
+
+        // 10. [评论活跃度规则] commentCount >= 1 且 < 3 且无已验证成功历史
+        //     评论总数 < 3 = 站审核策略不活跃 / 新站无历史 / 站已弃置
+        //     commentCount === 0 或 undefined 走原来的 no-existing-comments 路径，这里不重复判
+        const resourceCommentCount = Number(resource.commentCount || 0);
+        if (resourceCommentCount > 0 && resourceCommentCount < 3 && !hasRealVisiblePublish) {
+            reasons.push('low-comment-count');
         }
 
         if (reasons.length > 0) {
