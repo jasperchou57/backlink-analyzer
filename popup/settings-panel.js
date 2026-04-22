@@ -330,7 +330,7 @@
         <div class="settings-section">
           <h4>🧹 队列清理（中档策略）</h4>
           <div style="font-size:11px;color:#8891a8;margin-bottom:8px">
-            扫描现有资源，把"发了 Google 也看不到"和"彻底发不了"的标记为不可发布：edu/gov/社交媒体、评论关闭、登录/验证码、连续失败、<b>仅有审核中的记录</b>（Google 爬不到）、<b>已触达 duplicate_comment 终态</b>（已发过）、<b>评论总数 1-2 条且无已验证成功</b>（站不活跃）。≥3 条带链接评论的高质量资源加排序权重。不删除数据，随时可手动改回。
+            扫描现有资源，把"发了 Google 也看不到"和"彻底发不了"的标记为不可发布：edu/gov/社交媒体、评论关闭、登录/验证码、连续失败、<b>仅有审核中的记录</b>（Google 爬不到）、<b>已触达 duplicate_comment 终态</b>（已发过）、<b>评论总数 &lt; 3 条且无已验证成功</b>（站不活跃）、<b>老数据无评论痕迹</b>（proxy 判定 0 评论）。≥3 条带链接评论的高质量资源加排序权重。不删除数据，随时可手动改回。
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
             <button class="btn-test" id="btn-cleanup-preview">🔍 预览清理</button>

@@ -2458,7 +2458,9 @@ async function writeResourcesToStorage(resources = []) {
  * - 历史发布原因命中 HARD_UNPUBLISHABLE_REASONS → 下架
  * - moderation-only：所有 published 记录都 reviewPending=true → 下架（Google 爬不到）
  * - duplicate-comment-terminal：历史里已有 duplicate_comment 终态 → 下架（我们发过了）
- * - [新] low-comment-count：commentCount ≥1 但 <3 且无已验证成功 → 下架（站点不活跃）
+ * - low-comment-count：新数据 commentCount < 3 且无已验证成功 → 下架（不活跃站）
+ * - low-comment-count-legacy：老数据无 commentCount 字段 + details 没 has-existing-comments
+ *   → 下架（采集时页面找不到评论类名，代理判定为 0 评论）
  * - commentAnchorCount ≥3 → 加 boost 标签（不下架，只排序加权）
  *
  * options.dryRun 为 true 时：只统计、不改任何数据。返回 reasonSamples 给 UI 预览用。
@@ -2575,12 +2577,24 @@ async function cleanupResourceQueue(options = {}) {
             reasons.push('duplicate-comment-terminal');
         }
 
-        // 10. [评论活跃度规则] commentCount >= 1 且 < 3 且无已验证成功历史
-        //     评论总数 < 3 = 站审核策略不活跃 / 新站无历史 / 站已弃置
-        //     commentCount === 0 或 undefined 走原来的 no-existing-comments 路径，这里不重复判
-        const resourceCommentCount = Number(resource.commentCount || 0);
-        if (resourceCommentCount > 0 && resourceCommentCount < 3 && !hasRealVisiblePublish) {
-            reasons.push('low-comment-count');
+        // 10. [评论活跃度规则] 评论总数 < 3 判为不活跃站点下架
+        //     分两路：
+        //     a) 新数据（有 commentCount 字段）：commentCount < 3（含 0）→ low-comment-count
+        //     b) 老数据（没 commentCount 字段）：用 details 里是否有
+        //        'has-existing-comments' 做代理。缺少该标签 = 采集时页面上找不到
+        //        任何评论类名 → 几乎肯定是 0 评论 → low-comment-count-legacy
+        //     两个桶用不同 reason 以便预览时分别看样本决定是否应用
+        const hasCommentCountField =
+            Object.prototype.hasOwnProperty.call(resource, 'commentCount')
+            && resource.commentCount !== undefined
+            && resource.commentCount !== null;
+        if (hasCommentCountField) {
+            const cc = Number(resource.commentCount || 0);
+            if (cc < 3 && !hasRealVisiblePublish) {
+                reasons.push('low-comment-count');
+            }
+        } else if (!detailsSet.has('has-existing-comments') && !hasRealVisiblePublish) {
+            reasons.push('low-comment-count-legacy');
         }
 
         if (reasons.length > 0) {

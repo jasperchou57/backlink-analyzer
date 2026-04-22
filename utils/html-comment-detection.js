@@ -116,9 +116,9 @@
             if (requiresLogin) blockers.push('login-required');
             if (commentsClosed) blockers.push('comment-closed');
             if (hasCaptcha) blockers.push('captcha');
-            // 评论总数 < 3：活跃度低信号。不作为主路径门槛，仅纳入 blockers
+            // 评论总数 < 3（含 0）：活跃度低信号。不作为主路径门槛，仅纳入 blockers
             // 参与"差 ≤ 2 条"救援逻辑，相当于多一个 blocker 时才被排挤进冷池。
-            if (commentCount > 0 && commentCount < 3) blockers.push('fewer-than-3-comments');
+            if (commentCount < 3) blockers.push('fewer-than-3-comments');
 
             // 如果是 WP 站但被某个条件拦截了，仍然返回结果（放入待后续处理池）
             if (isWordPress && hasWpCommentForm && blockers.length <= 2) {
@@ -186,8 +186,9 @@
             details.push('has-email-field');
         }
 
-        // 评论总数 < 3 的站点打个标签（不下架），方便后续 cleanup 追溯
-        if (commentCount > 0 && commentCount < 3) {
+        // 评论总数 < 3（含 0）的站点打个标签，方便后续 cleanup 追溯
+        // 主路径不改 isPublishable，让 cleanup 统一处理；标签留个痕迹
+        if (commentCount < 3) {
             details.push('fewer-than-3-comments');
         }
 
