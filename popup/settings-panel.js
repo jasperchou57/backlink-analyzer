@@ -328,12 +328,16 @@
         </div>
 
         <div class="settings-section">
-          <h4>🧹 队列清理</h4>
+          <h4>🧹 队列清理（中档策略）</h4>
           <div style="font-size:11px;color:#8891a8;margin-bottom:8px">
-            一次性扫描现有资源：edu/gov/社交媒体域名、评论已关闭、登录/验证码、历史连续失败的资源会被标记为"不可发布"并踢出队列。commentAnchorCount≥3 的高质量资源会加排序权重。不会删除数据。
+            扫描现有资源，把"发了 Google 也看不到"和"彻底发不了"的标记为不可发布：edu/gov/社交媒体、评论关闭、登录/验证码、连续失败、<b>仅有审核中的记录</b>（Google 爬不到）、<b>已触达 duplicate_comment 终态</b>（已发过）。≥3 条带链接评论的高质量资源加排序权重。不删除数据，随时可手动改回。
           </div>
-          <button class="btn-test" id="btn-cleanup-queue">🧹 清理当前队列</button>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn-test" id="btn-cleanup-preview">🔍 预览清理</button>
+            <button class="btn-test" id="btn-cleanup-apply" style="background:#2b4a2b;color:#d0ffd0;display:none">✅ 确认应用清理</button>
+          </div>
           <div class="test-result" id="cleanup-result"></div>
+          <div id="cleanup-preview-detail" style="display:none;margin-top:10px;max-height:320px;overflow:auto;border:1px solid #2a2f3a;border-radius:6px;padding:10px;font-size:11px;background:#1a1d26"></div>
         </div>
 
         <div class="settings-section">
@@ -467,27 +471,89 @@
             }
         });
 
-        overlay.querySelector('#btn-cleanup-queue').addEventListener('click', async () => {
+        const escapeHtmlText = (s) => String(s || '')
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+        const renderCleanupResult = (result, { applied = false } = {}) => {
             const resultEl = overlay.querySelector('#cleanup-result');
-            resultEl.textContent = '清理中...';
+            const detailEl = overlay.querySelector('#cleanup-preview-detail');
+            const applyBtn = overlay.querySelector('#btn-cleanup-apply');
+
+            if (!result?.success) {
+                resultEl.textContent = '✗ ' + (result?.message || '清理失败');
+                resultEl.className = 'test-result error';
+                detailEl.style.display = 'none';
+                applyBtn.style.display = 'none';
+                return;
+            }
+
+            const c = result.counts || {};
+            const label = applied ? '✅ 已应用' : '🔍 预览';
+            resultEl.innerHTML = `${label}：总计 ${c.total} · 新下架 ${c.markedUnpublishable} · 已下架 ${c.alreadyUnpublishable} · 加权 ${c.boosted} · 保留 ${c.kept}`;
+            resultEl.className = 'test-result success';
+
+            const reasonStats = result.reasonStats || {};
+            const reasonSamples = result.reasonSamples || {};
+            const reasonEntries = Object.entries(reasonStats).sort((a, b) => b[1] - a[1]);
+
+            if (reasonEntries.length === 0) {
+                detailEl.style.display = 'none';
+                applyBtn.style.display = 'none';
+                return;
+            }
+
+            const blocks = reasonEntries.map(([reason, n]) => {
+                const urls = (reasonSamples[reason] || []).slice(0, 5);
+                const urlList = urls.length
+                    ? urls.map((u) => `<li style="color:#8891a8;margin:2px 0;word-break:break-all">${escapeHtmlText(u)}</li>`).join('')
+                    : '<li style="color:#555">（无样本）</li>';
+                return `<div style="margin-bottom:10px">
+                    <div style="color:#eee;font-weight:600">${escapeHtmlText(reason)} · ${n} 条</div>
+                    <ul style="margin:4px 0 0 18px;padding:0">${urlList}</ul>
+                </div>`;
+            }).join('');
+            detailEl.innerHTML = blocks;
+            detailEl.style.display = 'block';
+
+            // 只有 dryRun 且有东西可删时才暴露"应用"按钮
+            applyBtn.style.display = (!applied && c.markedUnpublishable > 0) ? 'inline-block' : 'none';
+        };
+
+        overlay.querySelector('#btn-cleanup-preview').addEventListener('click', async () => {
+            const resultEl = overlay.querySelector('#cleanup-result');
+            resultEl.textContent = '扫描中...';
             resultEl.className = 'test-result';
             try {
-                const result = await chrome.runtime.sendMessage({ action: 'cleanupResourceQueue' });
-                if (result?.success) {
-                    const c = result.counts || {};
-                    const reasons = Object.entries(result.reasonStats || {})
-                        .sort((a, b) => b[1] - a[1])
-                        .map(([r, n]) => `${r}: ${n}`)
-                        .join('、');
-                    resultEl.innerHTML = `✓ 总计 ${c.total}，新下架 ${c.markedUnpublishable}，已下架 ${c.alreadyUnpublishable}，加权 ${c.boosted}，保留 ${c.kept}${reasons ? `<br>原因：${reasons}` : ''}`;
-                    resultEl.className = 'test-result success';
-                } else {
-                    resultEl.textContent = '✗ ' + (result?.message || '清理失败');
-                    resultEl.className = 'test-result error';
-                }
+                const result = await chrome.runtime.sendMessage({
+                    action: 'cleanupResourceQueue',
+                    dryRun: true
+                });
+                renderCleanupResult(result, { applied: false });
             } catch (e) {
-                resultEl.textContent = '✗ ' + (e?.message || '清理失败');
+                resultEl.textContent = '✗ ' + (e?.message || '扫描失败');
                 resultEl.className = 'test-result error';
+            }
+        });
+
+        overlay.querySelector('#btn-cleanup-apply').addEventListener('click', async () => {
+            const applyBtn = overlay.querySelector('#btn-cleanup-apply');
+            const resultEl = overlay.querySelector('#cleanup-result');
+            if (!confirm('即将把预览中列出的资源全部标记为"不可发布"。确认继续？')) return;
+            applyBtn.disabled = true;
+            resultEl.textContent = '应用中...';
+            resultEl.className = 'test-result';
+            try {
+                const result = await chrome.runtime.sendMessage({
+                    action: 'cleanupResourceQueue',
+                    dryRun: false
+                });
+                renderCleanupResult(result, { applied: true });
+            } catch (e) {
+                resultEl.textContent = '✗ ' + (e?.message || '应用失败');
+                resultEl.className = 'test-result error';
+            } finally {
+                applyBtn.disabled = false;
             }
         });
 

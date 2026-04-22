@@ -1568,7 +1568,10 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
         exportPublishEventLog: async () => await exportPublishEventLog(),
         clearPublishEventLog: async () => await clearPublishEventLog(),
         clearAllData: async () => await clearResourceWorkspace(),
-        cleanupResourceQueue: async () => await cleanupResourceQueue(),
+        cleanupResourceQueue: async (msg = {}) => await cleanupResourceQueue({
+            dryRun: !!msg.dryRun,
+            sampleLimit: Number(msg.sampleLimit) || 5
+        }),
         getPublishDiagnostics: async () => await getPublishDiagnostics(),
         testAiConnection: () => AIEngine.testConnection(),
         getAIUsageStats: async () => ({ success: true, stats: await AIEngine.getUsageStats() }),
@@ -2446,14 +2449,22 @@ async function writeResourcesToStorage(resources = []) {
 
 /**
  * 一次性清理：用现有字段硬筛选资源队列。
+ *
+ * 规则组（中档策略 "发出去 Google 能看到才算能发"）：
  * - edu/gov/社交媒体域名 → 下架
  * - 评论区存在但无表单（评论已关闭的强指示）→ 下架
  * - commentsClosed / requiresLogin 字段 = true → 下架
  * - 历史连续失败 ≥3 次且从未成功 → 下架
  * - 历史发布原因命中 HARD_UNPUBLISHABLE_REASONS → 下架
+ * - [新] moderation-only：所有 published 记录都 reviewPending=true → 下架（Google 爬不到）
+ * - [新] duplicate-comment-terminal：历史里已有 duplicate_comment 终态 → 下架（我们发过了）
  * - commentAnchorCount ≥3 → 加 boost 标签（不下架，只排序加权）
+ *
+ * options.dryRun 为 true 时：只统计、不改任何数据。返回 reasonSamples 给 UI 预览用。
  */
-async function cleanupResourceQueue() {
+async function cleanupResourceQueue(options = {}) {
+    const dryRun = !!options.dryRun;
+    const sampleLimit = Number(options.sampleLimit) > 0 ? Number(options.sampleLimit) : 5;
     const resources = await getStoredResources();
     const counts = {
         total: resources.length,
@@ -2463,6 +2474,13 @@ async function cleanupResourceQueue() {
         kept: 0
     };
     const reasonStats = {};
+    const reasonSamples = {};
+    const addReasonSample = (reason, url) => {
+        if (!reasonSamples[reason]) reasonSamples[reason] = [];
+        if (url && reasonSamples[reason].length < sampleLimit) {
+            reasonSamples[reason].push(url);
+        }
+    };
 
     const nextResources = resources.map((resource) => {
         if (!resource) return resource;
@@ -2533,12 +2551,39 @@ async function cleanupResourceQueue() {
             }
         }
 
+        // 8. [中档新规则] moderation-only：所有 published 记录都是 reviewPending=true
+        //    → Google 永远爬不到，不占队列。
+        //    如果曾经有过 "anchorVisible=true 且 reviewPending≠true" 的干净成功记录，
+        //    给予 benefit-of-doubt，不下架。
+        const hasPublishAttempt = historyEntries.some((entry) => Number(entry?.attempts?.published || 0) > 0);
+        const hasRealVisiblePublish = historyEntries.some((entry) => {
+            const meta = entry?.publishMeta || {};
+            return meta.anchorVisible === true && meta.reviewPending !== true;
+        });
+        const hasPendingReview = historyEntries.some((entry) => entry?.publishMeta?.reviewPending === true);
+        if (hasPublishAttempt && hasPendingReview && !hasRealVisiblePublish) {
+            reasons.push('moderation-only');
+        }
+
+        // 9. [中档新规则] duplicate-comment-terminal：已经在这发过一次，再发也是重复
+        const hasDuplicateTerminal = historyEntries.some((entry) => {
+            const terminal = String(entry?.publishMeta?.terminalFailureReason || '').toLowerCase();
+            return terminal === 'duplicate_comment';
+        });
+        if (hasDuplicateTerminal) {
+            reasons.push('duplicate-comment-terminal');
+        }
+
         if (reasons.length > 0) {
             counts.markedUnpublishable++;
             const dedupedReasons = Array.from(new Set(reasons));
             dedupedReasons.forEach((r) => {
                 reasonStats[r] = (reasonStats[r] || 0) + 1;
+                addReasonSample(r, resource.url || '');
             });
+            if (dryRun) {
+                return resource;
+            }
             return {
                 ...resource,
                 status: 'unpublishable',
@@ -2553,6 +2598,7 @@ async function cleanupResourceQueue() {
         // 高质量加权：≥3 条带链接评论
         if (anchorCount >= 3) {
             counts.boosted++;
+            if (dryRun) return resource;
             return {
                 ...resource,
                 details: Array.from(new Set([...details, 'anchor-count-boost']))
@@ -2563,12 +2609,14 @@ async function cleanupResourceQueue() {
         return resource;
     });
 
-    const stored = await writeResourcesToStorage(nextResources);
-    syncResourceOpportunityStats(stored);
-    broadcastStats();
-    autoPublishDispatch.schedule('resource-cleanup', 1500);
+    if (!dryRun) {
+        const stored = await writeResourcesToStorage(nextResources);
+        syncResourceOpportunityStats(stored);
+        broadcastStats();
+        autoPublishDispatch.schedule('resource-cleanup', 1500);
+    }
 
-    return { success: true, counts, reasonStats };
+    return { success: true, dryRun, counts, reasonStats, reasonSamples };
 }
 
 /**
