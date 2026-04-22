@@ -821,11 +821,12 @@ const PublishRuntime = {
 
         if (status === 'published') {
             sessionPublishedCount += 1;
-            // Anchor 成功计数改成"有链接且不是 nofollow/ugc/sponsored"才算。
-            // 以前只看 anchorVisible，rel=nofollow 的评论被当成成功 → SEO KPI 失真。
-            // anchorIsDofollow 仅在 anchorRequested=true 时由 verifier 填充，
-            // 对非 anchor 模式任务此字段为 undefined，不影响现有流程。
-            const anchorCountsAsSuccess = !!publishMeta.anchorIsDofollow;
+            // Anchor 成功计数：只要 verifier 在页面上找到了我们的锚文本就算数，
+            // 不区分 nofollow / dofollow。dofollow 的 SEO 价值更高，但 nofollow
+            // 也能带来点击和品牌曝光，用户侧想把这类也算成功。
+            // 区分信息保留在 publishMeta.anchorIsNofollow / anchorIsDofollow / anchorRel
+            // 字段里，以后做 diagnostics 或报表时可单独统计 dofollow rate。
+            const anchorCountsAsSuccess = !!publishMeta.anchorVisible;
             if (anchorCountsAsSuccess) {
                 sessionAnchorSuccessCount += 1;
             }
