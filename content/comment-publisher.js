@@ -1662,6 +1662,7 @@
         clearAutoSubmitTimer();
         clearSubmissionFallbackTimer();
         clearWorkflowStallTimer();
+        stopProgressHeartbeat();
         // Disarm network-inspector，确保本次结果定稿后不再吃任何迟到的 POST 响应。
         try {
             window.dispatchEvent(new CustomEvent('__bla_inspect_disarm'));
@@ -1846,6 +1847,7 @@
         clearAutoSubmitTimer();
         clearSubmissionFallbackTimer();
         clearWorkflowStallTimer();
+        stopProgressHeartbeat();
         // 取消时 disarm 防止残留 armed 状态误吃后续 POST
         try {
             window.dispatchEvent(new CustomEvent('__bla_inspect_disarm'));
@@ -1975,6 +1977,39 @@
         return Math.max(baseTimeoutMs, minByProfile, 3000 + typingCostMs + fieldCostMs);
     }
 
+    // 后台 watchdog 只在收到新 stage 消息时才被重置。长阶段（filling_form 45s /
+    // submitting 20s 等）里 content script 埋头打字/等 DOM/等 AI 时不会换阶段，
+    // 重 DOM 站点打字能超过 45s → watchdog 误判卡死。
+    // 用这个 8s 心跳把最近一次 stage 消息重发给 background，保持 watchdog 活着。
+    // content script 一旦真挂了（JS 事件循环卡死），setInterval 也不会 fire，
+    // watchdog 会按原来的方式兜底。
+    let progressHeartbeatTimer = null;
+    let progressHeartbeatMsg = null;
+    const PROGRESS_HEARTBEAT_MS = 8000;
+
+    function stopProgressHeartbeat() {
+        if (progressHeartbeatTimer) {
+            clearInterval(progressHeartbeatTimer);
+            progressHeartbeatTimer = null;
+        }
+        progressHeartbeatMsg = null;
+    }
+
+    function startProgressHeartbeat(msg) {
+        stopProgressHeartbeat();
+        progressHeartbeatMsg = msg;
+        progressHeartbeatTimer = setInterval(() => {
+            if (!progressHeartbeatMsg || publishStopped || publishResultReported) {
+                stopProgressHeartbeat();
+                return;
+            }
+            try {
+                chrome.runtime.sendMessage(progressHeartbeatMsg).catch(() => {});
+                logPublishEvent('stage-heartbeat', { stage: progressHeartbeatMsg.stage });
+            } catch {}
+        }, PROGRESS_HEARTBEAT_MS);
+    }
+
     function updateWorkflowProgress(context, stage = '', stageLabel = '', options = {}) {
         const normalizedStage = compactText(stage || '');
         const normalizedLabel = compactText(stageLabel || '');
@@ -1990,7 +2025,7 @@
         const timeoutMs = Number(options.timeoutMs || 0) || getStageTimeoutMs(context, normalizedStage);
         armWorkflowStallTimer(context, timeoutMs);
 
-        chrome.runtime.sendMessage({
+        const msg = {
             action: 'commentProgress',
             resourceId: currentResourceId,
             taskId: currentTaskId,
@@ -1998,7 +2033,9 @@
             stage: normalizedStage,
             stageLabel: normalizedLabel,
             stageTimeoutMs: timeoutMs
-        }).catch(() => {});
+        };
+        chrome.runtime.sendMessage(msg).catch(() => {});
+        startProgressHeartbeat(msg);
     }
 
     function resolveWorkflow(workflow) {
