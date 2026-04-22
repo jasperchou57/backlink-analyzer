@@ -1978,14 +1978,27 @@
     }
 
     // 后台 watchdog 只在收到新 stage 消息时才被重置。长阶段（filling_form 45s /
-    // submitting 20s 等）里 content script 埋头打字/等 DOM/等 AI 时不会换阶段，
-    // 重 DOM 站点打字能超过 45s → watchdog 误判卡死。
+    // finding_form 懒加载 / generating_comment AI 调用）里 content script 埋头
+    // 打字/等 DOM/等 AI 时不会换阶段，重 DOM 站点打字能超过 45s → watchdog 误判。
     // 用这个 8s 心跳把最近一次 stage 消息重发给 background，保持 watchdog 活着。
     // content script 一旦真挂了（JS 事件循环卡死），setInterval 也不会 fire，
     // watchdog 会按原来的方式兜底。
+    //
+    // 关键：只对"真正在干活"的阶段 heartbeat。submitting 阶段 content script 是
+    // 在等 network signal / navigation / watchdog 超时，不是在工作 → 不该 heartbeat。
+    // 否则 submission watchdog 会被无限重置，整条任务卡死（mybizzykitchen.com 案例）。
+    // 同时给每个阶段加硬顶 MAX_HEARTBEATS，防止 filling_form 真的无限卡时永远不
+    // 兜底：20 × 8s = 160s 就停心跳，让 watchdog 正常触发。
+    const HEARTBEAT_ELIGIBLE_STAGES = new Set([
+        'finding_form',
+        'generating_comment',
+        'filling_form'
+    ]);
+    const PROGRESS_HEARTBEAT_MS = 8000;
+    const MAX_HEARTBEATS_PER_STAGE = 20;
     let progressHeartbeatTimer = null;
     let progressHeartbeatMsg = null;
-    const PROGRESS_HEARTBEAT_MS = 8000;
+    let progressHeartbeatCount = 0;
 
     function stopProgressHeartbeat() {
         if (progressHeartbeatTimer) {
@@ -1993,19 +2006,30 @@
             progressHeartbeatTimer = null;
         }
         progressHeartbeatMsg = null;
+        progressHeartbeatCount = 0;
     }
 
     function startProgressHeartbeat(msg) {
         stopProgressHeartbeat();
         progressHeartbeatMsg = msg;
+        progressHeartbeatCount = 0;
         progressHeartbeatTimer = setInterval(() => {
             if (!progressHeartbeatMsg || publishStopped || publishResultReported) {
                 stopProgressHeartbeat();
                 return;
             }
+            if (progressHeartbeatCount >= MAX_HEARTBEATS_PER_STAGE) {
+                // 硬顶：让 watchdog 按正常超时规则兜底
+                stopProgressHeartbeat();
+                return;
+            }
             try {
                 chrome.runtime.sendMessage(progressHeartbeatMsg).catch(() => {});
-                logPublishEvent('stage-heartbeat', { stage: progressHeartbeatMsg.stage });
+                progressHeartbeatCount += 1;
+                logPublishEvent('stage-heartbeat', {
+                    stage: progressHeartbeatMsg.stage,
+                    count: progressHeartbeatCount
+                });
             } catch {}
         }, PROGRESS_HEARTBEAT_MS);
     }
@@ -2035,7 +2059,14 @@
             stageTimeoutMs: timeoutMs
         };
         chrome.runtime.sendMessage(msg).catch(() => {});
-        startProgressHeartbeat(msg);
+
+        // 只对"真正在干活"的长阶段 heartbeat。submitting 等阶段是"等信号"，
+        // 不该屏蔽 watchdog（否则 signal 丢了就永远卡住）。
+        if (HEARTBEAT_ELIGIBLE_STAGES.has(normalizedStage)) {
+            startProgressHeartbeat(msg);
+        } else {
+            stopProgressHeartbeat();
+        }
     }
 
     function resolveWorkflow(workflow) {
