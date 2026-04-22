@@ -266,7 +266,10 @@
                 const currentOutcome = getCurrentHistoryCounts(historyEntry);
                 const isDirectCandidate = isPublishCandidateForTaskUi(resource, task);
                 const hasTaskHistory = !!historyEntry && (attempts.published + attempts.failed + attempts.skipped > 0);
-                if (isDirectCandidate || hasTaskHistory) {
+                // directTotal 只计当前池子里的候选，不再把"历史上碰过但现在已出池"的
+                // 加进分母。让"待发布进度 X / Y"里的 Y 跟"免登录直发"池大小对齐；
+                // 同工作流的任务现在分母一致，清理池子时分母自动同步更新。
+                if (isDirectCandidate) {
                     stats.directTotal++;
                 }
 
@@ -739,7 +742,7 @@
                                     <span class="task-overview-bar-value">${publishOverview.direct}</span>
                                 </div>
                                 <div class="task-overview-bar">
-                                    <span class="task-overview-bar-label">🧭 当前任务累计免登录直发候选</span>
+                                    <span class="task-overview-bar-label">🧭 免登录直发池候选</span>
                                     <span class="task-overview-bar-value">${publishOverview.directTotal}</span>
                                 </div>
                                 <div class="task-overview-bar anchor">
