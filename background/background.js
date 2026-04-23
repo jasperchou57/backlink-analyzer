@@ -289,6 +289,73 @@ async function clearPublishEventLog() {
     return { success: true };
 }
 // ─── 黑匣子记录器 END ───
+
+/**
+ * AI 生成评论者名字 + 邮箱池。用来躲开 Akismet / JetPack 对固定 commenter 指纹
+ * 的识别。用户每次想换一批就点一下，扩展用已配置的 AI 生成一组全新的身份。
+ * 返回 { success, names: [], emails: [] }。
+ */
+async function generateIdentityPool(msg = {}) {
+    const count = Math.max(3, Math.min(20, Number(msg.count) || 10));
+    const locale = String(msg.locale || 'english').trim() || 'english';
+    const prompt = `Generate ${count} realistic blog commenter identities. Each is a pair: a human-sounding full name + a matching plausible email address.
+
+Output format — EXACTLY ${count} lines, one per identity, using "|" as separator:
+FirstName LastName|firstname.lastname@provider.com
+
+Strict requirements:
+- Names must sound like real people. Use diverse first names and surnames. NO celebrities, NO obvious fakes like "John Doe". Variety: mix of common and less common names.
+- Emails must match the name (first.last@, firstlast@, first_last@ style). Use varied providers: gmail.com, outlook.com, yahoo.com, protonmail.com, icloud.com, hotmail.com, hey.com.
+- Style: ${locale} conventions (${locale === 'english' ? 'western names' : locale}).
+- No numbering, no header, no explanation. Just ${count} lines of "Name|email".
+
+Example line:
+Emily Carter|emily.carter@outlook.com`;
+
+    let content;
+    try {
+        content = await AIEngine.call('identityPool', prompt, { timeoutMs: 20000, maxTokens: 1024, temperature: 0.9 });
+    } catch (error) {
+        return {
+            success: false,
+            message: error?.message || 'AI 调用失败',
+            hint: '请确认设置里 AI Provider / API Key / Model ID 都配好了'
+        };
+    }
+
+    // 按行解析
+    const names = [];
+    const emails = [];
+    for (const rawLine of String(content || '').split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+        const idx = line.indexOf('|');
+        if (idx < 0) continue;
+        const name = line.slice(0, idx).trim();
+        const email = line.slice(idx + 1).trim();
+        // 基本 sanity check
+        if (!name || name.length > 60) continue;
+        if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) continue;
+        names.push(name);
+        emails.push(email);
+    }
+
+    if (names.length < 3) {
+        return {
+            success: false,
+            message: `AI 响应解析后只拿到 ${names.length} 组有效身份，少于 3 组，无法使用`,
+            rawSample: String(content || '').slice(0, 300),
+            hint: '可能是 AI 没按 "Name|email" 格式返回。可以换个更好的模型再试（比如用 OpenRouter 的 claude-sonnet）'
+        };
+    }
+
+    return {
+        success: true,
+        count: names.length,
+        names,
+        emails
+    };
+}
 let autoPublishControlState = createDefaultAutoPublishControlState();
 let autoPublishControlLoaded = false;
 let resourceSignalNormalizationTimer = null;
@@ -1567,6 +1634,7 @@ const runtimeMessageRouter = RuntimeMessageRouter.create({
         },
         exportPublishEventLog: async () => await exportPublishEventLog(),
         clearPublishEventLog: async () => await clearPublishEventLog(),
+        generateIdentityPool: async (msg = {}) => await generateIdentityPool(msg),
         clearAllData: async () => await clearResourceWorkspace(),
         cleanupResourceQueue: async (msg = {}) => await cleanupResourceQueue({
             dryRun: !!msg.dryRun,

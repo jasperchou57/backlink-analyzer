@@ -1253,13 +1253,17 @@
 
                 return `
                     <div class="settings-field">
-                        <label>评论者名称（支持多条，一行一个，每次发布随机抽一个）</label>
-                        <textarea class="input" id="task-commenter" rows="4" style="font-family:inherit;resize:vertical" placeholder="单条：Slime Seas Wiki&#10;多条（防反垃圾指纹识别）：&#10;Emily Chen&#10;Marcus Rodriguez&#10;Sarah Johnson">${escapeHtml(currentTask.name_commenter || '')}</textarea>
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                            <label style="margin:0">评论者名称（支持多条，一行一个，每次发布随机抽一个）</label>
+                            <button type="button" class="btn-test" id="task-gen-identity-pool" style="padding:4px 10px;font-size:11px;margin:0">🎲 AI 生成 10 组</button>
+                        </div>
+                        <textarea class="input" id="task-commenter" rows="6" style="font-family:inherit;resize:vertical" placeholder="单条：Slime Seas Wiki&#10;多条（防反垃圾指纹识别）：&#10;Emily Chen&#10;Marcus Rodriguez&#10;Sarah Johnson">${escapeHtml(currentTask.name_commenter || '')}</textarea>
                     </div>
                     <div class="settings-field">
                         <label>评论者邮箱（多条时须与名称同顺序同数量，按索引配对）</label>
-                        <textarea class="input" id="task-email" rows="4" style="font-family:inherit;resize:vertical" placeholder="单条：hello@slimeseas.com&#10;多条（与名称同顺序）：&#10;emily.chen@outlook.com&#10;marcus.r@gmail.com&#10;sarah.j@yahoo.com">${escapeHtml(currentTask.email || '')}</textarea>
-                        <div style="font-size:11px;color:#8891a8;margin-top:4px">💡 用池子能让 Akismet / JetPack 反垃圾识别不到固定指纹，显著提高发布成功率</div>
+                        <textarea class="input" id="task-email" rows="6" style="font-family:inherit;resize:vertical" placeholder="单条：hello@slimeseas.com&#10;多条（与名称同顺序）：&#10;emily.chen@outlook.com&#10;marcus.r@gmail.com&#10;sarah.j@yahoo.com">${escapeHtml(currentTask.email || '')}</textarea>
+                        <div style="font-size:11px;color:#8891a8;margin-top:4px">💡 用池子能让 Akismet / JetPack 反垃圾识别不到固定指纹。点右上"🎲 AI 生成 10 组"让 AI 自动生成一批身份，省去手动填的麻烦。</div>
+                        <div class="test-result" id="task-gen-identity-result" style="margin-top:6px"></div>
                     </div>
                     <div class="settings-field">
                         <label>发布模式</label>
@@ -1347,6 +1351,46 @@
                 }
             });
             updateMaxPublishesFieldMeta();
+
+            // AI 生成评论者身份池。用事件代理，因为 workflow 切换时字段会重新渲染。
+            overlay.addEventListener('click', async (event) => {
+                if (event.target?.id !== 'task-gen-identity-pool') return;
+                const btn = event.target;
+                const nameEl = overlay.querySelector('#task-commenter');
+                const emailEl = overlay.querySelector('#task-email');
+                const resultEl = overlay.querySelector('#task-gen-identity-result');
+                if (!nameEl || !emailEl) return;
+
+                // 如果已有内容，确认覆盖
+                if ((nameEl.value.trim() || emailEl.value.trim())) {
+                    if (!confirm('当前已填写了名称/邮箱，AI 生成会覆盖现有内容。确认继续？')) return;
+                }
+
+                btn.disabled = true;
+                const originalText = btn.textContent;
+                btn.textContent = '生成中...';
+                resultEl.textContent = '正在调用 AI 生成 10 组身份（约 5-15 秒）...';
+                resultEl.className = 'test-result';
+
+                try {
+                    const result = await chrome.runtime.sendMessage({ action: 'generateIdentityPool', count: 10 });
+                    if (!result?.success) {
+                        resultEl.innerHTML = `✗ ${escapeHtml(result?.message || '生成失败')}${result?.hint ? '<br><span style="color:#8891a8">' + escapeHtml(result.hint) + '</span>' : ''}`;
+                        resultEl.className = 'test-result error';
+                        return;
+                    }
+                    nameEl.value = result.names.join('\n');
+                    emailEl.value = result.emails.join('\n');
+                    resultEl.innerHTML = `✓ 已生成 ${result.count} 组身份，已填入上面两个框。看着觉得行就继续保存任务；不满意点"🎲 AI 生成"再换一批。`;
+                    resultEl.className = 'test-result success';
+                } catch (e) {
+                    resultEl.textContent = '✗ ' + (e?.message || 'AI 调用失败');
+                    resultEl.className = 'test-result error';
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                }
+            });
             overlay.querySelector('#btn-save-task').addEventListener('click', async () => {
                 const website = overlay.querySelector('#task-website').value.trim();
                 if (!website) {
