@@ -1079,38 +1079,52 @@ function ensurePublishContentScripts(scriptFiles = []) {
 }
 
 // 防御：提交后页面被重定向到 Cloudflare challenge / 登录墙 / 错误页时不能认为成功。
-// URL 关键字命中即判为软可重试失败。
-const NAVIGATION_CHALLENGE_URL_RE = new RegExp([
-    'cloudflare',
-    'cf[-_]chl',
-    'cf[-_]browser',
-    'challenge',
-    'ddos[-_]guard',
-    'just[-_]a[-_]moment',
-    'attention[-_]required',
-    'access[-_]denied',
-    '/403(?:[/?#]|$)',
-    '/404(?:[/?#]|$)',
-    '/500(?:[/?#]|$)',
-    'forbidden',
-    'captcha[-_]verify',
-    'hcaptcha[-_]verify',
-    'turnstile',
-    '/wp-login',
-    '/login(?:[/?#]|$)',
-    '/signin(?:[/?#]|$)',
-    '/sign[-_]in',
-    '/account/login',
-    '/users/sign_in',
-    'please[-_]wait'
-].join('|'), 'i');
-
+// 老版本用单词级 regex（包含 "challenge" / "login" / "forbidden" / "please-wait" 等
+// 通用词），结果博客文章 slug 里含这些词就被误判，比如
+//   feedyourfictionaddiction.com/.../discussion-challenge-link-up-giveaway.html
+//     ^^^ "challenge" 是"书籍挑战活动"的意思，不是 Cloudflare challenge
+//
+// 新版用 URL 结构化解析：host / pathname / search 分别精确检查，只命中真正的
+// 安全防护/错误页标识，不会误伤博客正文 slug。
 function classifyPostSubmitUrl(rawUrl = '') {
-    const url = String(rawUrl || '').toLowerCase();
-    if (!url) return { blocked: false };
-    if (NAVIGATION_CHALLENGE_URL_RE.test(url)) {
-        return { blocked: true, reason: 'navigation-challenge' };
+    const raw = String(rawUrl || '').trim();
+    if (!raw) return { blocked: false };
+    let u;
+    try {
+        u = new URL(raw);
+    } catch {
+        return { blocked: false };
     }
+    const host = u.hostname.toLowerCase();
+    const path = (u.pathname || '/').toLowerCase();
+    const search = (u.search || '').toLowerCase();
+
+    // 1. Cloudflare / DDoS-Guard 的 CDN 主机名
+    if (/(?:^|\.)cloudflare\.com$/.test(host)) return { blocked: true, reason: 'cloudflare-host' };
+    if (/(?:^|\.)ddos-guard\.net$/.test(host)) return { blocked: true, reason: 'ddos-guard-host' };
+
+    // 2. Cloudflare 挑战路径/参数（站点自己用 Cloudflare 代理时会出现在同站 URL 上）
+    if (path.includes('/cdn-cgi/challenge-platform/')) return { blocked: true, reason: 'cf-challenge-path' };
+    if (path.includes('/cdn-cgi/turnstile/')) return { blocked: true, reason: 'cf-turnstile-path' };
+    if (search.includes('__cf_chl_')) return { blocked: true, reason: 'cf-challenge-param' };
+
+    // 3. WP 登录页（精确路径，不是 slug 包含 login 就算）
+    if (path === '/wp-login.php' || path.startsWith('/wp-login.php/')) {
+        return { blocked: true, reason: 'wp-login' };
+    }
+
+    // 4. HTTP 错误页：路径就是单独的错误号或 "forbidden" 等关键字（不是嵌在 slug 里）
+    //    匹配 /403 /404 /500 /503 /access-denied /forbidden 及其 .html/.php 变体
+    if (/^\/(?:403|404|500|502|503|access-denied|forbidden)(?:\.(?:html?|php))?\/?$/.test(path)) {
+        return { blocked: true, reason: 'http-error-page' };
+    }
+
+    // 5. 常见自定义登录路径（精确匹配整段路径，不是子串）
+    //    避开误伤博客 slug（比如 "/how-to-login-tutorial/"）
+    if (/^\/(?:login|signin|sign-in|account\/login|users\/sign_in)\/?$/.test(path)) {
+        return { blocked: true, reason: 'login-page' };
+    }
+
     return { blocked: false };
 }
 
@@ -1139,7 +1153,7 @@ async function finalizePendingSubmissionFromNavigation(taskId, tabId) {
             resourceId: pending.resourceId,
             tabId,
             url: postUrl,
-            data: { reason: classification.reason }
+            data: { reason: classification.reason, blockReason: classification.reason }
         });
         // 跳转到 challenge/登录/错误页 → 评论肯定没发，标软可重试失败，
         // 走 SOFT_RETRYABLE 重试而不是一头扎进 'submitted' → verifier 再判错。
