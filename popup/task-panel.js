@@ -1253,12 +1253,13 @@
 
                 return `
                     <div class="settings-field">
-                        <label>评论者名称</label>
-                        <input class="input" id="task-commenter" value="${escapeHtml(currentTask.name_commenter || '')}">
+                        <label>评论者名称（支持多条，一行一个，每次发布随机抽一个）</label>
+                        <textarea class="input" id="task-commenter" rows="4" style="font-family:inherit;resize:vertical" placeholder="单条：Slime Seas Wiki&#10;多条（防反垃圾指纹识别）：&#10;Emily Chen&#10;Marcus Rodriguez&#10;Sarah Johnson">${escapeHtml(currentTask.name_commenter || '')}</textarea>
                     </div>
                     <div class="settings-field">
-                        <label>评论者邮箱</label>
-                        <input class="input" id="task-email" value="${escapeHtml(currentTask.email || '')}">
+                        <label>评论者邮箱（多条时须与名称同顺序同数量，按索引配对）</label>
+                        <textarea class="input" id="task-email" rows="4" style="font-family:inherit;resize:vertical" placeholder="单条：hello@slimeseas.com&#10;多条（与名称同顺序）：&#10;emily.chen@outlook.com&#10;marcus.r@gmail.com&#10;sarah.j@yahoo.com">${escapeHtml(currentTask.email || '')}</textarea>
+                        <div style="font-size:11px;color:#8891a8;margin-top:4px">💡 用池子能让 Akismet / JetPack 反垃圾识别不到固定指纹，显著提高发布成功率</div>
                     </div>
                     <div class="settings-field">
                         <label>发布模式</label>

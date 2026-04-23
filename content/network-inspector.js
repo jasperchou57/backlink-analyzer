@@ -100,11 +100,14 @@
         }
     }
 
-    window.addEventListener('__bla_inspect_arm', (event) => {
-        const detail = event.detail || {};
-        const actionUrl = String(detail.formAction || '').trim();
+    // ⚠️ 8 小时实测：CustomEvent 从 isolated world 到 main world 的 detail 对象
+    // 会被 Chrome 的 V8 隔离策略阻断（detail 读不到），导致 armedState 永远没设上，
+    // 整夜 0 次 network-signal。改用 window.postMessage：同窗口跨 world 通信
+    // Chrome 官方保证可用，detail 走 structured clone 能传 string。
+    //
+    // 兼容性：仍然保留 CustomEvent 监听器兜底，万一未来 Chrome 改行为至少一条能通。
+    function applyArm(actionUrl) {
         try {
-            // formAction 可能是相对路径，以当前页面为基底
             const u = actionUrl
                 ? new URL(actionUrl, window.location.href)
                 : new URL(window.location.href);
@@ -115,12 +118,29 @@
             };
             if (armTimer) clearTimeout(armTimer);
             armTimer = setTimeout(disarmInspector, ARM_MAX_DURATION_MS);
+            // 主世界 console log，便于调试时在 DevTools 控制台看到 arm 被触发
+            try { console.log('[BLA] inspector armed for', armedState.actionHost + armedState.actionPath); } catch {}
         } catch {
-            // parse 失败就 disarm，不兜底拦截
+            disarmInspector();
+        }
+    }
+
+    // 新主通道：postMessage
+    window.addEventListener('message', (event) => {
+        if (event.source !== window) return;
+        const data = event.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.type === '__bla_inspect_arm') {
+            applyArm(String(data.formAction || '').trim());
+        } else if (data.type === '__bla_inspect_disarm') {
             disarmInspector();
         }
     });
 
+    // 旧兜底通道：CustomEvent
+    window.addEventListener('__bla_inspect_arm', (event) => {
+        applyArm(String(event.detail?.formAction || '').trim());
+    });
     window.addEventListener('__bla_inspect_disarm', disarmInspector);
 
     function matchesArmedAction(reqUrl) {

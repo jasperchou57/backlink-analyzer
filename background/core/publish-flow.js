@@ -866,6 +866,50 @@ function shouldPreferCommentViewport(resource = {}, task = {}, workflow = null) 
     );
 }
 
+/**
+ * 署名池解析：把一个多行/多条字符串拆成有效条目列表。
+ * 支持 \n / ; / , 三种分隔符（\n 最常用，逗号/分号为写在单行时的兼容）。
+ * 空行和纯空白条目剔除，前后空格 trim。
+ */
+function parseIdentityPool(raw = '') {
+    return String(raw || '')
+        .split(/[\n;,]+/)
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0);
+}
+
+/**
+ * 从名字池 + 邮箱池里抽一条配对条目。
+ * - 两个池都至少有 1 条：按 min(len_name, len_email) 随机挑同一个 index（避免错配）
+ * - 只有名字池：从名字随机挑，邮箱用单条
+ * - 单条：退化为原行为，跟老代码一样
+ * - 两者都空：返回空字符串
+ *
+ * 目的：避免同一个 commenterName+email 被 Akismet 学成指纹。
+ * 用户在任务配置里填多行名字+多行邮箱（同顺序），扩展每次发布随机抽一组。
+ */
+function pickPooledIdentity(rawName, rawEmail) {
+    const names = parseIdentityPool(rawName);
+    const emails = parseIdentityPool(rawEmail);
+    if (names.length <= 1 && emails.length <= 1) {
+        return { name: names[0] || '', email: emails[0] || '' };
+    }
+    // 两池都有多条：按最短池长配对
+    if (names.length > 1 && emails.length > 1) {
+        const len = Math.min(names.length, emails.length);
+        const idx = Math.floor(Math.random() * len);
+        return { name: names[idx], email: emails[idx] };
+    }
+    // 只有一边多条：多边抽、另一边固定
+    const name = names.length > 1
+        ? names[Math.floor(Math.random() * names.length)]
+        : (names[0] || '');
+    const email = emails.length > 1
+        ? emails[Math.floor(Math.random() * emails.length)]
+        : (emails[0] || '');
+    return { name, email };
+}
+
 async function sendPublishToTab(tabId, resource, task, workflow, settings, overrides = {}) {
     const domainPolicy = await getDomainPublishPolicy(resource?.url || '');
     const templateHint = await self.PublishMemory?.getTemplateHint?.(resource?.url || '');
@@ -874,6 +918,12 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
     const websiteValue = Object.prototype.hasOwnProperty.call(overrides, 'website')
         ? overrides.website
         : (shouldOmitWebsiteField ? '' : (task.website || settings.website || ''));
+
+    // 从池里抽一组 name+email（单条时等同旧行为）
+    const pooledIdentity = pickPooledIdentity(
+        task.name_commenter || settings.name || task.name || '',
+        task.email || settings.email || ''
+    );
     const workflowScriptFiles = workflow?.scripts?.length ? [...workflow.scripts] : [
         'content/comment-form-detection.js',
         'content/comment-standard-flow.js',
@@ -902,7 +952,11 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
             retryWithoutWebsite: !!overrides.retryWithoutWebsite,
             websiteOmitted: !websiteValue,
             domainPolicyOmit: !!domainPolicy.omitWebsiteField,
-            templateHintAvoid: !!templateHint?.avoidWebsiteField
+            templateHintAvoid: !!templateHint?.avoidWebsiteField,
+            // 池抽取信息：方便在黑匣子里回看"这轮用了哪个名字"
+            pickedName: pooledIdentity.name,
+            nameFromPool: parseIdentityPool(task.name_commenter || settings.name || task.name || '').length > 1,
+            emailFromPool: parseIdentityPool(task.email || settings.email || '').length > 1
         }
     });
 
@@ -953,8 +1007,8 @@ async function sendPublishToTab(tabId, resource, task, workflow, settings, overr
             action: 'fillComment',
             data: {
                 attemptId,
-                name: task.name_commenter || settings.name || task.name || '',
-                email: task.email || settings.email || '',
+                name: pooledIdentity.name,
+                email: pooledIdentity.email,
                 website: websiteValue,
                 mode: task.mode || 'semi-auto',
                 resourceId: resource.id,

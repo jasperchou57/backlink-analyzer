@@ -223,6 +223,7 @@
         });
         // 新任务入口先 disarm，防止同 tab 复用时上一轮的 armed 状态残留
         try {
+            window.postMessage({ type: '__bla_inspect_disarm' }, '*');
             window.dispatchEvent(new CustomEvent('__bla_inspect_disarm'));
         } catch {}
         currentPublishMeta = {
@@ -1517,11 +1518,15 @@
 
         // Arm network-inspector（只在这个窗口内、且 URL 匹配 form.action 的 POST 会被分析）。
         // 以前 inspector 全生命周期拦任何 POST，3rd party 埋点响应会被误判成提交成功。
+        //
+        // 通信用 window.postMessage 主通道 + CustomEvent 兜底。
+        // CustomEvent 从 isolated world 发到 main world 的 detail 对象会被 Chrome 的
+        // V8 隔离策略阻断（8 小时整夜 0 次 network-signal 就是这个原因）。
+        // postMessage 是 Chrome 官方保证跨 world 可用的机制。
         try {
             const formAction = form?.getAttribute?.('action') || window.location.href;
-            window.dispatchEvent(new CustomEvent('__bla_inspect_arm', {
-                detail: { formAction }
-            }));
+            window.postMessage({ type: '__bla_inspect_arm', formAction }, '*');
+            window.dispatchEvent(new CustomEvent('__bla_inspect_arm', { detail: { formAction } }));
         } catch {}
 
         const fallbackComment = compactText(context.comment || '')
@@ -1665,6 +1670,7 @@
         stopProgressHeartbeat();
         // Disarm network-inspector，确保本次结果定稿后不再吃任何迟到的 POST 响应。
         try {
+            window.postMessage({ type: '__bla_inspect_disarm' }, '*');
             window.dispatchEvent(new CustomEvent('__bla_inspect_disarm'));
         } catch {}
         logPublishEvent('report-result', {
@@ -1850,6 +1856,7 @@
         stopProgressHeartbeat();
         // 取消时 disarm 防止残留 armed 状态误吃后续 POST
         try {
+            window.postMessage({ type: '__bla_inspect_disarm' }, '*');
             window.dispatchEvent(new CustomEvent('__bla_inspect_disarm'));
         } catch {}
         addDebugEvent('field', 'Publish session stopped by user');
