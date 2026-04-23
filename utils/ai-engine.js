@@ -430,8 +430,16 @@ Respond with valid JSON only.`;
             commentGen: settings.modelCommentGen,
             linkDiscover: settings.modelLinkDiscover,
             researchPlan: settings.modelCommentGen || settings.modelClassify,
+            identityPool: settings.modelCommentGen || settings.modelClassify
         };
-        return modelMap[task] || '';
+        if (modelMap[task]) return modelMap[task];
+        // 未在 modelMap 里的新任务类型：回退到任何一个已配置的模型，避免因 task
+        // 名没对上而整条路径拒绝工作。优先级 commentGen > classify > formExtract > linkDiscover。
+        return settings.modelCommentGen
+            || settings.modelClassify
+            || settings.modelFormExtract
+            || settings.modelLinkDiscover
+            || '';
     },
 
     _resolveProvider(settings) {
