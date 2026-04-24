@@ -2526,6 +2526,10 @@ async function writeResourcesToStorage(resources = []) {
  * - 历史发布原因命中 HARD_UNPUBLISHABLE_REASONS → 下架
  * - moderation-only：所有 published 记录都 reviewPending=true → 下架（Google 爬不到）
  * - duplicate-comment-terminal：历史里已有 duplicate_comment 终态 → 下架（我们发过了）
+ * - likely-third-party-comments：连续 ≥2 次 comment-form-not-found 且无成功 → 下架
+ *   （大概率是 Jetpack / Disqus 等跨域 iframe 评论系统，永远发不了）
+ * - third-party-comments：发布端 DOM 显式检测到 jetpack_remote_comment / disqus_thread
+ *   等第三方评论系统 → 下架
  * - low-comment-count：新数据 commentCount < 3 且无已验证成功 → 下架（不活跃站）
  * - low-comment-count-legacy：老数据无 commentCount 字段 + details 没 has-existing-comments
  *   → 下架（采集时页面找不到评论类名，代理判定为 0 评论）
@@ -2643,6 +2647,29 @@ async function cleanupResourceQueue(options = {}) {
         });
         if (hasDuplicateTerminal) {
             reasons.push('duplicate-comment-terminal');
+        }
+
+        // 9b. [新] 连续 comment-form-not-found ≥ 2：大概率是 Jetpack Remote
+        //     Comment / Disqus 等第三方评论系统，我们永远发不了。
+        //     新采集的站会被 html-comment-detection 直接拒在门外，这条规则是
+        //     给 cleanup 之前采的老数据做追溯兜底。
+        const formNotFoundCount = historyEntries.reduce((n, entry) => {
+            const reason = String(entry?.publishMeta?.submissionBlockReason || '').toLowerCase();
+            if (reason !== 'comment-form-not-found') return n;
+            return n + Number(entry?.attempts?.failed || 0);
+        }, 0);
+        if (formNotFoundCount >= 2 && !hasRealVisiblePublish) {
+            reasons.push('likely-third-party-comments');
+        }
+
+        // 9c. [新] 显式 third-party-comment-system：发布端 DOM 检测命中后记录的
+        const hasThirdPartyTerminal = historyEntries.some((entry) => {
+            const reason = String(entry?.publishMeta?.submissionBlockReason || '').toLowerCase();
+            const terminal = String(entry?.publishMeta?.terminalFailureReason || '').toLowerCase();
+            return reason === 'third-party-comment-system' || terminal === 'third-party-comment-system';
+        });
+        if (hasThirdPartyTerminal) {
+            reasons.push('third-party-comments');
         }
 
         // 10. [评论活跃度规则] 评论总数 < 3 判为不活跃站点下架

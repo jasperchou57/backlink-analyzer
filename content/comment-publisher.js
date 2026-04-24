@@ -324,8 +324,49 @@
         }
     }
 
+    // DOM 选择器：第三方评论系统的标志元素。命中就直接硬失败，不走 18 秒找表单流程。
+    // 扩展 DOM 访问不了跨域 iframe，所以这类站再怎么填也发不出去。
+    const THIRD_PARTY_COMMENT_SELECTORS = [
+        '.jetpack_remote_comment',            // Jetpack Remote Comment iframe
+        'iframe[src*="jetpack.wordpress.com/jetpack-comment"]',
+        '#disqus_thread',                     // Disqus
+        'iframe[src*="disqus.com/embed"]',
+        '.hyvor-talk-view',                   // Hyvor Talk
+        'iframe[src*="talk.hyvor.com"]',
+        '.fastcomments-widget',               // Fastcomments
+        'iframe[src*="fastcomments.com"]',
+        'iframe[src*="intensedebate.com"]',   // Intense Debate
+        'iframe[src*="livefyre.com"]',        // Livefyre
+        'iframe[src*="commento.io"]',         // Commento
+        'iframe[src*="vuukle.com"]',          // Vuukle
+        'iframe[src*="graphcomment.com"]',    // GraphComment
+        'iframe[src*="spot.im"]',             // Spot.IM / OpenWeb
+        'iframe[src*="muut.com"]',            // Muut
+        'iframe[src*="facebook.com/plugins/comments"]' // Facebook Comments
+    ];
+
     function detectHardUnpublishableSignal() {
         try {
+            // 先查第三方评论系统。比 commentsClosed / requiresLogin 这些更优先，
+            // 因为命中后根本不需要查 capabilities（节省 6-18 秒找表单的时间）。
+            for (const selector of THIRD_PARTY_COMMENT_SELECTORS) {
+                try {
+                    if (document.querySelector(selector)) {
+                        return 'third-party-comment-system';
+                    }
+                } catch {}
+            }
+            // 额外兜底：<form id="commentform"> 里只有 iframe 没有真 textarea/input
+            // 的情况（某些自定义 Jetpack 皮肤可能没上面那些 class 名）
+            const commentForm = document.querySelector('#commentform, form.comment-form');
+            if (commentForm) {
+                const hasIframe = !!commentForm.querySelector('iframe');
+                const hasRealTextarea = !!commentForm.querySelector('textarea[name="comment"], textarea#comment, textarea[name*="comment" i]');
+                if (hasIframe && !hasRealTextarea) {
+                    return 'third-party-comment-system';
+                }
+            }
+
             const detection = getCommentFormDetection();
             if (!detection?.detectPageCommentCapabilities) return '';
             const caps = detection.detectPageCommentCapabilities(document);

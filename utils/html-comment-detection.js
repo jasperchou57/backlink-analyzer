@@ -18,9 +18,47 @@
 (function (globalScope) {
     if (globalScope.HtmlCommentDetection) return;
 
+    // 第三方评论系统 / iframe 托管评论：我们的 content script 无法访问跨域 iframe
+    // 里面的真实 textarea/input，100% 发不了。发现就直接不入库，也不进 weak 池。
+    //
+    // 典型案例：hackaday.com、themoviemylife.com 等用 Jetpack Remote Comment
+    // 的博客——外层 <form id="commentform"> 只包一个跨域 iframe，表单实际在
+    // jetpack.wordpress.com 域上，sandbox 还限制了 allow-scripts。
+    //
+    // 不用单纯"页面里有 jetpack 字样"判断（jetpack 作为 WP 插件装了但用原生
+    // 评论表单的站也很多）。只认真正标志着"iframe 托管评论"的 class/src：
+    const THIRD_PARTY_COMMENT_MARKERS = [
+        'jetpack_remote_comment',            // Jetpack 远程评论 iframe
+        'jetpack.wordpress.com/jetpack-comment', // 同上，iframe 的 src
+        'disqus_thread',                     // Disqus embed
+        'disqus.com/embed',
+        'disqus_shortname',
+        'hyvor-talk',                        // Hyvor Talk
+        'talk.hyvor.com',
+        'fastcomments.com',                  // Fastcomments
+        'fastcomments-widget',
+        'intensedebate.com',                 // Intense Debate
+        'livefyre.com',                      // Livefyre
+        'cdn.commento.io',                   // Commento
+        'commento.io/embed',
+        'vuukle.com',                        // Vuukle
+        'graphcomment.com',                  // GraphComment
+        'spot.im',                           // Spot.IM / OpenWeb
+        'muut.com',                          // Muut
+        'facebook.com/plugins/comments'      // Facebook Comments plugin
+    ];
+
     function analyze(html, url = '', options = {}) {
         const text = String(html || '');
         const h = text.toLowerCase();
+
+        // ── 0. 第三方评论系统硬阻断 ─────────────────────────────
+        // 这些站不管其他条件多匹配，真实表单都在跨域 iframe 里，content script
+        // 访问不到。直接不入库，避免浪费采集名额、发布尝试时间、cleanup 负担。
+        const thirdPartyMarker = THIRD_PARTY_COMMENT_MARKERS.find((m) => h.includes(m));
+        if (thirdPartyMarker) {
+            return null;
+        }
 
         // ── 8 条核心检测 ──────────────────────────────────────
 

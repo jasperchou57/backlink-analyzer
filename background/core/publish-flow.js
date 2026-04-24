@@ -205,7 +205,8 @@ function isRateLimitReason(reason = '') {
 const HARD_UNPUBLISHABLE_REASONS = new Set([
     'comments-closed',
     'login-required',
-    'captcha-blocked'
+    'captcha-blocked',
+    'third-party-comment-system'
 ]);
 
 // 软原因：临时问题，给 1-2 次重试机会后进入冷却，不永久下架
