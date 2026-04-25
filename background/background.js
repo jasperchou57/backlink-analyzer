@@ -2851,11 +2851,64 @@ async function performStorageMaintenance() {
         await migratePublishTaskCommentStyles();
     } catch {}
 
+    try {
+        await backfillKnownGoodTaskIds();
+    } catch {}
+
     scheduleResourceSignalNormalization(900);
 
     try {
         await ensureDomainIntelLoaded();
         await flushDomainIntel();
+    } catch {}
+}
+
+/**
+ * 一次性回填：扫描所有资源的 publishHistory，把每个曾经 anchorVisible=true 的
+ * 历史记录里的 taskId 累加到 resource.publishMeta.knownGoodTaskIds。
+ * 这样老数据也能享受跨任务白名单 boost，不用等新一轮发布慢慢累积。
+ *
+ * 用 chrome.storage.local 里一个 flag 标记已完成，避免每次启动都跑一遍 3000 条。
+ */
+const KNOWN_GOOD_BACKFILL_KEY = 'knownGoodBackfillV1';
+async function backfillKnownGoodTaskIds() {
+    try {
+        const flag = await chrome.storage.local.get(KNOWN_GOOD_BACKFILL_KEY);
+        if (flag?.[KNOWN_GOOD_BACKFILL_KEY]) return;
+    } catch {}
+
+    const resources = await getStoredResources();
+    let touched = 0;
+    const next = resources.map((resource) => {
+        if (!resource) return resource;
+        const existing = Array.isArray(resource.publishMeta?.knownGoodTaskIds)
+            ? resource.publishMeta.knownGoodTaskIds.filter(Boolean)
+            : [];
+        const collected = new Set(existing);
+        const before = collected.size;
+        const history = resource.publishHistory || {};
+        for (const entry of Object.values(history)) {
+            if (entry?.publishMeta?.anchorVisible === true && entry?.taskId) {
+                collected.add(String(entry.taskId));
+            }
+        }
+        if (collected.size === before) return resource;
+        touched++;
+        return {
+            ...resource,
+            publishMeta: {
+                ...(resource.publishMeta || {}),
+                knownGoodTaskIds: Array.from(collected)
+            }
+        };
+    });
+
+    if (touched > 0) {
+        await writeResourcesToStorage(next);
+        await Logger.publish(`跨任务白名单回填：${touched} 个资源被标记为 known-good`);
+    }
+    try {
+        await chrome.storage.local.set({ [KNOWN_GOOD_BACKFILL_KEY]: true });
     } catch {}
 }
 

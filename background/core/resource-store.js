@@ -76,7 +76,12 @@
                 websiteRetryExhausted: meta.websiteRetryExhausted ? true : undefined,
                 cooldownDeferred: meta.cooldownDeferred ? true : undefined,
                 cooldownUntil: meta.cooldownUntil || '',
-                durationMs: Number(meta.durationMs || 0) || undefined
+                durationMs: Number(meta.durationMs || 0) || undefined,
+                // 跨任务白名单：曾经在此资源上 anchorVisible=true 的所有 taskId
+                // 列表。任务挑选 dispatch 队列时给这类资源 +5 priority boost。
+                knownGoodTaskIds: Array.isArray(meta.knownGoodTaskIds) && meta.knownGoodTaskIds.length > 0
+                    ? Array.from(new Set(meta.knownGoodTaskIds.filter(Boolean).map((id) => String(id).slice(0, 80)))).slice(0, 32)
+                    : undefined
             });
         }
 

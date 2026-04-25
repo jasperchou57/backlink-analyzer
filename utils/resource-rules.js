@@ -305,6 +305,17 @@
     }
 
     function getPublishCandidatePriority(resource, task = {}) {
+        const base = computeBasePublishCandidatePriority(resource, task);
+        if (base <= 0) return base;
+        // 跨任务白名单 boost：曾被任一任务的 verifier 找到 anchor 的资源 +5 priority。
+        // 让"已验证可发"的好站在所有任务间共享优先级，避免新任务从头摸索一遍。
+        const verifiedTaskCount = Array.isArray(resource?.publishMeta?.knownGoodTaskIds)
+            ? resource.publishMeta.knownGoodTaskIds.length
+            : 0;
+        return base + (verifiedTaskCount > 0 ? 5 : 0);
+    }
+
+    function computeBasePublishCandidatePriority(resource, task = {}) {
         if (resourceIsCommentOnly(resource)) return 0;
 
         const workflowId = task?.workflowId || '';

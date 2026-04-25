@@ -559,6 +559,19 @@ const PublishRuntime = {
                 publishMeta.anchorIsNofollow = !!verification?.anchorIsNofollow;
                 publishMeta.anchorIsDofollow = !!verification?.anchorIsDofollow;
             }
+            // 跨任务白名单：verifier 找到 anchor 就把当前 taskId 加入资源的 known-good
+            // 列表。后续任何任务挑 dispatch 时给这类资源 +5 priority boost，让"已被
+            // 验证可发的好站"在所有任务间共享，避免新任务从头摸索。
+            if (verification?.anchorVisible) {
+                const currentResource = ctx.getState().queue?.[ctx.getState().currentIndex] || null;
+                const existingIds = currentResource?.publishMeta?.knownGoodTaskIds || [];
+                const taskIdNow = ctx.getState().currentTask?.id || taskId || '';
+                if (taskIdNow) {
+                    publishMeta.knownGoodTaskIds = Array.from(
+                        new Set([...existingIds, taskIdNow].filter(Boolean))
+                    );
+                }
+            }
             publishMeta.commentLocated = !!verification?.commentLocated;
             publishMeta.commentLocationMethod = verification?.commentLocationMethod || '';
             publishMeta.commentLocatedExcerpt = verification?.commentExcerpt || '';
