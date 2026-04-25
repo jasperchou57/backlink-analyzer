@@ -232,6 +232,88 @@
         return true;
     }
 
+    /**
+     * 强制展开"评论区默认折叠"主题的容器。
+     *
+     * 大量主题（prodsens / hackaday / 各种 WordPress.com 风格）把 commentform
+     * 包在 <div class="comments-collapse" id="comments-hidden"> 类容器里，CSS
+     * 默认 display:none 或 height:0。用户必须点"View Comments"才展开。
+     *
+     * 我们的 isVisible() 检查 boundingClientRect.width/height > 0，折叠状态
+     * 直接判定 form 不可见 → scoreStandardCommentForm 返回 -Infinity →
+     * fast-flow-check ran=false 100% 失败。整批资源 fast-flow 命中率仅 1.5%
+     * 就是这个原因。
+     *
+     * 修法：preflight 早期扫描所有"看着像折叠 wrapper"的容器，强行 inline
+     * style 解除折叠 + 移除常见 hidden class + 取消 hidden attribute。也尝试
+     * 点击常见 toggle 按钮（aria-expanded="false" 的）。
+     */
+    function forceExpandCollapsedComments(context = {}) {
+        const candidates = new Set();
+        const wrapperSelectors = [
+            '[id*="comments-hidden" i]',
+            '[id*="comments-collapsed" i]',
+            '[class*="comments-hidden" i]',
+            '[class*="comments-collapsed" i]',
+            '[class*="comments-collapse" i]',
+            '[class*="comment-collapsed" i]',
+            '[id*="comment-toggle" i]',
+            '[class*="comment-toggle" i][aria-hidden="true"]',
+            '.cs-entry__comments-collapse',     // prodsens (Convex theme 系)
+            '.entry-comments-collapse',
+            '.collapsed-comments',
+            '.commentlist-hidden'
+        ];
+        for (const selector of wrapperSelectors) {
+            try {
+                globalScope.document.querySelectorAll(selector).forEach((el) => candidates.add(el));
+            } catch {}
+        }
+
+        let expanded = 0;
+        for (const el of candidates) {
+            if (!(el instanceof HTMLElement)) continue;
+            try {
+                el.style.removeProperty('display');
+                el.style.removeProperty('height');
+                el.style.removeProperty('max-height');
+                el.style.removeProperty('overflow');
+                el.style.removeProperty('visibility');
+                el.style.maxHeight = 'none';
+                el.style.height = 'auto';
+                el.style.display = 'block';
+                el.style.visibility = 'visible';
+                el.removeAttribute('hidden');
+                if (el.getAttribute('aria-hidden') === 'true') el.setAttribute('aria-hidden', 'false');
+                if (el.getAttribute('aria-expanded') === 'false') el.setAttribute('aria-expanded', 'true');
+                ['hidden', 'is-hidden', 'd-none', 'collapsed', 'is-collapsed'].forEach((cls) => el.classList.remove(cls));
+                expanded++;
+            } catch {}
+        }
+
+        // 主题里典型的 toggle 按钮：aria-expanded="false" + 点击展开评论
+        const toggleSelectors = [
+            'button[aria-expanded="false"][aria-controls*="comments" i]',
+            'button[aria-expanded="false"][aria-controls*="respond" i]',
+            'a[aria-expanded="false"][href*="#comments"]',
+            'a[aria-expanded="false"][href*="#respond"]',
+            '.comments-toggle[aria-expanded="false"]',
+            '.show-comments[aria-expanded="false"]'
+        ];
+        for (const selector of toggleSelectors) {
+            try {
+                globalScope.document.querySelectorAll(selector).forEach((btn) => {
+                    try { btn.click(); expanded++; } catch {}
+                });
+            } catch {}
+        }
+
+        if (expanded > 0) {
+            markCommentSearchProgress(context, 'collapsed-expanded', { count: expanded });
+        }
+        return expanded;
+    }
+
     async function primeCommentSectionSearch(context = {}, options = {}) {
         const immediate = options.immediate !== false;
         const metrics = getDocumentScrollMetrics();
@@ -240,6 +322,13 @@
             || options.longPageMode
             || metrics.scrollHeight > metrics.viewportHeight * 2.5
         );
+
+        // 第 0 步：强制展开默认折叠的评论区。这一步必须在所有"找元素"之前跑，
+        // 否则 isVisible 会因为父容器 display:none 把所有候选都判为不可见。
+        if (!context.collapsedExpanded) {
+            forceExpandCollapsedComments(context);
+            context.collapsedExpanded = true;
+        }
 
         // 第一步：找一个"真正像样"的评论区目标（带 textarea/可编辑区或严格 form）
         // 找到了就 scrollIntoView 过去
